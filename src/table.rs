@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::allocator::{Allocation, BlockAllocator};
@@ -10,8 +10,8 @@ use crate::layout::{DELETED_BIT, HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, read_node, set_private_next};
 
-const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-const FORMAT_VERSION: u64 = 1;
+pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
+pub(crate) const FORMAT_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PutResult {
@@ -20,13 +20,16 @@ pub enum PutResult {
 }
 
 pub struct Database {
-    config: Config,
-    node_size: u64,
-    heads: MappedFile,
-    body: BlockAllocator,
-    blobs: Option<BlockAllocator>,
-    hazards: HazardRegistry,
-    retired: RetireQueue,
+    pub(crate) config: Config,
+    pub(crate) node_size: u64,
+    pub(crate) heads: MappedFile,
+    pub(crate) body: BlockAllocator,
+    pub(crate) blobs: Option<BlockAllocator>,
+    pub(crate) hazards: HazardRegistry,
+    pub(crate) retired: RetireQueue,
+    pub(crate) checkpoint_state: AtomicU64,
+    pub(crate) checkpoint_generation: AtomicU64,
+    pub(crate) path: PathBuf,
 }
 
 impl Database {
@@ -71,6 +74,9 @@ impl Database {
             blobs,
             hazards,
             retired,
+            checkpoint_state: AtomicU64::new(0),
+            checkpoint_generation: AtomicU64::new(0),
+            path: path.to_path_buf(),
         })
     }
 
@@ -500,7 +506,7 @@ impl Database {
         Ok(())
     }
 
-    fn head(&self, bucket: u64) -> Result<&AtomicU64> {
+    pub(crate) fn head(&self, bucket: u64) -> Result<&AtomicU64> {
         if bucket >= self.config.bucket_count {
             return Err(Error::Corrupt("bucket index is out of range"));
         }
@@ -530,15 +536,35 @@ struct Found {
     root: u64,
 }
 
-fn heads_length(bucket_count: u64) -> Result<u64> {
+pub(crate) fn bank_size(bucket_count: u64) -> Result<u64> {
     bucket_count
         .checked_mul(size_of::<u64>() as u64)
-        .and_then(|bytes| bytes.checked_add(HEADS_START))
         .and_then(|bytes| align_up(bytes, PAGE_SIZE))
+        .ok_or(Error::InvalidConfig("checkpoint bank size overflow"))
+}
+
+pub(crate) fn snapshot_bank_start(bucket_count: u64, bank: u64) -> Result<u64> {
+    if bank > 1 {
+        return Err(Error::Corrupt("checkpoint bank index is out of range"));
+    }
+    let bank_size = bank_size(bucket_count)?;
+    HEADS_START
+        .checked_add(bank_size)
+        .and_then(|start| start.checked_add(bank.checked_mul(bank_size)?))
+        .ok_or(Error::InvalidConfig("checkpoint bank offset overflow"))
+}
+
+pub(crate) fn heads_length(bucket_count: u64) -> Result<u64> {
+    HEADS_START
+        .checked_add(
+            bank_size(bucket_count)?
+                .checked_mul(3)
+                .ok_or(Error::InvalidConfig("heads file size overflow"))?,
+        )
         .ok_or(Error::InvalidConfig("heads file size overflow"))
 }
 
-fn initialize_header(heads: &MappedFile, config: &Config, node_size: u64) -> Result<()> {
+pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: u64) -> Result<()> {
     let page_size = usize::try_from(PAGE_SIZE)
         .map_err(|_| Error::InvalidConfig("page size does not fit memory"))?;
     let mut header = Vec::new();
@@ -568,7 +594,7 @@ fn initialize_header(heads: &MappedFile, config: &Config, node_size: u64) -> Res
     unsafe { heads.copy_in(0, &header) }
 }
 
-fn write_header_u64(header: &mut [u8], offset: usize, value: u64) -> Result<()> {
+pub(crate) fn write_header_u64(header: &mut [u8], offset: usize, value: u64) -> Result<()> {
     let end = offset
         .checked_add(size_of::<u64>())
         .ok_or(Error::Corrupt("header field overflow"))?;
@@ -581,8 +607,6 @@ fn write_header_u64(header: &mut [u8], offset: usize, value: u64) -> Result<()> 
 
 #[cfg(all(test, not(miri)))]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     fn test_directory(name: &str) -> PathBuf {

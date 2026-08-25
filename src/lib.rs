@@ -1,6 +1,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 mod allocator;
+mod checkpoint;
 mod config;
 mod error;
 mod hash;

@@ -49,17 +49,30 @@ impl BlockAllocator {
         block_size: u64,
     ) -> Result<Self> {
         validate_layout(capacity, block_size)?;
-        let block_count = capacity / block_size;
-        let count_bytes = block_count
-            .checked_mul(size_of::<u64>() as u64)
-            .and_then(|bytes| bytes.checked_add(COUNTS_START))
-            .and_then(|bytes| align_up(bytes, PAGE_SIZE))
-            .ok_or(Error::InvalidConfig("block-count file size overflow"))?;
-        let data_length = capacity
-            .checked_add(DATA_START)
-            .ok_or(Error::InvalidConfig("data file size overflow"))?;
+        let (data_length, count_bytes, block_count) = file_lengths(capacity, block_size)?;
         let data = MappedFile::create(data_path, data_length, false, false)?;
         let counts = MappedFile::create(counts_path, count_bytes, false, true)?;
+        data.advise_random()?;
+        counts.advise_heads()?;
+        Ok(Self {
+            data,
+            counts,
+            capacity,
+            block_size,
+            block_count,
+        })
+    }
+
+    pub(crate) fn open(
+        data_path: &Path,
+        counts_path: &Path,
+        capacity: u64,
+        block_size: u64,
+    ) -> Result<Self> {
+        validate_layout(capacity, block_size)?;
+        let (data_length, count_bytes, block_count) = file_lengths(capacity, block_size)?;
+        let data = MappedFile::open(data_path, data_length, false)?;
+        let counts = MappedFile::open(counts_path, count_bytes, false)?;
         data.advise_random()?;
         counts.advise_heads()?;
         Ok(Self {
@@ -365,6 +378,19 @@ fn validate_layout(capacity: u64, block_size: u64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn file_lengths(capacity: u64, block_size: u64) -> Result<(u64, u64, u64)> {
+    let block_count = capacity / block_size;
+    let count_bytes = block_count
+        .checked_mul(size_of::<u64>() as u64)
+        .and_then(|bytes| bytes.checked_add(COUNTS_START))
+        .and_then(|bytes| align_up(bytes, PAGE_SIZE))
+        .ok_or(Error::InvalidConfig("block-count file size overflow"))?;
+    let data_length = capacity
+        .checked_add(DATA_START)
+        .ok_or(Error::InvalidConfig("data file size overflow"))?;
+    Ok((data_length, count_bytes, block_count))
 }
 
 const fn pack(block_state: BlockState, used: u32, count: u32) -> u64 {
