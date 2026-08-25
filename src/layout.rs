@@ -1,4 +1,5 @@
 pub(crate) const PAGE_SIZE: u64 = 4_096;
+pub(crate) const DATA_START: u64 = PAGE_SIZE;
 pub(crate) const NODE_ALIGNMENT: u64 = 8;
 pub(crate) const NODE_FIXED_SIZE: u64 = 48;
 

@@ -8,6 +8,7 @@ pub enum Error {
     Io(io::Error),
     InvalidConfig(&'static str),
     InvalidKeyLength { expected: usize, actual: usize },
+    OutOfMemory,
     CapacityExhausted(&'static str),
     Corrupt(&'static str),
     Busy(&'static str),
@@ -26,6 +27,7 @@ impl Display for Error {
                     "invalid key length: expected {expected}, got {actual}"
                 )
             }
+            Self::OutOfMemory => formatter.write_str("memory allocation failed"),
             Self::CapacityExhausted(area) => write!(formatter, "{area} capacity exhausted"),
             Self::Corrupt(message) => write!(formatter, "database is corrupt: {message}"),
             Self::Busy(message) => write!(formatter, "database is busy: {message}"),

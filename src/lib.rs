@@ -1,9 +1,12 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+mod allocator;
 mod config;
 mod error;
 mod hash;
 mod layout;
+mod mapped_file;
+mod sys;
 
 pub use config::{Config, Mode};
 pub use error::{Error, Result};

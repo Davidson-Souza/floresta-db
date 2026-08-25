@@ -69,6 +69,9 @@ impl Config {
                 "block size must be a power of two no smaller than 4096",
             ));
         }
+        if self.block_size > u64::from(u32::MAX) {
+            return Err(Error::InvalidConfig("block size must fit in 32 bits"));
+        }
         if self.body_capacity % self.block_size != 0 {
             return Err(Error::InvalidConfig("body capacity must be block aligned"));
         }
