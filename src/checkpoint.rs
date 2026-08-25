@@ -9,8 +9,11 @@ use crate::hash::xxh64;
 use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue};
 use crate::layout::{DELETED_BIT, PAGE_SIZE};
 use crate::mapped_file::MappedFile;
-use crate::node::{Node, allocate_node, read_node, set_private_next};
-use crate::table::{Database, FORMAT_VERSION, HEADER_MAGIC, heads_length, snapshot_bank_start};
+use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
+use crate::table::{
+    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, header_checksum, heads_length,
+    snapshot_bank_start,
+};
 
 const CHECKPOINT_IDLE: u64 = 0;
 const CHECKPOINT_BUSY: u64 = 1;
@@ -353,6 +356,7 @@ fn copy_node(
         destination_blobs,
         node.blob_offset,
         node.blob_length,
+        node.blob_checksum,
     )?;
     let blob_offset = blob.map_or(0, |allocation| allocation.offset);
     let allocation = match allocate_node(
@@ -362,6 +366,7 @@ fn copy_node(
         node.hash,
         blob_offset,
         node.blob_length,
+        node.blob_checksum,
     ) {
         Ok(allocation) => allocation,
         Err(error) => {
@@ -386,8 +391,19 @@ fn copy_blob(
     destination: Option<&BlockAllocator>,
     offset: u64,
     length: u64,
+    expected_checksum: u64,
 ) -> Result<Option<Allocation>> {
     if length == 0 {
+        let valid_checksum = if source.is_some() {
+            expected_checksum == blob_checksum(&[])
+        } else {
+            expected_checksum == 0
+        };
+        if !valid_checksum {
+            return Err(Error::Corrupt(
+                "empty checkpoint blob checksum does not match",
+            ));
+        }
         return Ok(None);
     }
     let length_usize = usize::try_from(length)
@@ -395,6 +411,9 @@ fn copy_blob(
     let bytes = source
         .ok_or(Error::Corrupt("checkpoint source blob file is missing"))?
         .read(offset, length_usize)?;
+    if expected_checksum != blob_checksum(&bytes) {
+        return Err(Error::Corrupt("checkpoint blob checksum does not match"));
+    }
     let destination = destination.ok_or(Error::Corrupt("checkpoint blob file is missing"))?;
     let allocation = destination.allocate(length_usize, 8)?;
     if let Err(error) = destination.write(allocation, &bytes) {
@@ -534,6 +553,7 @@ fn snapshot_checksum(
             checksum = mix_checksum(checksum, node.hash);
             checksum = mix_checksum(checksum, node.blob_offset);
             checksum = mix_checksum(checksum, node.blob_length);
+            checksum = mix_checksum(checksum, node.blob_checksum);
             checksum = xxh64(&node.key, checksum);
             current = node.successor();
         }
@@ -577,17 +597,25 @@ fn snapshot_prefix_contains(
 
 fn validate_snapshot_blob(snapshot: &SnapshotFiles, mode: Mode, node: &Node) -> Result<()> {
     match (mode, node.blob_offset, node.blob_length) {
-        (Mode::Set | Mode::Map, 0, 0) => Ok(()),
+        (Mode::Set, 0, 0) if node.blob_checksum == 0 => Ok(()),
+        (Mode::Map, 0, 0) if node.blob_checksum == blob_checksum(&[]) => Ok(()),
+        (Mode::Set | Mode::Map, 0, 0) => {
+            Err(Error::Corrupt("empty checkpoint blob checksum is invalid"))
+        }
         (Mode::Set, _, _) => Err(Error::Corrupt("set checkpoint node references a blob")),
         (Mode::Map, 0, _) => Err(Error::Corrupt("map checkpoint blob offset is null")),
         (Mode::Map, offset, length) => {
             let length = u32::try_from(length)
                 .map_err(|_| Error::Corrupt("checkpoint blob length is too large"))?;
-            snapshot
+            let blobs = snapshot
                 .blobs
                 .as_ref()
-                .ok_or(Error::Corrupt("map checkpoint blob file is missing"))?
-                .allocation_for(offset, length)?;
+                .ok_or(Error::Corrupt("map checkpoint blob file is missing"))?;
+            blobs.allocation_for(offset, length)?;
+            let bytes = blobs.read(offset, length as usize)?;
+            if node.blob_checksum != blob_checksum(&bytes) {
+                return Err(Error::Corrupt("checkpoint blob checksum does not match"));
+            }
             Ok(())
         }
     }
@@ -667,6 +695,9 @@ fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
         return Err(Error::Unsupported(
             "database format version is not supported",
         ));
+    }
+    if read_u64(&header, HEADER_CHECKSUM_OFFSET)? != header_checksum(&header)? {
+        return Err(Error::Corrupt("heads header checksum does not match"));
     }
     let mode = match read_u64(&header, 16)? {
         1 => Mode::Set,
@@ -1013,6 +1044,64 @@ mod tests {
         let bucket = xxh64(b"only-key", config.hash_seed) % config.bucket_count;
         let root = snapshot_root_atomic(&heads, &config, 1, bucket)?;
         cas_replace(root, 0);
+        heads.sync_all()?;
+        drop(heads);
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_snapshot_blob_corruption() -> Result<()> {
+        let path = test_directory("checkpoint-blob-corruption");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let config = test_config();
+        let database = Database::create(&path, config.clone())?;
+        database.put(b"only-key", b"value")?;
+        assert_eq!(database.checkpoint()?, 1);
+        drop(database);
+
+        let heads = MappedFile::open(
+            &path.join("heads"),
+            heads_length(config.bucket_count)?,
+            false,
+        )?;
+        let snapshot = open_snapshot(&path, &config, 1)?;
+        let bucket = xxh64(b"only-key", config.hash_seed) % config.bucket_count;
+        let root = snapshot_root_atomic(&heads, &config, 1, bucket)?.load(Ordering::Acquire);
+        let node = read_node(&snapshot.body, root, config.node_size()?, config.key_size)?;
+        let blob = snapshot
+            .blobs
+            .as_ref()
+            .ok_or(Error::Corrupt("test snapshot blob file is missing"))?;
+        let length = u32::try_from(node.blob_length)
+            .map_err(|_| Error::Corrupt("test blob length overflow"))?;
+        blob.write(blob.allocation_for(node.blob_offset, length)?, &[0])?;
+        blob.sync_all()?;
+        drop(snapshot);
+        drop(heads);
+
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_header_corruption() -> Result<()> {
+        let path = test_directory("checkpoint-header-corruption");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let config = test_config();
+        let database = Database::create(&path, config.clone())?;
+        database.put(b"only-key", b"value")?;
+        database.checkpoint()?;
+        drop(database);
+
+        let heads = MappedFile::open(
+            &path.join("heads"),
+            heads_length(config.bucket_count)?,
+            false,
+        )?;
+        cas_replace(heads.atomic_u64(24)?, config.bucket_count + 1);
         heads.sync_all()?;
         drop(heads);
         assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));

@@ -4,8 +4,9 @@ use crate::allocator::{Allocation, BlockAllocator};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
 use crate::layout::{
-    DELETED_BIT, NODE_BLOB_LENGTH_OFFSET, NODE_BLOB_OFFSET, NODE_CHECKSUM_OFFSET, NODE_HASH_OFFSET,
-    NODE_KEY_OFFSET, NODE_MAGIC, NODE_MAGIC_OFFSET, NODE_NEXT_OFFSET,
+    DELETED_BIT, NODE_BLOB_CHECKSUM_OFFSET, NODE_BLOB_LENGTH_OFFSET, NODE_BLOB_OFFSET,
+    NODE_CHECKSUM_OFFSET, NODE_HASH_OFFSET, NODE_KEY_OFFSET, NODE_MAGIC, NODE_MAGIC_OFFSET,
+    NODE_NEXT_OFFSET,
 };
 
 #[derive(Debug)]
@@ -15,6 +16,7 @@ pub(crate) struct Node {
     pub(crate) hash: u64,
     pub(crate) blob_offset: u64,
     pub(crate) blob_length: u64,
+    pub(crate) blob_checksum: u64,
     pub(crate) key: Vec<u8>,
 }
 
@@ -35,6 +37,7 @@ pub(crate) fn allocate_node(
     hash: u64,
     blob_offset: u64,
     blob_length: u64,
+    blob_checksum: u64,
 ) -> Result<Allocation> {
     let node_size_usize = usize::try_from(node_size)
         .map_err(|_| Error::InvalidConfig("node size does not fit memory"))?;
@@ -48,6 +51,7 @@ pub(crate) fn allocate_node(
     write_u64(&mut bytes, NODE_BLOB_OFFSET, blob_offset)?;
     write_u64(&mut bytes, NODE_BLOB_LENGTH_OFFSET, blob_length)?;
     write_u64(&mut bytes, NODE_MAGIC_OFFSET, NODE_MAGIC)?;
+    write_u64(&mut bytes, NODE_BLOB_CHECKSUM_OFFSET, blob_checksum)?;
     let key_end = NODE_KEY_OFFSET
         .checked_add(key.len())
         .ok_or(Error::InvalidConfig("node key range overflow"))?;
@@ -55,7 +59,7 @@ pub(crate) fn allocate_node(
         .get_mut(NODE_KEY_OFFSET..key_end)
         .ok_or(Error::InvalidConfig("key does not fit body node"))?;
     key_destination.copy_from_slice(key);
-    let checksum = node_checksum(hash, blob_offset, blob_length, key);
+    let checksum = node_checksum(hash, blob_offset, blob_length, blob_checksum, key);
     write_u64(&mut bytes, NODE_CHECKSUM_OFFSET, checksum)?;
     body.write(allocation, &bytes)?;
     Ok(allocation)
@@ -85,6 +89,7 @@ pub(crate) fn read_node(
     let hash = read_static_u64(&bytes, NODE_HASH_OFFSET)?;
     let blob_offset = read_static_u64(&bytes, NODE_BLOB_OFFSET)?;
     let blob_length = read_static_u64(&bytes, NODE_BLOB_LENGTH_OFFSET)?;
+    let blob_checksum = read_static_u64(&bytes, NODE_BLOB_CHECKSUM_OFFSET)?;
     if read_static_u64(&bytes, NODE_MAGIC_OFFSET)? != NODE_MAGIC {
         return Err(Error::Corrupt("body node magic does not match"));
     }
@@ -102,7 +107,7 @@ pub(crate) fn read_node(
     key.try_reserve_exact(key_size)
         .map_err(|_| Error::OutOfMemory)?;
     key.extend_from_slice(key_source);
-    if checksum != node_checksum(hash, blob_offset, blob_length, &key) {
+    if checksum != node_checksum(hash, blob_offset, blob_length, blob_checksum, &key) {
         return Err(Error::Corrupt("body node checksum does not match"));
     }
     Ok(Node {
@@ -111,6 +116,7 @@ pub(crate) fn read_node(
         hash,
         blob_offset,
         blob_length,
+        blob_checksum,
         key,
     })
 }
@@ -122,9 +128,21 @@ pub(crate) fn set_private_next(body: &BlockAllocator, node: u64, old: u64, new: 
     Ok(())
 }
 
-fn node_checksum(hash: u64, blob_offset: u64, blob_length: u64, key: &[u8]) -> u64 {
-    let mut checksum =
-        hash.rotate_left(13) ^ blob_offset.rotate_left(29) ^ blob_length.rotate_left(47);
+pub(crate) fn blob_checksum(value: &[u8]) -> u64 {
+    xxh64(value, NODE_MAGIC)
+}
+
+fn node_checksum(
+    hash: u64,
+    blob_offset: u64,
+    blob_length: u64,
+    blob_checksum: u64,
+    key: &[u8],
+) -> u64 {
+    let mut checksum = hash.rotate_left(13)
+        ^ blob_offset.rotate_left(29)
+        ^ blob_length.rotate_left(47)
+        ^ blob_checksum.rotate_left(7);
     checksum ^= xxh64(key, NODE_MAGIC);
     checksum
 }

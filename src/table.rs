@@ -8,10 +8,12 @@ use crate::hash::xxh64;
 use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue};
 use crate::layout::{DELETED_BIT, HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
-use crate::node::{Node, allocate_node, read_node, set_private_next};
+use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-pub(crate) const FORMAT_VERSION: u64 = 1;
+pub(crate) const FORMAT_VERSION: u64 = 2;
+pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 88;
+pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PutResult {
@@ -125,6 +127,9 @@ impl Database {
             return Ok(None);
         };
         if node.blob_length == 0 {
+            if node.blob_checksum != blob_checksum(&[]) {
+                return Err(Error::Corrupt("empty map value checksum does not match"));
+            }
             guard.clear()?;
             return Ok(Some(Vec::new()));
         }
@@ -135,6 +140,9 @@ impl Database {
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
         let value = blobs.read(node.blob_offset, length)?;
+        if node.blob_checksum != blob_checksum(&value) {
+            return Err(Error::Corrupt("map value checksum does not match"));
+        }
         guard.clear()?;
         Ok(Some(value))
     }
@@ -236,6 +244,7 @@ impl Database {
         let blob_length = value.map_or(0, <[u8]>::len);
         let blob_length_u64 =
             u64::try_from(blob_length).map_err(|_| Error::CapacityExhausted("blob length"))?;
+        let value_checksum = value.map_or(0, blob_checksum);
         let hash = xxh64(key, self.config.hash_seed);
         let node = match allocate_node(
             &self.body,
@@ -244,6 +253,7 @@ impl Database {
             hash,
             blob_offset,
             blob_length_u64,
+            value_checksum,
         ) {
             Ok(allocation) => allocation,
             Err(error) => {
@@ -591,8 +601,17 @@ pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: 
     write_header_u64(&mut header, 64, u64::from(config.max_threads))?;
     write_header_u64(&mut header, 72, config.hash_seed)?;
     write_header_u64(&mut header, 80, node_size)?;
+    let checksum = header_checksum(&header)?;
+    write_header_u64(&mut header, HEADER_CHECKSUM_OFFSET, checksum)?;
     // SAFETY: database creation is single-threaded and heads are not published yet.
     unsafe { heads.copy_in(0, &header) }
+}
+
+pub(crate) fn header_checksum(header: &[u8]) -> Result<u64> {
+    let bytes = header
+        .get(0..HEADER_CHECKSUM_OFFSET)
+        .ok_or(Error::Corrupt("heads header is too small for its checksum"))?;
+    Ok(xxh64(bytes, HEADER_CHECKSUM_SEED))
 }
 
 pub(crate) fn write_header_u64(header: &mut [u8], offset: usize, value: u64) -> Result<()> {
