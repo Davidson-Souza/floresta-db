@@ -123,6 +123,12 @@ impl Database {
     /// Returns an error when another checkpoint is active, worker registration
     /// is exhausted, snapshot capacity is exhausted, or ordered flushing fails.
     pub fn checkpoint(&self) -> Result<u64> {
+        let failed_bank = self
+            .checkpoint_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(Error::CapacityExhausted("checkpoint generation"))?
+            & 1;
         self.checkpoint_state
             .compare_exchange(
                 CHECKPOINT_IDLE,
@@ -132,6 +138,9 @@ impl Database {
             )
             .map_err(|_| Error::Busy("another checkpoint is active"))?;
         let result = self.checkpoint_inner();
+        if result.is_err() {
+            let _cleanup = self.cleanup_failed_checkpoint(failed_bank);
+        }
         let reset = self.checkpoint_state.compare_exchange(
             CHECKPOINT_BUSY,
             CHECKPOINT_IDLE,
@@ -142,6 +151,14 @@ impl Database {
             return Err(Error::Corrupt("checkpoint state changed unexpectedly"));
         }
         result
+    }
+
+    fn cleanup_failed_checkpoint(&self, bank: u64) -> Result<()> {
+        invalidate_manifest(&self.heads, bank)?;
+        self.heads.sync_all()?;
+        remove_snapshot_files(&self.path, self.config.mode, bank)?;
+        self.clear_snapshot_bank(bank)?;
+        sync_namespace(&self.path)
     }
 
     fn checkpoint_inner(&self) -> Result<u64> {
@@ -603,6 +620,9 @@ fn validate_snapshot_blob(snapshot: &SnapshotFiles, mode: Mode, node: &Node) -> 
             Err(Error::Corrupt("empty checkpoint blob checksum is invalid"))
         }
         (Mode::Set, _, _) => Err(Error::Corrupt("set checkpoint node references a blob")),
+        (Mode::Map, _, 0) => Err(Error::Corrupt(
+            "empty map checkpoint blob offset is nonzero",
+        )),
         (Mode::Map, 0, _) => Err(Error::Corrupt("map checkpoint blob offset is null")),
         (Mode::Map, offset, length) => {
             let length = u32::try_from(length)
@@ -968,6 +988,10 @@ mod tests {
         let occupied = database.hazards.acquire()?;
         assert!(matches!(database.checkpoint(), Err(Error::Busy(_))));
         drop(occupied);
+        assert!(!snapshot_path(&path, 0, "body").exists());
+        assert!(!snapshot_path(&path, 0, "body.counts").exists());
+        assert!(!snapshot_path(&path, 0, "blobs").exists());
+        assert!(!snapshot_path(&path, 0, "blobs.counts").exists());
         assert_eq!(database.checkpoint()?, 2);
         drop(database);
 

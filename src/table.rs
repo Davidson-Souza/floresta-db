@@ -170,12 +170,14 @@ impl Database {
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
         let guard = self.hazards.acquire()?;
+        self.reclaim_retired()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
         let found = self.find(bucket, hash, key, &guard)?;
         let Some(target) = found.node else {
             return Ok(false);
         };
+        let retirement = self.reserve_retirement(target.offset)?;
         let target_next = self.body.atomic_u64(target.offset)?;
         let next = loop {
             let observed = target_next.load(Ordering::Acquire);
@@ -194,9 +196,8 @@ impl Database {
                 break observed;
             }
         };
-        self.unlink_offset(bucket, target.offset, next, &guard)?;
+        self.unlink_offset(bucket, target.offset, next, &guard, retirement)?;
         guard.clear()?;
-        self.reclaim_retired()?;
         Ok(true)
     }
 
@@ -248,6 +249,7 @@ impl Database {
         guard: &HazardGuard<'_>,
     ) -> Result<PutResult> {
         self.validate_key(key)?;
+        self.reclaim_retired()?;
         let blob = self.allocate_blob(value)?;
         let blob_offset = blob.map_or(0, |allocation| allocation.offset);
         let blob_length = value.map_or(0, <[u8]>::len);
@@ -287,6 +289,10 @@ impl Database {
             } else {
                 (None, PutResult::Inserted)
             };
+            let retirement = match &existing {
+                Some(existing) => Some(self.reserve_retirement(existing.offset)?),
+                None => None,
+            };
             set_private_next(&self.body, node.offset, private_next, found.root)?;
             private_next = found.root;
             let incoming = self.head(bucket)?;
@@ -301,10 +307,12 @@ impl Database {
             {
                 if let Some(existing) = existing {
                     let successor = self.mark_node(existing.offset)?;
-                    self.unlink_offset(bucket, existing.offset, successor, guard)?;
+                    let retirement = retirement.ok_or(Error::Corrupt(
+                        "replacement retirement reservation is missing",
+                    ))?;
+                    self.unlink_offset(bucket, existing.offset, successor, guard, retirement)?;
                 }
                 guard.clear()?;
-                self.reclaim_retired()?;
                 return Ok(result);
             }
         }
@@ -411,7 +419,9 @@ impl Database {
         target: u64,
         successor: u64,
         guard: &HazardGuard<'_>,
+        retirement: RetireReservation<'_>,
     ) -> Result<()> {
+        let mut target_retirement = Some(retirement);
         'restart: loop {
             guard.clear()?;
             let mut link = Link::Head(bucket);
@@ -426,12 +436,14 @@ impl Database {
             while current != 0 {
                 let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
                 if current == target {
-                    let retirement = self.reserve_retirement(target)?;
                     if self
                         .link_atomic(link)?
                         .compare_exchange(target, successor, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        let retirement = target_retirement.take().ok_or(Error::Corrupt(
+                            "target retirement reservation was already consumed",
+                        ))?;
                         retirement.commit()?;
                         return Ok(());
                     }
@@ -439,7 +451,14 @@ impl Database {
                 }
                 if node.deleted() {
                     let next = node.successor();
-                    let retirement = self.reserve_retirement(current)?;
+                    let retirement = match self.retired.reserve(current) {
+                        Ok(retirement) => retirement,
+                        Err(Error::Busy(_)) => {
+                            std::hint::spin_loop();
+                            continue 'restart;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if self
                         .link_atomic(link)?
                         .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
