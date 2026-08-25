@@ -290,12 +290,28 @@ impl Database {
                 (None, PutResult::Inserted)
             };
             let retirement = match &existing {
-                Some(existing) => Some(self.reserve_retirement(existing.offset)?),
+                Some(existing) => match self.reserve_retirement(existing.offset) {
+                    Ok(retirement) => Some(retirement),
+                    Err(error) => {
+                        self.release_private(node, blob)?;
+                        return Err(error);
+                    }
+                },
                 None => None,
             };
-            set_private_next(&self.body, node.offset, private_next, found.root)?;
+            if let Err(error) = set_private_next(&self.body, node.offset, private_next, found.root)
+            {
+                self.release_private(node, blob)?;
+                return Err(error);
+            }
             private_next = found.root;
-            let incoming = self.head(bucket)?;
+            let incoming = match self.head(bucket) {
+                Ok(incoming) => incoming,
+                Err(error) => {
+                    self.release_private(node, blob)?;
+                    return Err(error);
+                }
+            };
             if incoming
                 .compare_exchange(
                     found.root,

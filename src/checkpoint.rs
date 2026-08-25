@@ -123,12 +123,6 @@ impl Database {
     /// Returns an error when another checkpoint is active, worker registration
     /// is exhausted, snapshot capacity is exhausted, or ordered flushing fails.
     pub fn checkpoint(&self) -> Result<u64> {
-        let failed_bank = self
-            .checkpoint_generation
-            .load(Ordering::Acquire)
-            .checked_add(1)
-            .ok_or(Error::CapacityExhausted("checkpoint generation"))?
-            & 1;
         self.checkpoint_state
             .compare_exchange(
                 CHECKPOINT_IDLE,
@@ -137,6 +131,22 @@ impl Database {
                 Ordering::Acquire,
             )
             .map_err(|_| Error::Busy("another checkpoint is active"))?;
+        let Some(failed_generation) = self
+            .checkpoint_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+        else {
+            self.checkpoint_state
+                .compare_exchange(
+                    CHECKPOINT_BUSY,
+                    CHECKPOINT_IDLE,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| Error::Corrupt("checkpoint state changed unexpectedly"))?;
+            return Err(Error::CapacityExhausted("checkpoint generation"));
+        };
+        let failed_bank = failed_generation & 1;
         let result = self.checkpoint_inner();
         if result.is_err() {
             let _cleanup = self.cleanup_failed_checkpoint(failed_bank);
