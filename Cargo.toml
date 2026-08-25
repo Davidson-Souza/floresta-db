@@ -1,0 +1,18 @@
+[package]
+name = "db-experiment"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A CAS-only concurrent mmap database experiment"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
