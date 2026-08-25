@@ -95,10 +95,13 @@ pub(crate) fn read_node(
     let key_end = key_start
         .checked_add(key_size)
         .ok_or(Error::Corrupt("node key range overflow"))?;
-    let key = bytes
+    let key_source = bytes
         .get(key_start..key_end)
-        .ok_or(Error::Corrupt("node key is out of bounds"))?
-        .to_vec();
+        .ok_or(Error::Corrupt("node key is out of bounds"))?;
+    let mut key = Vec::new();
+    key.try_reserve_exact(key_size)
+        .map_err(|_| Error::OutOfMemory)?;
+    key.extend_from_slice(key_source);
     if checksum != node_checksum(hash, blob_offset, blob_length, &key) {
         return Err(Error::Corrupt("body node checksum does not match"));
     }

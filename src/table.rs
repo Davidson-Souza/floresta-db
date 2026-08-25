@@ -5,6 +5,7 @@ use crate::allocator::{Allocation, BlockAllocator};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
+use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue};
 use crate::layout::{DELETED_BIT, HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, read_node, set_private_next};
@@ -24,6 +25,8 @@ pub struct Database {
     heads: MappedFile,
     body: BlockAllocator,
     blobs: Option<BlockAllocator>,
+    hazards: HazardRegistry,
+    retired: RetireQueue,
 }
 
 impl Database {
@@ -36,6 +39,8 @@ impl Database {
     pub fn create(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         config.validate()?;
         let node_size = config.node_size()?;
+        let hazards = HazardRegistry::new(config.max_threads)?;
+        let retired = RetireQueue::new(config.max_threads)?;
         let path = path.as_ref();
         std::fs::create_dir(path)?;
         let heads_length = heads_length(config.bucket_count)?;
@@ -64,6 +69,8 @@ impl Database {
             heads,
             body,
             blobs,
+            hazards,
+            retired,
         })
     }
 
@@ -76,7 +83,8 @@ impl Database {
         if self.config.mode != Mode::Set {
             return Err(Error::Unsupported("add is available only for sets"));
         }
-        self.put_inner(key, None)
+        let guard = self.hazards.acquire()?;
+        self.put_inner(key, None, &guard)
     }
 
     /// Inserts or replaces a map value.
@@ -89,7 +97,8 @@ impl Database {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("put is available only for maps"));
         }
-        self.put_inner(key, Some(value))
+        let guard = self.hazards.acquire()?;
+        self.put_inner(key, Some(value), &guard)
     }
 
     /// Returns a copied map value, allowing mapped storage to be reclaimed.
@@ -102,13 +111,15 @@ impl Database {
             return Err(Error::Unsupported("get is available only for maps"));
         }
         self.validate_key(key)?;
+        let guard = self.hazards.acquire()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let found = self.find(bucket, hash, key)?;
+        let found = self.find(bucket, hash, key, &guard)?;
         let Some(node) = found.node else {
             return Ok(None);
         };
         if node.blob_length == 0 {
+            guard.clear()?;
             return Ok(Some(Vec::new()));
         }
         let length = usize::try_from(node.blob_length)
@@ -117,7 +128,9 @@ impl Database {
             .blobs
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        Ok(Some(blobs.read(node.blob_offset, length)?))
+        let value = blobs.read(node.blob_offset, length)?;
+        guard.clear()?;
+        Ok(Some(value))
     }
 
     /// Tests membership in either a set or map.
@@ -127,9 +140,12 @@ impl Database {
     /// Returns an error for a wrong key width or corrupt storage.
     pub fn contains(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
+        let guard = self.hazards.acquire()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        Ok(self.find(bucket, hash, key)?.node.is_some())
+        let contains = self.find(bucket, hash, key, &guard)?.node.is_some();
+        guard.clear()?;
+        Ok(contains)
     }
 
     /// Logically marks and physically unlinks one key using CAS operations.
@@ -139,9 +155,10 @@ impl Database {
     /// Returns an error for a wrong key width or corrupt storage.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
+        let guard = self.hazards.acquire()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let found = self.find(bucket, hash, key)?;
+        let found = self.find(bucket, hash, key, &guard)?;
         let Some(target) = found.node else {
             return Ok(false);
         };
@@ -163,8 +180,19 @@ impl Database {
                 break observed;
             }
         };
-        self.unlink_offset(bucket, target.offset, next)?;
+        self.unlink_offset(bucket, target.offset, next, &guard)?;
+        guard.clear()?;
+        self.reclaim_retired()?;
         Ok(true)
+    }
+
+    /// Reclaims currently unprotected retired nodes and their values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if block counts or hole punching fail.
+    pub fn reclaim(&self) -> Result<usize> {
+        self.reclaim_retired()
     }
 
     /// Flushes mapped contents without defining a checkpoint generation.
@@ -189,7 +217,12 @@ impl Database {
         self.sync()
     }
 
-    fn put_inner(&self, key: &[u8], value: Option<&[u8]>) -> Result<PutResult> {
+    fn put_inner(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        guard: &HazardGuard<'_>,
+    ) -> Result<PutResult> {
         self.validate_key(key)?;
         let blob = self.allocate_blob(value)?;
         let blob_offset = blob.map_or(0, |allocation| allocation.offset);
@@ -216,35 +249,36 @@ impl Database {
         let bucket = hash % self.config.bucket_count;
         let mut private_next = 0;
         loop {
-            let found = match self.find(bucket, hash, key) {
+            let found = match self.find(bucket, hash, key, guard) {
                 Ok(found) => found,
                 Err(error) => {
                     self.release_private(node, blob)?;
                     return Err(error);
                 }
             };
-            let (link, expected, next, result) = if let Some(existing) = found.node {
-                (
-                    found.link,
-                    existing.offset,
-                    existing.successor(),
-                    PutResult::Replaced,
-                )
+            let (existing, result) = if let Some(existing) = found.node {
+                (Some(existing), PutResult::Replaced)
             } else {
-                (
-                    Link::Head(bucket),
-                    found.root,
-                    found.root,
-                    PutResult::Inserted,
-                )
+                (None, PutResult::Inserted)
             };
-            set_private_next(&self.body, node.offset, private_next, next)?;
-            private_next = next;
-            let incoming = self.link_atomic(link)?;
+            set_private_next(&self.body, node.offset, private_next, found.root)?;
+            private_next = found.root;
+            let incoming = self.head(bucket)?;
             if incoming
-                .compare_exchange(expected, node.offset, Ordering::Release, Ordering::Acquire)
+                .compare_exchange(
+                    found.root,
+                    node.offset,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
+                if let Some(existing) = existing {
+                    let successor = self.mark_node(existing.offset)?;
+                    self.unlink_offset(bucket, existing.offset, successor, guard)?;
+                }
+                guard.clear()?;
+                self.reclaim_retired()?;
                 return Ok(result);
             }
         }
@@ -284,10 +318,17 @@ impl Database {
             .release(allocation)
     }
 
-    fn find(&self, bucket: u64, hash: u64, key: &[u8]) -> Result<Found> {
+    fn find(&self, bucket: u64, hash: u64, key: &[u8], guard: &HazardGuard<'_>) -> Result<Found> {
         'restart: loop {
+            guard.clear()?;
             let mut link = Link::Head(bucket);
             let root = self.link_atomic(link)?.load(Ordering::Acquire);
+            let mut predecessor_hazard = 0_usize;
+            let mut current_hazard = 1_usize;
+            guard.protect(current_hazard, root)?;
+            if self.link_atomic(link)?.load(Ordering::Acquire) != root {
+                continue;
+            }
             let mut current = root;
             while current != 0 {
                 if current & DELETED_BIT != 0 {
@@ -303,31 +344,47 @@ impl Database {
                     {
                         continue 'restart;
                     }
-                    current = successor;
-                    continue;
+                    self.retire_node(current)?;
+                    continue 'restart;
                 }
                 if node.hash == hash && node.key == key {
                     return Ok(Found {
-                        link,
                         node: Some(node),
                         root,
                     });
                 }
+                let observed_next = node.next;
+                let successor = node.successor();
+                guard.protect(predecessor_hazard, successor)?;
+                if self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next {
+                    continue 'restart;
+                }
                 link = Link::Node(current);
-                current = node.successor();
+                current = successor;
+                std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
             }
-            return Ok(Found {
-                link,
-                node: None,
-                root,
-            });
+            return Ok(Found { node: None, root });
         }
     }
 
-    fn unlink_offset(&self, bucket: u64, target: u64, successor: u64) -> Result<()> {
+    fn unlink_offset(
+        &self,
+        bucket: u64,
+        target: u64,
+        successor: u64,
+        guard: &HazardGuard<'_>,
+    ) -> Result<()> {
         'restart: loop {
+            guard.clear()?;
             let mut link = Link::Head(bucket);
-            let mut current = self.link_atomic(link)?.load(Ordering::Acquire);
+            let root = self.link_atomic(link)?.load(Ordering::Acquire);
+            let mut predecessor_hazard = 0_usize;
+            let mut current_hazard = 1_usize;
+            guard.protect(current_hazard, root)?;
+            if self.link_atomic(link)?.load(Ordering::Acquire) != root {
+                continue;
+            }
+            let mut current = root;
             while current != 0 {
                 let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
                 if current == target {
@@ -336,6 +393,7 @@ impl Database {
                         .compare_exchange(target, successor, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        self.retire_node(target)?;
                         return Ok(());
                     }
                     continue 'restart;
@@ -349,13 +407,86 @@ impl Database {
                     {
                         continue 'restart;
                     }
-                    current = next;
-                    continue;
+                    self.retire_node(current)?;
+                    continue 'restart;
+                }
+                let observed_next = node.next;
+                let next = node.successor();
+                guard.protect(predecessor_hazard, next)?;
+                if self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next {
+                    continue 'restart;
                 }
                 link = Link::Node(current);
-                current = node.successor();
+                current = next;
+                std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
             }
             return Ok(());
+        }
+    }
+
+    fn mark_node(&self, offset: u64) -> Result<u64> {
+        let next = self.body.atomic_u64(offset)?;
+        loop {
+            let observed = next.load(Ordering::Acquire);
+            if observed & DELETED_BIT != 0 {
+                return Ok(observed & !DELETED_BIT);
+            }
+            if next
+                .compare_exchange(
+                    observed,
+                    observed | DELETED_BIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(observed);
+            }
+        }
+    }
+
+    fn retire_node(&self, offset: u64) -> Result<()> {
+        match self.retired.publish(offset) {
+            Ok(()) => Ok(()),
+            Err(Error::Busy(_)) => {
+                self.reclaim_retired()?;
+                self.retired.publish(offset)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn reclaim_retired(&self) -> Result<usize> {
+        self.retired
+            .reclaim(&self.hazards, |offset| self.release_retired(offset))
+    }
+
+    fn release_retired(&self, offset: u64) -> Result<()> {
+        let node = read_node(&self.body, offset, self.node_size, self.config.key_size)?;
+        let mut first_error = None;
+        if node.blob_length != 0 {
+            let length = u32::try_from(node.blob_length)
+                .map_err(|_| Error::Corrupt("retired blob length exceeds one block"))?;
+            let blob = self
+                .blobs
+                .as_ref()
+                .ok_or(Error::Corrupt("retired map node has no blob allocator"))?;
+            let allocation = blob.allocation_for(node.blob_offset, length)?;
+            if let Err(error) = blob.release(allocation) {
+                first_error = Some(error);
+            }
+        }
+        let node_length = u32::try_from(self.node_size)
+            .map_err(|_| Error::Corrupt("retired body node length overflow"))?;
+        let allocation = self.body.allocation_for(offset, node_length)?;
+        if let Err(error) = self.body.release(allocation) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -395,7 +526,6 @@ enum Link {
 }
 
 struct Found {
-    link: Link,
     node: Option<Node>,
     root: u64,
 }
@@ -529,6 +659,89 @@ mod tests {
         });
         assert!(database.delete(b"same-key")?);
         assert_eq!(database.get(b"same-key")?, None);
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hazard_delays_online_hole_punching() -> Result<()> {
+        let path = test_directory("hazard-reclaim");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut test_config = config(Mode::Set, 1, 4_000);
+        test_config.block_size = PAGE_SIZE;
+        test_config.body_capacity = PAGE_SIZE * 8;
+        let database = Database::create(&path, test_config)?;
+        let key = vec![7; 4_000];
+        database.add(&key)?;
+
+        let guard = database.hazards.acquire()?;
+        let hash = xxh64(&key, database.config.hash_seed);
+        let found = database.find(0, hash, &key, &guard)?;
+        let old_offset = found
+            .node
+            .ok_or(Error::Corrupt("test could not find inserted key"))?
+            .offset;
+        std::thread::scope(|scope| scope.spawn(|| database.add(&key)).join())
+            .map_err(|_| Error::Corrupt("replacement test thread panicked"))??;
+        assert!(
+            database
+                .body
+                .read(old_offset, 8)?
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+
+        guard.clear()?;
+        assert!(database.reclaim()? > 0);
+        assert!(
+            database
+                .body
+                .read(old_offset, 8)?
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        drop(guard);
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readers_never_observe_invalid_replacement_state() -> Result<()> {
+        let path = test_directory("read-replace-race");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut test_config = config(Mode::Map, 1, 8);
+        test_config.body_capacity = test_config.block_size * 16;
+        test_config.blob_capacity = test_config.block_size * 16;
+        let database = Database::create(&path, test_config)?;
+        database.put(b"race-key", &0_u64.to_le_bytes())?;
+        std::thread::scope(|scope| -> Result<()> {
+            let writer = scope.spawn(|| -> Result<()> {
+                for value in 1_u64..1_000 {
+                    database.put(b"race-key", &value.to_le_bytes())?;
+                }
+                Ok(())
+            });
+            let reader = scope.spawn(|| -> Result<()> {
+                for _iteration in 0..1_000 {
+                    let value = database
+                        .get(b"race-key")?
+                        .ok_or(Error::Corrupt("replacement made the key disappear"))?;
+                    if value.len() != size_of::<u64>() {
+                        return Err(Error::Corrupt("reader observed an invalid value"));
+                    }
+                }
+                Ok(())
+            });
+            writer
+                .join()
+                .map_err(|_| Error::Corrupt("writer test thread panicked"))??;
+            reader
+                .join()
+                .map_err(|_| Error::Corrupt("reader test thread panicked"))??;
+            Ok(())
+        })?;
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())

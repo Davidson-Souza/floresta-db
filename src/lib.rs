@@ -4,6 +4,7 @@ mod allocator;
 mod config;
 mod error;
 mod hash;
+mod hazard;
 mod layout;
 mod mapped_file;
 mod node;
