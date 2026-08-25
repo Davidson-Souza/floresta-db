@@ -32,6 +32,13 @@ pub(crate) struct RetireQueue {
     slots: Vec<RetiredSlot>,
 }
 
+pub(crate) struct RetireReservation<'queue> {
+    queue: &'queue RetireQueue,
+    index: usize,
+    offset: u64,
+    active: bool,
+}
+
 impl HazardRegistry {
     pub(crate) fn new(max_threads: u16) -> Result<Self> {
         let capacity = usize::from(max_threads);
@@ -133,11 +140,11 @@ impl RetireQueue {
         Ok(Self { slots })
     }
 
-    pub(crate) fn publish(&self, offset: u64) -> Result<()> {
+    pub(crate) fn reserve(&self, offset: u64) -> Result<RetireReservation<'_>> {
         if offset == 0 {
             return Err(Error::Corrupt("cannot retire a null offset"));
         }
-        for slot in &self.slots {
+        for (index, slot) in self.slots.iter().enumerate() {
             if slot
                 .state
                 .compare_exchange(
@@ -163,15 +170,12 @@ impl RetireQueue {
                 );
                 return Err(Error::Corrupt("retirement slot was not empty"));
             }
-            slot.state
-                .compare_exchange(
-                    RETIRE_RESERVED,
-                    RETIRE_PUBLISHED,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                )
-                .map_err(|_| Error::Corrupt("retirement publication state changed"))?;
-            return Ok(());
+            return Ok(RetireReservation {
+                queue: self,
+                index,
+                offset,
+                active: true,
+            });
         }
         Err(Error::Busy("retirement queue is full"))
     }
@@ -241,6 +245,49 @@ impl RetireQueue {
     }
 }
 
+impl RetireReservation<'_> {
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let slot = self
+            .queue
+            .slots
+            .get(self.index)
+            .ok_or(Error::Corrupt("retirement reservation index is invalid"))?;
+        slot.state
+            .compare_exchange(
+                RETIRE_RESERVED,
+                RETIRE_PUBLISHED,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map_err(|_| Error::Corrupt("retirement publication state changed"))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for RetireReservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(slot) = self.queue.slots.get(self.index) else {
+            return;
+        };
+        if slot
+            .offset
+            .compare_exchange(self.offset, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _released = slot.state.compare_exchange(
+                RETIRE_RESERVED,
+                RETIRE_FREE,
+                Ordering::Release,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 fn cas_replace(atomic: &AtomicU64, replacement: u64) {
     let mut observed = atomic.load(Ordering::SeqCst);
     loop {
@@ -272,7 +319,7 @@ mod tests {
         let retired = RetireQueue::new(1)?;
         let guard = registry.acquire()?;
         guard.protect(1, 9)?;
-        retired.publish(9)?;
+        retired.reserve(9)?.commit()?;
         assert_eq!(retired.reclaim(&registry, |_offset| Ok(()))?, 0);
         guard.clear()?;
         let mut released = 0;
@@ -291,7 +338,7 @@ mod tests {
     fn failed_release_remains_queued_for_retry() -> Result<()> {
         let registry = HazardRegistry::new(1)?;
         let retired = RetireQueue::new(1)?;
-        retired.publish(11)?;
+        retired.reserve(11)?.commit()?;
         assert!(matches!(
             retired.reclaim(&registry, |_offset| Err(Error::Corrupt(
                 "injected release failure"
@@ -307,6 +354,17 @@ mod tests {
             1
         );
         assert_eq!(released, 11);
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_reservation_returns_its_slot_without_publication() -> Result<()> {
+        let registry = HazardRegistry::new(1)?;
+        let retired = RetireQueue::new(1)?;
+        drop(retired.reserve(13)?);
+        assert_eq!(retired.reclaim(&registry, |_offset| Ok(()))?, 0);
+        retired.reserve(14)?.commit()?;
+        assert_eq!(retired.reclaim(&registry, |_offset| Ok(()))?, 1);
         Ok(())
     }
 }

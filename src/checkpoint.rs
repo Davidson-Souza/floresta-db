@@ -747,7 +747,10 @@ fn read_manifest(heads: &MappedFile, bank: u64) -> Result<Option<Manifest>> {
     let stored_bank = heads.atomic_u64(offset + 16)?.load(Ordering::Acquire);
     let checksum = heads.atomic_u64(offset + 24)?.load(Ordering::Acquire);
     let snapshot_checksum = heads.atomic_u64(offset + 32)?.load(Ordering::Acquire);
-    if stored_bank != bank || checksum != manifest_checksum(generation, bank, snapshot_checksum) {
+    if stored_bank != bank
+        || generation & 1 != bank
+        || checksum != manifest_checksum(generation, bank, snapshot_checksum)
+    {
         return Ok(None);
     }
     Ok(Some(Manifest {
@@ -842,9 +845,11 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 
 fn sync_namespace(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1102,6 +1107,53 @@ mod tests {
             false,
         )?;
         cas_replace(heads.atomic_u64(24)?, config.bucket_count + 1);
+        heads.sync_all()?;
+        drop(heads);
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_supports_single_component_relative_paths() -> Result<()> {
+        let path = PathBuf::from(format!(
+            "db-experiment-relative-checkpoint-{}",
+            std::process::id()
+        ));
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, test_config())?;
+        database.put(b"only-key", b"value")?;
+        assert_eq!(database.checkpoint()?, 1);
+        drop(database);
+        let reopened = Database::open(&path)?;
+        assert_eq!(reopened.get(b"only-key")?, Some(b"value".to_vec()));
+        drop(reopened);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_manifest_with_wrong_generation_parity() -> Result<()> {
+        let path = test_directory("checkpoint-manifest-parity");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let config = test_config();
+        let database = Database::create(&path, config.clone())?;
+        database.put(b"only-key", b"value")?;
+        database.checkpoint()?;
+        drop(database);
+
+        let heads = MappedFile::open(
+            &path.join("heads"),
+            heads_length(config.bucket_count)?,
+            false,
+        )?;
+        let offset = manifest_offset(1)?;
+        let snapshot_checksum = heads.atomic_u64(offset + 32)?.load(Ordering::Acquire);
+        cas_replace(heads.atomic_u64(offset + 8)?, 2);
+        cas_replace(
+            heads.atomic_u64(offset + 24)?,
+            manifest_checksum(2, 1, snapshot_checksum),
+        );
         heads.sync_all()?;
         drop(heads);
         assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));

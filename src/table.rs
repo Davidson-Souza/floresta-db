@@ -5,7 +5,7 @@ use crate::allocator::{Allocation, BlockAllocator};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
-use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue};
+use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue, RetireReservation};
 use crate::layout::{DELETED_BIT, HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
@@ -330,18 +330,29 @@ impl Database {
     }
 
     fn release_private(&self, node: Allocation, blob: Option<Allocation>) -> Result<()> {
-        self.body.release(node)?;
-        if let Some(blob) = blob {
-            self.release_blob(blob)?;
+        self.body.validate_release(node)?;
+        if let (Some(blobs), Some(blob)) = (&self.blobs, blob) {
+            blobs.validate_release(blob)?;
+            blobs.release_count(blob)?;
         }
-        Ok(())
+        self.body.release_count(node)?;
+
+        let body_result = self.body.reclaim_block(node.block);
+        let blob_result = match (&self.blobs, blob) {
+            (Some(blobs), Some(blob)) => blobs.reclaim_block(blob.block),
+            _ => Ok(()),
+        };
+        body_result?;
+        blob_result
     }
 
     fn release_blob(&self, allocation: Allocation) -> Result<()> {
-        self.blobs
+        let blobs = self
+            .blobs
             .as_ref()
-            .ok_or(Error::Corrupt("map has no blob allocator"))?
-            .release(allocation)
+            .ok_or(Error::Corrupt("map has no blob allocator"))?;
+        blobs.release_count(allocation)?;
+        blobs.reclaim_block(allocation.block)
     }
 
     fn find(&self, bucket: u64, hash: u64, key: &[u8], guard: &HazardGuard<'_>) -> Result<Found> {
@@ -363,6 +374,7 @@ impl Database {
                 let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
                 if node.deleted() {
                     let successor = node.successor();
+                    let retirement = self.reserve_retirement(current)?;
                     if self
                         .link_atomic(link)?
                         .compare_exchange(current, successor, Ordering::AcqRel, Ordering::Acquire)
@@ -370,7 +382,7 @@ impl Database {
                     {
                         continue 'restart;
                     }
-                    self.retire_node(current)?;
+                    retirement.commit()?;
                     continue 'restart;
                 }
                 if node.hash == hash && node.key == key {
@@ -414,18 +426,20 @@ impl Database {
             while current != 0 {
                 let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
                 if current == target {
+                    let retirement = self.reserve_retirement(target)?;
                     if self
                         .link_atomic(link)?
                         .compare_exchange(target, successor, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.retire_node(target)?;
+                        retirement.commit()?;
                         return Ok(());
                     }
                     continue 'restart;
                 }
                 if node.deleted() {
                     let next = node.successor();
+                    let retirement = self.reserve_retirement(current)?;
                     if self
                         .link_atomic(link)?
                         .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
@@ -433,7 +447,7 @@ impl Database {
                     {
                         continue 'restart;
                     }
-                    self.retire_node(current)?;
+                    retirement.commit()?;
                     continue 'restart;
                 }
                 let observed_next = node.next;
@@ -471,13 +485,12 @@ impl Database {
         }
     }
 
-    fn retire_node(&self, offset: u64) -> Result<()> {
-        match self.retired.publish(offset) {
-            Ok(()) => Ok(()),
+    fn reserve_retirement(&self, offset: u64) -> Result<RetireReservation<'_>> {
+        match self.retired.reserve(offset) {
+            Ok(reservation) => Ok(reservation),
             Err(Error::Busy(_)) => {
-                let reclaim_result = self.reclaim_retired();
-                self.retired.publish(offset)?;
-                reclaim_result.map(|_reclaimed| ())
+                self.reclaim_retired()?;
+                self.retired.reserve(offset)
             }
             Err(error) => Err(error),
         }
