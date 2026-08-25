@@ -208,9 +208,18 @@ impl RetireQueue {
                 continue;
             }
             if let Err(error) = release(offset) {
+                slot.state
+                    .compare_exchange(
+                        RETIRE_CLAIMED,
+                        RETIRE_PUBLISHED,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|_| Error::Corrupt("failed retirement state changed"))?;
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+                continue;
             }
             slot.offset
                 .compare_exchange(offset, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -275,6 +284,29 @@ mod tests {
             1
         );
         assert_eq!(released, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_release_remains_queued_for_retry() -> Result<()> {
+        let registry = HazardRegistry::new(1)?;
+        let retired = RetireQueue::new(1)?;
+        retired.publish(11)?;
+        assert!(matches!(
+            retired.reclaim(&registry, |_offset| Err(Error::Corrupt(
+                "injected release failure"
+            ))),
+            Err(Error::Corrupt(_))
+        ));
+        let mut released = 0;
+        assert_eq!(
+            retired.reclaim(&registry, |offset| {
+                released = offset;
+                Ok(())
+            })?,
+            1
+        );
+        assert_eq!(released, 11);
         Ok(())
     }
 }

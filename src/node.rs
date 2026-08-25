@@ -41,7 +41,6 @@ pub(crate) fn allocate_node(
 ) -> Result<Allocation> {
     let node_size_usize = usize::try_from(node_size)
         .map_err(|_| Error::InvalidConfig("node size does not fit memory"))?;
-    let allocation = body.allocate(node_size_usize, 8)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(node_size_usize)
@@ -61,7 +60,11 @@ pub(crate) fn allocate_node(
     key_destination.copy_from_slice(key);
     let checksum = node_checksum(hash, blob_offset, blob_length, blob_checksum, key);
     write_u64(&mut bytes, NODE_CHECKSUM_OFFSET, checksum)?;
-    body.write(allocation, &bytes)?;
+    let allocation = body.allocate(node_size_usize, 8)?;
+    if let Err(error) = body.write(allocation, &bytes) {
+        let _released = body.release(allocation);
+        return Err(error);
+    }
     Ok(allocation)
 }
 

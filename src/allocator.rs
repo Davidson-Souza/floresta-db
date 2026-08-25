@@ -140,9 +140,23 @@ impl BlockAllocator {
                 continue;
             }
             let old_count = count(old);
+            if old_count == MAX_COUNT {
+                let sealed = pack(BlockState::Sealed, used(old), old_count);
+                if word
+                    .compare_exchange(old, sealed, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let _advanced = current.compare_exchange(
+                        block,
+                        block + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                continue;
+            }
             let new_count = old_count
                 .checked_add(1)
-                .filter(|value| *value <= MAX_COUNT)
                 .ok_or(Error::CapacityExhausted("block object count"))?;
             let end_u32 =
                 u32::try_from(end).map_err(|_| Error::CapacityExhausted("block offset"))?;
@@ -170,6 +184,24 @@ impl BlockAllocator {
     }
 
     pub(crate) fn release(&self, allocation: Allocation) -> Result<()> {
+        self.release_count(allocation)?;
+        self.punch_if_empty(allocation.block)
+    }
+
+    pub(crate) fn validate_release(&self, allocation: Allocation) -> Result<()> {
+        let old = self.block_word(allocation.block)?.load(Ordering::Acquire);
+        if !matches!(state(old)?, BlockState::Open | BlockState::Sealed) {
+            return Err(Error::Corrupt(
+                "released allocation belongs to an inactive block",
+            ));
+        }
+        if count(old) == 0 {
+            return Err(Error::Corrupt("block object count underflow"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_count(&self, allocation: Allocation) -> Result<()> {
         let word = self.block_word(allocation.block)?;
         loop {
             let old = word.load(Ordering::Acquire);
@@ -187,12 +219,20 @@ impl BlockAllocator {
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                if block_state == BlockState::Sealed && new_count == 0 {
-                    self.punch_if_empty(allocation.block)?;
-                }
                 return Ok(());
             }
         }
+    }
+
+    pub(crate) fn reclaim_empty_blocks(&self) -> Result<()> {
+        for block in 0..self.block_count {
+            self.punch_if_empty(block)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reclaim_block(&self, block: u64) -> Result<()> {
+        self.punch_if_empty(block)
     }
 
     pub(crate) fn seal_current(&self) -> Result<()> {
@@ -481,6 +521,31 @@ mod tests {
                 });
             }
         });
+        drop(allocator);
+        std::fs::remove_file(data_path)?;
+        std::fs::remove_file(count_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn advances_when_a_block_object_count_is_saturated() -> Result<()> {
+        let (data_path, count_path) = test_paths("allocator-count-saturation");
+        let _ignored_data = std::fs::remove_file(&data_path);
+        let _ignored_counts = std::fs::remove_file(&count_path);
+        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+        let first = allocator.allocate(8, 8)?;
+        let word = allocator.block_word(first.block)?;
+        loop {
+            let old = word.load(Ordering::Acquire);
+            let saturated = pack(BlockState::Open, used(old), MAX_COUNT);
+            if word
+                .compare_exchange(old, saturated, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        assert_eq!(allocator.allocate(8, 8)?.block, 1);
         drop(allocator);
         std::fs::remove_file(data_path)?;
         std::fs::remove_file(count_path)?;

@@ -207,7 +207,16 @@ impl Database {
     /// Returns a storage error if block counts or hole punching fail.
     pub fn reclaim(&self) -> Result<usize> {
         let _guard = self.hazards.acquire()?;
-        self.reclaim_retired()
+        let reclaimed = self.reclaim_retired();
+        let body_retry = self.body.reclaim_empty_blocks();
+        let blob_retry = self
+            .blobs
+            .as_ref()
+            .map_or(Ok(()), BlockAllocator::reclaim_empty_blocks);
+        let reclaimed = reclaimed?;
+        body_retry?;
+        blob_retry?;
+        Ok(reclaimed)
     }
 
     /// Flushes mapped contents without defining a checkpoint generation.
@@ -466,45 +475,65 @@ impl Database {
         match self.retired.publish(offset) {
             Ok(()) => Ok(()),
             Err(Error::Busy(_)) => {
-                self.reclaim_retired()?;
-                self.retired.publish(offset)
+                let reclaim_result = self.reclaim_retired();
+                self.retired.publish(offset)?;
+                reclaim_result.map(|_reclaimed| ())
             }
             Err(error) => Err(error),
         }
     }
 
     fn reclaim_retired(&self) -> Result<usize> {
-        self.retired
-            .reclaim(&self.hazards, |offset| self.release_retired(offset))
+        let mut first_punch_error = None;
+        let reclaimed = self.retired.reclaim(&self.hazards, |offset| {
+            let (body_block, blob_block) = self.release_retired(offset)?;
+            if let Err(error) = self.body.reclaim_block(body_block) {
+                if first_punch_error.is_none() {
+                    first_punch_error = Some(error);
+                }
+            }
+            if let (Some(blobs), Some(block)) = (&self.blobs, blob_block) {
+                if let Err(error) = blobs.reclaim_block(block) {
+                    if first_punch_error.is_none() {
+                        first_punch_error = Some(error);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        match first_punch_error {
+            Some(error) => Err(error),
+            None => Ok(reclaimed),
+        }
     }
 
-    fn release_retired(&self, offset: u64) -> Result<()> {
+    fn release_retired(&self, offset: u64) -> Result<(u64, Option<u64>)> {
         let node = read_node(&self.body, offset, self.node_size, self.config.key_size)?;
-        let mut first_error = None;
-        if node.blob_length != 0 {
+        let blob_allocation = if node.blob_length == 0 {
+            None
+        } else {
             let length = u32::try_from(node.blob_length)
                 .map_err(|_| Error::Corrupt("retired blob length exceeds one block"))?;
             let blob = self
                 .blobs
                 .as_ref()
                 .ok_or(Error::Corrupt("retired map node has no blob allocator"))?;
-            let allocation = blob.allocation_for(node.blob_offset, length)?;
-            if let Err(error) = blob.release(allocation) {
-                first_error = Some(error);
-            }
-        }
+            Some(blob.allocation_for(node.blob_offset, length)?)
+        };
         let node_length = u32::try_from(self.node_size)
             .map_err(|_| Error::Corrupt("retired body node length overflow"))?;
-        let allocation = self.body.allocation_for(offset, node_length)?;
-        if let Err(error) = self.body.release(allocation) {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        let body_allocation = self.body.allocation_for(offset, node_length)?;
+
+        self.body.validate_release(body_allocation)?;
+        if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
+            blobs.validate_release(allocation)?;
+            blobs.release_count(allocation)?;
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.body.release_count(body_allocation)?;
+        Ok((
+            body_allocation.block,
+            blob_allocation.map(|allocation| allocation.block),
+        ))
     }
 
     fn validate_key(&self, key: &[u8]) -> Result<()> {
