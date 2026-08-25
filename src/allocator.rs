@@ -36,6 +36,7 @@ pub(crate) struct Allocation {
 pub(crate) struct BlockAllocator {
     data: MappedFile,
     counts: MappedFile,
+    capacity: u64,
     block_size: u64,
     block_count: u64,
 }
@@ -64,6 +65,7 @@ impl BlockAllocator {
         Ok(Self {
             data,
             counts,
+            capacity,
             block_size,
             block_count,
         })
@@ -215,11 +217,32 @@ impl BlockAllocator {
     }
 
     pub(crate) fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
+        self.validate_data_range(offset, length)?;
         self.data.copy_out(offset, length)
     }
 
     pub(crate) fn atomic_u64(&self, offset: u64) -> Result<&AtomicU64> {
+        self.validate_data_range(offset, size_of::<u64>())?;
         self.data.atomic_u64(offset)
+    }
+
+    pub(crate) fn allocation_for(&self, offset: u64, length: u32) -> Result<Allocation> {
+        self.validate_data_range(offset, length as usize)?;
+        let relative = offset
+            .checked_sub(DATA_START)
+            .ok_or(Error::Corrupt("allocation points into the file header"))?;
+        let block = relative / self.block_size;
+        let end_relative = relative
+            .checked_add(u64::from(length))
+            .ok_or(Error::Corrupt("allocation range overflow"))?;
+        if end_relative.saturating_sub(1) / self.block_size != block {
+            return Err(Error::Corrupt("allocation crosses a block boundary"));
+        }
+        Ok(Allocation {
+            offset,
+            length,
+            block,
+        })
     }
 
     pub(crate) fn sync_all(&self) -> Result<()> {
@@ -315,6 +338,20 @@ impl BlockAllocator {
             .and_then(|value| value.checked_add(COUNTS_START))
             .ok_or(Error::Corrupt("block-count offset overflow"))?;
         self.counts.atomic_u64(offset)
+    }
+
+    fn validate_data_range(&self, offset: u64, length: usize) -> Result<()> {
+        let length = u64::try_from(length).map_err(|_| Error::Corrupt("data length overflow"))?;
+        let relative = offset
+            .checked_sub(DATA_START)
+            .ok_or(Error::Corrupt("data offset points into the file header"))?;
+        let end = relative
+            .checked_add(length)
+            .ok_or(Error::Corrupt("data range overflow"))?;
+        if end > self.capacity {
+            return Err(Error::Corrupt("data range is out of bounds"));
+        }
+        Ok(())
     }
 }
 
