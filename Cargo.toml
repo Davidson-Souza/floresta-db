@@ -7,6 +7,17 @@ description = "A CAS-only concurrent mmap database experiment"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+bitcoin = { version = "0.32.7", optional = true }
+corepc-client = { version = "0.16.0", features = ["client-sync"], optional = true }
+
+[features]
+default = []
+bitcoin-load = ["dep:bitcoin", "dep:corepc-client"]
+
+[[bin]]
+name = "bitcoin-load"
+path = "src/bin/bitcoin_load/main.rs"
+required-features = ["bitcoin-load"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
