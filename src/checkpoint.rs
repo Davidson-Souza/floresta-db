@@ -171,6 +171,8 @@ impl Database {
             if runtime_head.load(Ordering::Acquire) != source_root {
                 continue;
             }
+            #[cfg(test)]
+            checkpoint_capture_hook(bucket);
             let mut predecessor_hazard = 0_usize;
             let mut current_hazard = 1_usize;
             let mut current = source_root;
@@ -228,6 +230,10 @@ impl Database {
                 }
                 current = successor;
                 std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
+            }
+            if runtime_head.load(Ordering::Acquire) != source_root {
+                release_snapshot_chain(snapshot, snapshot_root, &self.config, self.node_size)?;
+                continue;
             }
             return Ok(snapshot_root);
         }
@@ -593,6 +599,26 @@ fn cas_replace(atomic: &AtomicU64, replacement: u64) {
     }
 }
 
+#[cfg(test)]
+static CHECKPOINT_CAPTURE_HOOK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn checkpoint_capture_hook(bucket: u64) {
+    if bucket != 0 {
+        return;
+    }
+    if CHECKPOINT_CAPTURE_HOOK
+        .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        while CHECKPOINT_CAPTURE_HOOK.load(Ordering::SeqCst) != 3 {
+            std::hint::spin_loop();
+        }
+        let _reset =
+            CHECKPOINT_CAPTURE_HOOK.compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
@@ -683,6 +709,40 @@ mod tests {
 
         let reopened = Database::open(&path)?;
         assert_eq!(reopened.get(b"only-key")?, Some(b"value".to_vec()));
+        drop(reopened);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_restarts_when_replacement_marks_its_captured_root() -> Result<()> {
+        let path = test_directory("checkpoint-replace-root");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut config = test_config();
+        config.bucket_count = 1;
+        let database = Database::create(&path, config)?;
+        database.put(b"only-key", b"old")?;
+        CHECKPOINT_CAPTURE_HOOK
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::Corrupt("checkpoint test hook was already active"))?;
+        std::thread::scope(|scope| -> Result<()> {
+            let checkpoint = scope.spawn(|| database.checkpoint());
+            while CHECKPOINT_CAPTURE_HOOK.load(Ordering::SeqCst) != 2 {
+                std::hint::spin_loop();
+            }
+            database.put(b"only-key", b"new")?;
+            CHECKPOINT_CAPTURE_HOOK
+                .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| Error::Corrupt("checkpoint test hook changed unexpectedly"))?;
+            checkpoint
+                .join()
+                .map_err(|_| Error::Corrupt("checkpoint test thread panicked"))??;
+            Ok(())
+        })?;
+        drop(database);
+
+        let reopened = Database::open(&path)?;
+        assert_eq!(reopened.get(b"only-key")?, Some(b"new".to_vec()));
         drop(reopened);
         std::fs::remove_dir_all(path)?;
         Ok(())

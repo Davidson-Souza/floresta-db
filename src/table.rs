@@ -198,6 +198,7 @@ impl Database {
     ///
     /// Returns a storage error if block counts or hole punching fail.
     pub fn reclaim(&self) -> Result<usize> {
+        let _guard = self.hazards.acquire()?;
         self.reclaim_retired()
     }
 
