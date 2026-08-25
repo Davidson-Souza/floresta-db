@@ -22,6 +22,7 @@ const MANIFEST_STRIDE: u64 = 64;
 struct Manifest {
     generation: u64,
     bank: u64,
+    snapshot_checksum: u64,
 }
 
 struct SnapshotFiles {
@@ -47,9 +48,32 @@ impl Database {
                 "heads file length does not match its configuration",
             ));
         }
-        let manifest = read_latest_manifest(&heads)?;
-        let snapshot = open_snapshot(path, &config, manifest.bank)?;
+        let manifests = read_manifests(&heads)?;
+        drop(heads);
+        let mut first_error = None;
+        for manifest in manifests.into_iter().flatten() {
+            match Self::open_generation(path, &config, node_size, mapped_length, manifest) {
+                Ok(database) => return Ok(database),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        Err(first_error.unwrap_or(Error::Corrupt("database has no valid checkpoint")))
+    }
 
+    fn open_generation(
+        path: &Path,
+        config: &Config,
+        node_size: u64,
+        mapped_length: u64,
+        manifest: Manifest,
+    ) -> Result<Self> {
+        let heads = MappedFile::open(&path.join("heads"), mapped_length, true)?;
+        let snapshot = open_snapshot(path, config, manifest.bank)?;
+        validate_snapshot(&heads, &snapshot, config, node_size, manifest)?;
         remove_runtime_files(path, config.mode)?;
         let body = BlockAllocator::create(
             &path.join("body"),
@@ -70,7 +94,7 @@ impl Database {
         let hazards = HazardRegistry::new(config.max_threads)?;
         let retired = RetireQueue::new(config.max_threads)?;
         let database = Self {
-            config,
+            config: config.clone(),
             node_size,
             heads,
             body,
@@ -139,12 +163,22 @@ impl Database {
         }
         guard.clear()?;
 
+        let snapshot_checksum =
+            snapshot_checksum(&self.heads, &snapshot, &self.config, self.node_size, bank)?;
         snapshot.body.sync_all()?;
         if let Some(blobs) = &snapshot.blobs {
             blobs.sync_all()?;
         }
+        sync_namespace(&self.path)?;
         self.heads.sync_all()?;
-        write_manifest(&self.heads, Manifest { generation, bank })?;
+        write_manifest(
+            &self.heads,
+            Manifest {
+                generation,
+                bank,
+                snapshot_checksum,
+            },
+        )?;
         self.heads.sync_all()?;
         self.checkpoint_generation
             .compare_exchange(
@@ -177,6 +211,7 @@ impl Database {
             let mut current_hazard = 1_usize;
             let mut current = source_root;
             let mut snapshot_root = 0_u64;
+            let mut snapshot_tail = 0_u64;
             while current != 0 {
                 let node =
                     match read_node(&self.body, current, self.node_size, self.config.key_size) {
@@ -206,10 +241,31 @@ impl Database {
                         &snapshot.body,
                         snapshot.blobs.as_ref(),
                         &node,
-                        snapshot_root,
+                        0,
                         self.node_size,
                     ) {
-                        Ok(root) => snapshot_root = root,
+                        Ok(copied) => {
+                            if snapshot_root == 0 {
+                                snapshot_root = copied;
+                            } else if let Err(error) =
+                                set_private_next(&snapshot.body, snapshot_tail, 0, copied)
+                            {
+                                release_snapshot_node(
+                                    snapshot,
+                                    copied,
+                                    &self.config,
+                                    self.node_size,
+                                )?;
+                                release_snapshot_chain(
+                                    snapshot,
+                                    snapshot_root,
+                                    &self.config,
+                                    self.node_size,
+                                )?;
+                                return Err(error);
+                            }
+                            snapshot_tail = copied;
+                        }
                         Err(error) => {
                             release_snapshot_chain(
                                 snapshot,
@@ -280,17 +336,7 @@ impl Database {
     }
 
     fn snapshot_root(&self, bank: u64, bucket: u64) -> Result<&AtomicU64> {
-        if bucket >= self.config.bucket_count {
-            return Err(Error::Corrupt("checkpoint bucket is out of range"));
-        }
-        let offset = snapshot_bank_start(self.config.bucket_count, bank)?
-            .checked_add(
-                bucket
-                    .checked_mul(size_of::<u64>() as u64)
-                    .ok_or(Error::Corrupt("checkpoint root offset overflow"))?,
-            )
-            .ok_or(Error::Corrupt("checkpoint root offset overflow"))?;
-        self.heads.atomic_u64(offset)
+        snapshot_root_atomic(&self.heads, &self.config, bank, bucket)
     }
 }
 
@@ -367,23 +413,33 @@ fn release_snapshot_chain(
     while root != 0 {
         let node = read_node(&snapshot.body, root, node_size, config.key_size)?;
         let successor = node.successor();
-        if node.blob_length != 0 {
-            let length = u32::try_from(node.blob_length)
-                .map_err(|_| Error::Corrupt("snapshot blob is too large"))?;
-            let blobs = snapshot
-                .blobs
-                .as_ref()
-                .ok_or(Error::Corrupt("snapshot blob allocator is missing"))?;
-            blobs.release(blobs.allocation_for(node.blob_offset, length)?)?;
-        }
-        let length =
-            u32::try_from(node_size).map_err(|_| Error::Corrupt("snapshot node size overflow"))?;
-        snapshot
-            .body
-            .release(snapshot.body.allocation_for(root, length)?)?;
+        release_snapshot_node(snapshot, root, config, node_size)?;
         root = successor;
     }
     Ok(())
+}
+
+fn release_snapshot_node(
+    snapshot: &SnapshotFiles,
+    offset: u64,
+    config: &Config,
+    node_size: u64,
+) -> Result<()> {
+    let node = read_node(&snapshot.body, offset, node_size, config.key_size)?;
+    if node.blob_length != 0 {
+        let length = u32::try_from(node.blob_length)
+            .map_err(|_| Error::Corrupt("snapshot blob is too large"))?;
+        let blobs = snapshot
+            .blobs
+            .as_ref()
+            .ok_or(Error::Corrupt("snapshot blob allocator is missing"))?;
+        blobs.release(blobs.allocation_for(node.blob_offset, length)?)?;
+    }
+    let length =
+        u32::try_from(node_size).map_err(|_| Error::Corrupt("snapshot node size overflow"))?;
+    snapshot
+        .body
+        .release(snapshot.body.allocation_for(offset, length)?)
 }
 
 fn snapshot_chain_contains(
@@ -402,6 +458,162 @@ fn snapshot_chain_contains(
         root = node.successor();
     }
     Ok(false)
+}
+
+fn validate_snapshot(
+    heads: &MappedFile,
+    snapshot: &SnapshotFiles,
+    config: &Config,
+    node_size: u64,
+    manifest: Manifest,
+) -> Result<()> {
+    let checksum = snapshot_checksum(heads, snapshot, config, node_size, manifest.bank)?;
+    if checksum != manifest.snapshot_checksum {
+        return Err(Error::Corrupt(
+            "checkpoint snapshot checksum does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_checksum(
+    heads: &MappedFile,
+    snapshot: &SnapshotFiles,
+    config: &Config,
+    node_size: u64,
+    bank: u64,
+) -> Result<u64> {
+    let node_length =
+        u32::try_from(node_size).map_err(|_| Error::Corrupt("checkpoint node size overflow"))?;
+    let maximum_nodes = config
+        .body_capacity
+        .checked_div(node_size)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(Error::Corrupt("checkpoint node limit overflow"))?;
+    let mut checksum = MANIFEST_MAGIC;
+    for bucket in 0..config.bucket_count {
+        let root = snapshot_root_atomic(heads, config, bank, bucket)?.load(Ordering::Acquire);
+        checksum = mix_checksum(checksum, bucket);
+        checksum = mix_checksum(checksum, root);
+        let mut current = root;
+        let mut visited = 0_u64;
+        while current != 0 {
+            visited = visited
+                .checked_add(1)
+                .ok_or(Error::Corrupt("checkpoint traversal overflow"))?;
+            if visited > maximum_nodes {
+                return Err(Error::Corrupt("checkpoint body chain contains a cycle"));
+            }
+            snapshot.body.allocation_for(current, node_length)?;
+            let node = read_node(&snapshot.body, current, node_size, config.key_size)?;
+            if node.deleted() {
+                return Err(Error::Corrupt("checkpoint contains a deleted body node"));
+            }
+            if node.hash != xxh64(&node.key, config.hash_seed)
+                || node.hash % config.bucket_count != bucket
+            {
+                return Err(Error::Corrupt(
+                    "checkpoint node is in the wrong hash bucket",
+                ));
+            }
+            if snapshot_prefix_contains(
+                &snapshot.body,
+                root,
+                current,
+                node_size,
+                config.key_size,
+                maximum_nodes,
+                node.hash,
+                &node.key,
+            )? {
+                return Err(Error::Corrupt("checkpoint contains a duplicate key"));
+            }
+            validate_snapshot_blob(snapshot, config.mode, &node)?;
+            checksum = mix_checksum(checksum, node.offset);
+            checksum = mix_checksum(checksum, node.next);
+            checksum = mix_checksum(checksum, node.hash);
+            checksum = mix_checksum(checksum, node.blob_offset);
+            checksum = mix_checksum(checksum, node.blob_length);
+            checksum = xxh64(&node.key, checksum);
+            current = node.successor();
+        }
+    }
+    Ok(checksum)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_prefix_contains(
+    body: &BlockAllocator,
+    root: u64,
+    target: u64,
+    node_size: u64,
+    key_size: usize,
+    maximum_nodes: u64,
+    hash: u64,
+    key: &[u8],
+) -> Result<bool> {
+    let mut current = root;
+    let mut visited = 0_u64;
+    while current != target {
+        if current == 0 {
+            return Err(Error::Corrupt(
+                "checkpoint target is not reachable from its root",
+            ));
+        }
+        visited = visited
+            .checked_add(1)
+            .ok_or(Error::Corrupt("checkpoint prefix traversal overflow"))?;
+        if visited > maximum_nodes {
+            return Err(Error::Corrupt("checkpoint prefix contains a cycle"));
+        }
+        let node = read_node(body, current, node_size, key_size)?;
+        if node.hash == hash && node.key == key {
+            return Ok(true);
+        }
+        current = node.successor();
+    }
+    Ok(false)
+}
+
+fn validate_snapshot_blob(snapshot: &SnapshotFiles, mode: Mode, node: &Node) -> Result<()> {
+    match (mode, node.blob_offset, node.blob_length) {
+        (Mode::Set | Mode::Map, 0, 0) => Ok(()),
+        (Mode::Set, _, _) => Err(Error::Corrupt("set checkpoint node references a blob")),
+        (Mode::Map, 0, _) => Err(Error::Corrupt("map checkpoint blob offset is null")),
+        (Mode::Map, offset, length) => {
+            let length = u32::try_from(length)
+                .map_err(|_| Error::Corrupt("checkpoint blob length is too large"))?;
+            snapshot
+                .blobs
+                .as_ref()
+                .ok_or(Error::Corrupt("map checkpoint blob file is missing"))?
+                .allocation_for(offset, length)?;
+            Ok(())
+        }
+    }
+}
+
+fn snapshot_root_atomic<'heads>(
+    heads: &'heads MappedFile,
+    config: &Config,
+    bank: u64,
+    bucket: u64,
+) -> Result<&'heads AtomicU64> {
+    if bucket >= config.bucket_count {
+        return Err(Error::Corrupt("checkpoint bucket is out of range"));
+    }
+    let offset = snapshot_bank_start(config.bucket_count, bank)?
+        .checked_add(
+            bucket
+                .checked_mul(size_of::<u64>() as u64)
+                .ok_or(Error::Corrupt("checkpoint root offset overflow"))?,
+        )
+        .ok_or(Error::Corrupt("checkpoint root offset overflow"))?;
+    heads.atomic_u64(offset)
+}
+
+fn mix_checksum(checksum: u64, value: u64) -> u64 {
+    xxh64(&value.to_le_bytes(), checksum)
 }
 
 fn create_snapshot(path: &Path, config: &Config, bank: u64) -> Result<SnapshotFiles> {
@@ -483,17 +695,14 @@ fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
     Ok((config, node_size))
 }
 
-fn read_latest_manifest(heads: &MappedFile) -> Result<Manifest> {
+fn read_manifests(heads: &MappedFile) -> Result<[Option<Manifest>; 2]> {
     let first = read_manifest(heads, 0)?;
     let second = read_manifest(heads, 1)?;
     match (first, second) {
-        (Some(left), Some(right)) => Ok(if left.generation >= right.generation {
-            left
-        } else {
-            right
-        }),
-        (Some(manifest), None) | (None, Some(manifest)) => Ok(manifest),
-        (None, None) => Err(Error::Corrupt("database has no valid checkpoint")),
+        (Some(left), Some(right)) if right.generation > left.generation => {
+            Ok([Some(right), Some(left)])
+        }
+        (left, right) => Ok([left, right]),
     }
 }
 
@@ -506,10 +715,15 @@ fn read_manifest(heads: &MappedFile, bank: u64) -> Result<Option<Manifest>> {
     let generation = heads.atomic_u64(offset + 8)?.load(Ordering::Acquire);
     let stored_bank = heads.atomic_u64(offset + 16)?.load(Ordering::Acquire);
     let checksum = heads.atomic_u64(offset + 24)?.load(Ordering::Acquire);
-    if stored_bank != bank || checksum != manifest_checksum(generation, bank) {
+    let snapshot_checksum = heads.atomic_u64(offset + 32)?.load(Ordering::Acquire);
+    if stored_bank != bank || checksum != manifest_checksum(generation, bank, snapshot_checksum) {
         return Ok(None);
     }
-    Ok(Some(Manifest { generation, bank }))
+    Ok(Some(Manifest {
+        generation,
+        bank,
+        snapshot_checksum,
+    }))
 }
 
 fn write_manifest(heads: &MappedFile, manifest: Manifest) -> Result<()> {
@@ -517,9 +731,14 @@ fn write_manifest(heads: &MappedFile, manifest: Manifest) -> Result<()> {
     cas_replace(heads.atomic_u64(offset)?, 0);
     cas_replace(heads.atomic_u64(offset + 8)?, manifest.generation);
     cas_replace(heads.atomic_u64(offset + 16)?, manifest.bank);
+    cas_replace(heads.atomic_u64(offset + 32)?, manifest.snapshot_checksum);
     cas_replace(
         heads.atomic_u64(offset + 24)?,
-        manifest_checksum(manifest.generation, manifest.bank),
+        manifest_checksum(
+            manifest.generation,
+            manifest.bank,
+            manifest.snapshot_checksum,
+        ),
     );
     cas_replace(heads.atomic_u64(offset)?, MANIFEST_MAGIC);
     Ok(())
@@ -542,8 +761,9 @@ fn manifest_offset(bank: u64) -> Result<u64> {
         .ok_or(Error::Corrupt("manifest offset overflow"))
 }
 
-fn manifest_checksum(generation: u64, bank: u64) -> u64 {
-    xxh64(&generation.to_le_bytes(), MANIFEST_MAGIC ^ bank)
+fn manifest_checksum(generation: u64, bank: u64, snapshot_checksum: u64) -> u64 {
+    let first = xxh64(&generation.to_le_bytes(), MANIFEST_MAGIC ^ bank);
+    xxh64(&snapshot_checksum.to_le_bytes(), first)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
@@ -587,6 +807,14 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn sync_namespace(path: &Path) -> Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn cas_replace(atomic: &AtomicU64, replacement: u64) {
@@ -744,6 +972,50 @@ mod tests {
         let reopened = Database::open(&path)?;
         assert_eq!(reopened.get(b"only-key")?, Some(b"new".to_vec()));
         drop(reopened);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_falls_back_when_the_newest_snapshot_is_missing() -> Result<()> {
+        let path = test_directory("checkpoint-fallback");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, test_config())?;
+        database.put(b"only-key", b"generation-one")?;
+        assert_eq!(database.checkpoint()?, 1);
+        database.put(b"only-key", b"generation-two")?;
+        assert_eq!(database.checkpoint()?, 2);
+        drop(database);
+
+        std::fs::remove_file(snapshot_path(&path, 0, "body"))?;
+        let reopened = Database::open(&path)?;
+        assert_eq!(reopened.get(b"only-key")?, Some(b"generation-one".to_vec()));
+        drop(reopened);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_snapshot_root_corruption() -> Result<()> {
+        let path = test_directory("checkpoint-root-corruption");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let config = test_config();
+        let database = Database::create(&path, config.clone())?;
+        database.put(b"only-key", b"value")?;
+        assert_eq!(database.checkpoint()?, 1);
+        drop(database);
+
+        let heads = MappedFile::open(
+            &path.join("heads"),
+            heads_length(config.bucket_count)?,
+            false,
+        )?;
+        let bucket = xxh64(b"only-key", config.hash_seed) % config.bucket_count;
+        let root = snapshot_root_atomic(&heads, &config, 1, bucket)?;
+        cas_replace(root, 0);
+        heads.sync_all()?;
+        drop(heads);
+        assert!(matches!(Database::open(&path), Err(Error::Corrupt(_))));
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
