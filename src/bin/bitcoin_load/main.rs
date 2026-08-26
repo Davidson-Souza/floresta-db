@@ -2,7 +2,8 @@ mod ring;
 
 use std::error::Error as StdError;
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -140,20 +141,41 @@ fn run() -> AnyResult<()> {
         return Err(io::Error::other("tracked live output count is inconsistent").into());
     }
 
+    let verification_started = Instant::now();
     verify_core_utxo_set(&control, tip_hash, tip_height, indexed_outputs)?;
-    if arguments.checkpoint {
+    let verification_elapsed = verification_started.elapsed();
+    let checkpoint_elapsed = if arguments.checkpoint {
+        let checkpoint_started = Instant::now();
         database.checkpoint()?;
-    }
+        Some(checkpoint_started.elapsed())
+    } else {
+        None
+    };
+    let sync_started = Instant::now();
     database.sync()?;
+    let sync_elapsed = sync_started.elapsed();
+    let index_storage = storage_stats(&index_path)?;
+    let ring_storage = storage_stats(&ring_path)?;
     println!(
-        "blocks={} outputs={} inputs={} utxos={} bytes={} elapsed={:.3}s throughput={:.0} blocks/s",
+        "blocks={} outputs={} inputs={} utxos={} bytes={} elapsed={:.3}s",
         producer_stats.blocks,
         producer_stats.outputs,
         consumer_stats.inputs,
         indexed_outputs,
         producer_stats.bytes,
-        elapsed.as_secs_f64(),
-        blocks_per_second(producer_stats.blocks, elapsed)
+        elapsed.as_secs_f64()
+    );
+    print_performance_report(
+        &producer_stats,
+        &consumer_stats,
+        elapsed,
+        &CompletionMetrics {
+            verification: verification_elapsed,
+            checkpoint: checkpoint_elapsed,
+            sync: sync_elapsed,
+            index_storage,
+            ring_storage,
+        },
     );
     Ok(())
 }
@@ -167,18 +189,42 @@ fn produce_blocks(
 ) -> AnyResult<ProducerStats> {
     let client = rpc.client()?;
     let mut stats = ProducerStats::default();
-    while let Some(lease) = ring.claim_fetch()? {
+    loop {
+        let claim_started = Instant::now();
+        let lease = ring.claim_fetch();
+        stats.ring_claim.record(claim_started.elapsed());
+        let Some(lease) = lease? else {
+            break;
+        };
         let hash = rpc
-            .request(|| client.get_block_hash(lease.height))?
+            .request(&mut stats.rpc, || client.get_block_hash(lease.height))?
             .block_hash()?;
-        let block = rpc.request(|| client.get_block(hash))?;
+        let block = rpc.request(&mut stats.rpc, || client.get_block(hash))?;
         if block.block_hash() != hash {
             return Err(io::Error::other("RPC returned a block with the wrong hash").into());
         }
+        let serialize_started = Instant::now();
         let encoded = serialize(&block);
-        ring.write_fetch(lease, &encoded)?;
-        wait_for_height(output_next, lease.height, ring)?;
-        let outputs = add_block_outputs(database, ring, &block, lease.height, live_outputs)?;
+        stats.serialize.record(serialize_started.elapsed());
+        let ring_write_started = Instant::now();
+        let write_result = ring.write_fetch(lease, &encoded);
+        stats.ring_write.record(ring_write_started.elapsed());
+        write_result?;
+        let order_wait_started = Instant::now();
+        let wait_result = wait_for_height(output_next, lease.height, ring);
+        stats.output_order_wait.record(order_wait_started.elapsed());
+        wait_result?;
+        let output_index_started = Instant::now();
+        let outputs = add_block_outputs(
+            database,
+            ring,
+            &block,
+            lease.height,
+            live_outputs,
+            &mut stats,
+        );
+        stats.output_index.record(output_index_started.elapsed());
+        let outputs = outputs?;
         output_next
             .compare_exchange(
                 lease.height,
@@ -187,7 +233,10 @@ fn produce_blocks(
                 Ordering::Acquire,
             )
             .map_err(|_| io::Error::other("output indexing frontier changed unexpectedly"))?;
-        ring.publish_fetch(lease, encoded.len())?;
+        let publish_started = Instant::now();
+        let publish_result = ring.publish_fetch(lease, encoded.len());
+        stats.ring_publish.record(publish_started.elapsed());
+        publish_result?;
         stats.blocks = stats.blocks.saturating_add(1);
         stats.outputs = stats.outputs.saturating_add(outputs);
         stats.bytes = stats
@@ -203,11 +252,29 @@ fn consume_blocks(
     live_outputs: &AtomicU64,
 ) -> AnyResult<ConsumerStats> {
     let mut stats = ConsumerStats::default();
-    while let Some(lease) = ring.claim_consume()? {
-        let encoded = ring.read_consume(lease)?;
-        let block: Block = deserialize(&encoded)?;
-        let inputs = remove_block_inputs(database, &block, live_outputs)?;
-        ring.finish_consume(lease)?;
+    loop {
+        let claim_started = Instant::now();
+        let lease = ring.claim_consume();
+        stats.ring_claim.record(claim_started.elapsed());
+        let Some(lease) = lease? else {
+            break;
+        };
+        let ring_read_started = Instant::now();
+        let encoded = ring.read_consume(lease);
+        stats.ring_read.record(ring_read_started.elapsed());
+        let encoded = encoded?;
+        let deserialize_started = Instant::now();
+        let block = deserialize(&encoded);
+        stats.deserialize.record(deserialize_started.elapsed());
+        let block: Block = block?;
+        let input_remove_started = Instant::now();
+        let inputs = remove_block_inputs(database, &block, live_outputs, &mut stats);
+        stats.input_remove.record(input_remove_started.elapsed());
+        let inputs = inputs?;
+        let finish_started = Instant::now();
+        let finish_result = ring.finish_consume(lease);
+        stats.ring_finish.record(finish_started.elapsed());
+        finish_result?;
         stats.blocks = stats.blocks.saturating_add(1);
         stats.inputs = stats.inputs.saturating_add(inputs);
     }
@@ -220,6 +287,7 @@ fn add_block_outputs(
     block: &Block,
     height: u64,
     live_outputs: &AtomicU64,
+    stats: &mut ProducerStats,
 ) -> AnyResult<u64> {
     let height_u32 = u32::try_from(height)
         .map_err(|_| invalid_input("block height does not fit output value"))?;
@@ -234,12 +302,25 @@ fn add_block_outputs(
                 .map_err(|_| invalid_input("transaction output index exceeds u32"))?;
             let outpoint = OutPoint { txid, vout };
             let key = outpoint_key(outpoint);
-            let may_overwrite = transaction.is_coinbase() && database.contains(&key)?;
+            let may_overwrite = if transaction.is_coinbase() {
+                let contains_started = Instant::now();
+                let contains = database.contains(&key);
+                stats.db_contains.record(contains_started.elapsed());
+                contains?
+            } else {
+                false
+            };
             if may_overwrite {
-                wait_for_consumed_height(ring, height)?;
+                let bip30_wait_started = Instant::now();
+                let wait_result = wait_for_consumed_height(ring, height);
+                stats.bip30_wait.record(bip30_wait_started.elapsed());
+                wait_result?;
             }
             let value = output_value(output, height_u32)?;
-            match database.put(&key, &value)? {
+            let put_started = Instant::now();
+            let put_result = database.put(&key, &value);
+            stats.db_put.record(put_started.elapsed());
+            match put_result? {
                 PutResult::Inserted => {
                     cas_increment(live_outputs)?;
                     added = added.saturating_add(1);
@@ -258,6 +339,7 @@ fn remove_block_inputs(
     database: &Database,
     block: &Block,
     live_outputs: &AtomicU64,
+    stats: &mut ConsumerStats,
 ) -> AnyResult<u64> {
     let mut removed = 0_u64;
     for transaction in &block.txdata {
@@ -266,7 +348,10 @@ fn remove_block_inputs(
                 continue;
             }
             let key = outpoint_key(input.previous_output);
-            if !database.delete(&key)? {
+            let delete_started = Instant::now();
+            let delete_result = database.delete(&key);
+            stats.db_delete.record(delete_started.elapsed());
+            if !delete_result? {
                 return Err(io::Error::other(format!(
                     "input references missing outpoint {}",
                     input.previous_output
@@ -369,9 +454,119 @@ fn wait_for_progress() {
     std::thread::sleep(Duration::from_micros(50));
 }
 
+fn print_performance_report(
+    producer: &ProducerStats,
+    consumer: &ConsumerStats,
+    elapsed: Duration,
+    completion: &CompletionMetrics,
+) {
+    let database_operations = producer
+        .db_put
+        .count
+        .saturating_add(consumer.db_delete.count);
+    println!(
+        "rates blocks_s={:.1} data_mib_s={:.1} db_ops_s={:.1}",
+        per_second(producer.blocks, elapsed),
+        mebibytes_per_second(producer.bytes, elapsed),
+        per_second(database_operations, elapsed)
+    );
+    println!(
+        "rpc calls={} retries={} pacing_s={:.3} retry_wait_s={:.3}",
+        producer.rpc.calls,
+        producer.rpc.retries,
+        producer.rpc.pacing.as_secs_f64(),
+        producer.rpc.retry_wait.as_secs_f64()
+    );
+    print_timing("rpc.transport", &producer.rpc.transport);
+    print_timing("producer.ring_claim_wait", &producer.ring_claim);
+    print_timing("producer.output_order_wait", &producer.output_order_wait);
+    print_timing("producer.bip30_wait", &producer.bip30_wait);
+    print_timing("producer.serialize", &producer.serialize);
+    print_timing("producer.ring_write", &producer.ring_write);
+    print_timing("producer.index_stage", &producer.output_index);
+    print_timing("database.contains", &producer.db_contains);
+    print_timing("database.put", &producer.db_put);
+    print_timing("producer.ring_publish", &producer.ring_publish);
+    print_timing("consumer.ring_claim_wait", &consumer.ring_claim);
+    print_timing("consumer.ring_read", &consumer.ring_read);
+    print_timing("consumer.deserialize", &consumer.deserialize);
+    print_timing("consumer.spend_stage", &consumer.input_remove);
+    print_timing("database.delete", &consumer.db_delete);
+    print_timing("consumer.ring_finish", &consumer.ring_finish);
+    match completion.checkpoint {
+        Some(checkpoint) => println!(
+            "maintenance verify_s={:.3} checkpoint_s={:.3} sync_s={:.3}",
+            completion.verification.as_secs_f64(),
+            checkpoint.as_secs_f64(),
+            completion.sync.as_secs_f64()
+        ),
+        None => println!(
+            "maintenance verify_s={:.3} checkpoint=disabled sync_s={:.3}",
+            completion.verification.as_secs_f64(),
+            completion.sync.as_secs_f64()
+        ),
+    }
+    println!(
+        "storage component=index files={} logical_gib={:.3} allocated_mib={:.1}",
+        completion.index_storage.files,
+        gibibytes_f64(completion.index_storage.logical_bytes),
+        mebibytes_f64(completion.index_storage.allocated_bytes)
+    );
+    println!(
+        "storage component=ring files={} logical_gib={:.3} allocated_mib={:.1}",
+        completion.ring_storage.files,
+        gibibytes_f64(completion.ring_storage.logical_bytes),
+        mebibytes_f64(completion.ring_storage.allocated_bytes)
+    );
+}
+
+fn print_timing(name: &str, timing: &OperationTiming) {
+    println!(
+        "timing name={name} count={} total_s={:.3} avg_us={:.3} max_ms={:.3}",
+        timing.count,
+        timing.total.as_secs_f64(),
+        timing.average_micros(),
+        timing.max.as_secs_f64() * 1_000.0
+    );
+}
+
 #[allow(clippy::cast_precision_loss)]
-fn blocks_per_second(blocks: u64, elapsed: Duration) -> f64 {
-    blocks as f64 / elapsed.as_secs_f64()
+fn per_second(count: u64, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mebibytes_per_second(bytes: u64, elapsed: Duration) -> f64 {
+    mebibytes_f64(bytes) / elapsed.as_secs_f64()
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mebibytes_f64(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn gibibytes_f64(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn storage_stats(path: &Path) -> io::Result<StorageStats> {
+    let metadata = path.metadata()?;
+    if metadata.is_file() {
+        return Ok(StorageStats {
+            files: 1,
+            logical_bytes: metadata.len(),
+            allocated_bytes: metadata.blocks().saturating_mul(512),
+        });
+    }
+
+    let mut stats = StorageStats::default();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child = storage_stats(&entry.path())?;
+        stats.merge(child);
+    }
+    Ok(stats)
 }
 
 fn cas_increment(counter: &AtomicU64) -> io::Result<()> {
@@ -446,21 +641,33 @@ impl RpcSettings {
 
     fn request<T>(
         &self,
+        metrics: &mut RpcMetrics,
         mut request: impl FnMut() -> corepc_client::client_sync::Result<T>,
     ) -> AnyResult<T> {
+        metrics.calls = metrics.calls.saturating_add(1);
         for attempt in 0..=RPC_RETRIES {
-            match request() {
+            let transport_started = Instant::now();
+            let response = request();
+            metrics.transport.record(transport_started.elapsed());
+            match response {
                 Ok(value) => {
+                    let pacing_started = Instant::now();
                     std::thread::sleep(self.delay);
+                    metrics.pacing = metrics.pacing.saturating_add(pacing_started.elapsed());
                     return Ok(value);
                 }
                 Err(error) if attempt < RPC_RETRIES => {
+                    metrics.retries = metrics.retries.saturating_add(1);
                     eprintln!(
                         "RPC request failed (attempt {}/{}): {error}",
                         attempt + 1,
                         RPC_RETRIES + 1
                     );
+                    let retry_wait_started = Instant::now();
                     std::thread::sleep(RPC_RETRY_DELAY);
+                    metrics.retry_wait = metrics
+                        .retry_wait
+                        .saturating_add(retry_wait_started.elapsed());
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -547,10 +754,92 @@ impl Arguments {
 }
 
 #[derive(Clone, Copy, Default)]
+struct OperationTiming {
+    count: u64,
+    total: Duration,
+    max: Duration,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StorageStats {
+    files: u64,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+}
+
+struct CompletionMetrics {
+    verification: Duration,
+    checkpoint: Option<Duration>,
+    sync: Duration,
+    index_storage: StorageStats,
+    ring_storage: StorageStats,
+}
+
+impl StorageStats {
+    fn merge(&mut self, other: Self) {
+        self.files = self.files.saturating_add(other.files);
+        self.logical_bytes = self.logical_bytes.saturating_add(other.logical_bytes);
+        self.allocated_bytes = self.allocated_bytes.saturating_add(other.allocated_bytes);
+    }
+}
+
+impl OperationTiming {
+    fn record(&mut self, elapsed: Duration) {
+        self.count = self.count.saturating_add(1);
+        self.total = self.total.saturating_add(elapsed);
+        self.max = self.max.max(elapsed);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.total = self.total.saturating_add(other.total);
+        self.max = self.max.max(other.max);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn average_micros(self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total.as_secs_f64() * 1_000_000.0 / self.count as f64
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct RpcMetrics {
+    calls: u64,
+    retries: u64,
+    transport: OperationTiming,
+    pacing: Duration,
+    retry_wait: Duration,
+}
+
+impl RpcMetrics {
+    fn merge(&mut self, other: Self) {
+        self.calls = self.calls.saturating_add(other.calls);
+        self.retries = self.retries.saturating_add(other.retries);
+        self.transport.merge(other.transport);
+        self.pacing = self.pacing.saturating_add(other.pacing);
+        self.retry_wait = self.retry_wait.saturating_add(other.retry_wait);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct ProducerStats {
     blocks: u64,
     outputs: u64,
     bytes: u64,
+    rpc: RpcMetrics,
+    ring_claim: OperationTiming,
+    output_order_wait: OperationTiming,
+    bip30_wait: OperationTiming,
+    serialize: OperationTiming,
+    ring_write: OperationTiming,
+    output_index: OperationTiming,
+    db_contains: OperationTiming,
+    db_put: OperationTiming,
+    ring_publish: OperationTiming,
 }
 
 impl ProducerStats {
@@ -558,6 +847,16 @@ impl ProducerStats {
         self.blocks = self.blocks.saturating_add(other.blocks);
         self.outputs = self.outputs.saturating_add(other.outputs);
         self.bytes = self.bytes.saturating_add(other.bytes);
+        self.rpc.merge(other.rpc);
+        self.ring_claim.merge(other.ring_claim);
+        self.output_order_wait.merge(other.output_order_wait);
+        self.bip30_wait.merge(other.bip30_wait);
+        self.serialize.merge(other.serialize);
+        self.ring_write.merge(other.ring_write);
+        self.output_index.merge(other.output_index);
+        self.db_contains.merge(other.db_contains);
+        self.db_put.merge(other.db_put);
+        self.ring_publish.merge(other.ring_publish);
     }
 }
 
@@ -565,12 +864,24 @@ impl ProducerStats {
 struct ConsumerStats {
     blocks: u64,
     inputs: u64,
+    ring_claim: OperationTiming,
+    ring_read: OperationTiming,
+    deserialize: OperationTiming,
+    input_remove: OperationTiming,
+    db_delete: OperationTiming,
+    ring_finish: OperationTiming,
 }
 
 impl ConsumerStats {
     fn merge(&mut self, other: Self) {
         self.blocks = self.blocks.saturating_add(other.blocks);
         self.inputs = self.inputs.saturating_add(other.inputs);
+        self.ring_claim.merge(other.ring_claim);
+        self.ring_read.merge(other.ring_read);
+        self.deserialize.merge(other.deserialize);
+        self.input_remove.merge(other.input_remove);
+        self.db_delete.merge(other.db_delete);
+        self.ring_finish.merge(other.ring_finish);
     }
 }
 
@@ -706,5 +1017,21 @@ mod tests {
         assert!(should_index_output(1, &spendable));
         assert!(!should_index_output(1, &op_return));
         assert!(!should_index_output(1, &oversized));
+    }
+
+    #[test]
+    fn aggregates_operation_timings() {
+        let mut timing = OperationTiming::default();
+        timing.record(Duration::from_millis(2));
+        timing.record(Duration::from_millis(5));
+        let mut other = OperationTiming::default();
+        other.record(Duration::from_millis(3));
+
+        timing.merge(other);
+
+        assert_eq!(timing.count, 3);
+        assert_eq!(timing.total, Duration::from_millis(10));
+        assert_eq!(timing.max, Duration::from_millis(5));
+        assert!((timing.average_micros() - 3_333.333_333).abs() < 0.001);
     }
 }
