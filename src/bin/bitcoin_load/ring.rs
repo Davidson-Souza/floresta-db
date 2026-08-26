@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileExt;
@@ -253,7 +251,6 @@ impl BlockRing {
         self.advance_consumed()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn abort(&self) {
         let _aborted = self
             .aborted
@@ -262,6 +259,10 @@ impl BlockRing {
 
     pub(crate) fn consumed_height(&self) -> u64 {
         self.consumed_next.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire) != 0
     }
 
     fn advance_produced(&self) -> io::Result<()> {
