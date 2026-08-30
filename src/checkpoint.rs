@@ -34,6 +34,58 @@ struct SnapshotFiles {
 }
 
 impl Database {
+    /// Opens mutable runtime files written by a clean [`Database::close`] without requiring a
+    /// checkpoint generation.
+    ///
+    /// This is intentionally not crash recovery: interrupted writes may leave runtime files
+    /// inconsistent. Use [`Database::open`] when checkpoint durability is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime layout is invalid or mapped files cannot be reopened.
+    pub fn open_runtime(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let heads_path = path.join("heads");
+        let mapped_length = std::fs::metadata(&heads_path)?.len();
+        let heads = MappedFile::open(&heads_path, mapped_length, false)?;
+        let (config, node_size) = read_config(&heads)?;
+        if heads_length(config.bucket_count)? != mapped_length {
+            return Err(Error::Corrupt(
+                "heads file length does not match its configuration",
+            ));
+        }
+        let body = BlockAllocator::open(
+            &path.join("body"),
+            &path.join("body.counts"),
+            config.body_capacity,
+            config.block_size,
+        )?;
+        let blobs = if config.mode == Mode::Map {
+            Some(BlockAllocator::open(
+                &path.join("blobs"),
+                &path.join("blobs.counts"),
+                config.blob_capacity,
+                config.block_size,
+            )?)
+        } else {
+            None
+        };
+        let hazards = HazardRegistry::new(config.max_threads)?;
+        let retired = RetireQueue::new(config.max_threads)?;
+        Ok(Self {
+            config,
+            node_size,
+            heads,
+            body,
+            blobs,
+            hazards,
+            retired,
+            checkpoint_state: AtomicU64::new(CHECKPOINT_IDLE),
+            checkpoint_generation: AtomicU64::new(0),
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Opens the newest valid checkpoint and rebuilds fresh mutable runtime files.
     ///
     /// # Errors
@@ -44,7 +96,7 @@ impl Database {
         let path = path.as_ref();
         let heads_path = path.join("heads");
         let mapped_length = std::fs::metadata(&heads_path)?.len();
-        let heads = MappedFile::open(&heads_path, mapped_length, true)?;
+        let heads = MappedFile::open(&heads_path, mapped_length, false)?;
         let (config, node_size) = read_config(&heads)?;
         if heads_length(config.bucket_count)? != mapped_length {
             return Err(Error::Corrupt(
@@ -74,7 +126,7 @@ impl Database {
         mapped_length: u64,
         manifest: Manifest,
     ) -> Result<Self> {
-        let heads = MappedFile::open(&path.join("heads"), mapped_length, true)?;
+        let heads = MappedFile::open(&path.join("heads"), mapped_length, false)?;
         let snapshot = open_snapshot(path, config, manifest.bank)?;
         validate_snapshot(&heads, &snapshot, config, node_size, manifest)?;
         remove_runtime_files(path, config.mode)?;

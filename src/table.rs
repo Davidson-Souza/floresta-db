@@ -21,6 +21,13 @@ pub enum PutResult {
     Replaced,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PutOutcome {
+    Inserted,
+    Existing,
+    Replaced,
+}
+
 pub struct Database {
     pub(crate) config: Config,
     pub(crate) node_size: u64,
@@ -49,7 +56,7 @@ impl Database {
         let path = path.as_ref();
         std::fs::create_dir(path)?;
         let heads_length = heads_length(config.bucket_count)?;
-        let heads = MappedFile::create(&path.join("heads"), heads_length, true, true)?;
+        let heads = MappedFile::create(&path.join("heads"), heads_length, false, true)?;
         initialize_header(&heads, &config, node_size)?;
         heads.advise_heads()?;
         let body = BlockAllocator::create(
@@ -92,7 +99,11 @@ impl Database {
             return Err(Error::Unsupported("add is available only for sets"));
         }
         let guard = self.hazards.acquire()?;
-        self.put_inner(key, None, &guard)
+        match self.put_inner(key, None, &guard, true)? {
+            PutOutcome::Inserted => Ok(PutResult::Inserted),
+            PutOutcome::Replaced => Ok(PutResult::Replaced),
+            PutOutcome::Existing => Err(Error::Corrupt("upsert reported an existing key")),
+        }
     }
 
     /// Inserts or replaces a map value.
@@ -106,7 +117,32 @@ impl Database {
             return Err(Error::Unsupported("put is available only for maps"));
         }
         let guard = self.hazards.acquire()?;
-        self.put_inner(key, Some(value), &guard)
+        match self.put_inner(key, Some(value), &guard, true)? {
+            PutOutcome::Inserted => Ok(PutResult::Inserted),
+            PutOutcome::Replaced => Ok(PutResult::Replaced),
+            PutOutcome::Existing => Err(Error::Corrupt("upsert reported an existing key")),
+        }
+    }
+
+    /// Inserts a map value only when its key does not exist.
+    ///
+    /// This write-once path never replaces nodes and therefore skips retirement reclamation.
+    /// Concurrent attempts for the same key produce exactly one insertion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called on a set, when the key length differs from the configured
+    /// width, or when allocation fails.
+    pub fn put_new(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        if self.config.mode != Mode::Map {
+            return Err(Error::Unsupported("put_new is available only for maps"));
+        }
+        let guard = self.hazards.acquire()?;
+        match self.put_inner(key, Some(value), &guard, false)? {
+            PutOutcome::Inserted => Ok(true),
+            PutOutcome::Existing => Ok(false),
+            PutOutcome::Replaced => Err(Error::Corrupt("insert-only put replaced a key")),
+        }
     }
 
     /// Returns a copied map value, allowing mapped storage to be reclaimed.
@@ -247,9 +283,12 @@ impl Database {
         key: &[u8],
         value: Option<&[u8]>,
         guard: &HazardGuard<'_>,
-    ) -> Result<PutResult> {
+        replace_existing: bool,
+    ) -> Result<PutOutcome> {
         self.validate_key(key)?;
-        self.reclaim_retired()?;
+        if replace_existing {
+            self.reclaim_retired()?;
+        }
         let blob = self.allocate_blob(value)?;
         let blob_offset = blob.map_or(0, |allocation| allocation.offset);
         let blob_length = value.map_or(0, <[u8]>::len);
@@ -284,10 +323,16 @@ impl Database {
                     return Err(error);
                 }
             };
-            let (existing, result) = if let Some(existing) = found.node {
-                (Some(existing), PutResult::Replaced)
+            let existing = found.node;
+            if existing.is_some() && !replace_existing {
+                self.release_private(node, blob)?;
+                guard.clear()?;
+                return Ok(PutOutcome::Existing);
+            }
+            let result = if existing.is_some() {
+                PutOutcome::Replaced
             } else {
-                (None, PutResult::Inserted)
+                PutOutcome::Inserted
             };
             let retirement = match &existing {
                 Some(existing) => match self.reserve_retirement(existing.offset) {
@@ -781,6 +826,40 @@ mod tests {
         assert!(database.delete(b"same-key")?);
         assert_eq!(database.get(b"same-key")?, None);
         drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_insert_only_puts_publish_once_without_replacement() -> Result<()> {
+        let path = test_directory("insert-only-concurrent");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Map, 1, 8))?;
+        let inserted = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for value in 0_u64..8 {
+                let database_ref = &database;
+                let inserted_ref = &inserted;
+                scope.spawn(move || {
+                    if database_ref
+                        .put_new(b"same-key", &value.to_le_bytes())
+                        .unwrap_or(false)
+                    {
+                        inserted_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(inserted.load(Ordering::Relaxed), 1);
+        let expected = database
+            .get(b"same-key")?
+            .ok_or(Error::Corrupt("insert-only key is missing"))?;
+        assert!(!database.put_new(b"same-key", b"ignored")?);
+        assert_eq!(inserted.load(Ordering::Relaxed), 1);
+        database.close()?;
+        let reopened = Database::open_runtime(&path)?;
+        assert_eq!(reopened.get(b"same-key")?, Some(expected));
+        drop(reopened);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
