@@ -11,8 +11,8 @@ use crate::layout::{DELETED_BIT, PAGE_SIZE};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 use crate::table::{
-    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, header_checksum, heads_length,
-    snapshot_bank_start,
+    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, create_runtime_heads,
+    header_checksum, heads_length, snapshot_bank_start,
 };
 
 const CHECKPOINT_IDLE: u64 = 0;
@@ -54,13 +54,14 @@ impl Database {
                 "heads file length does not match its configuration",
             ));
         }
+        let runtime_heads = create_runtime_heads(config.bucket_count, &heads, true)?;
         let body = BlockAllocator::open(
             &path.join("body"),
             &path.join("body.counts"),
             config.body_capacity,
             config.block_size,
         )?;
-        let blobs = if config.mode == Mode::Map {
+        let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
             Some(BlockAllocator::open(
                 &path.join("blobs"),
                 &path.join("blobs.counts"),
@@ -76,6 +77,7 @@ impl Database {
             config,
             node_size,
             heads,
+            runtime_heads,
             body,
             blobs,
             hazards,
@@ -136,7 +138,7 @@ impl Database {
             config.body_capacity,
             config.block_size,
         )?;
-        let blobs = if config.mode == Mode::Map {
+        let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
             Some(BlockAllocator::create(
                 &path.join("blobs"),
                 &path.join("blobs.counts"),
@@ -148,10 +150,12 @@ impl Database {
         };
         let hazards = HazardRegistry::new(config.max_threads)?;
         let retired = RetireQueue::new(config.max_threads)?;
+        let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
         let database = Self {
             config: config.clone(),
             node_size,
             heads,
+            runtime_heads,
             body,
             blobs,
             hazards,
@@ -175,6 +179,11 @@ impl Database {
     /// Returns an error when another checkpoint is active, worker registration
     /// is exhausted, snapshot capacity is exhausted, or ordered flushing fails.
     pub fn checkpoint(&self) -> Result<u64> {
+        if self.config.inline_value_size != 0 {
+            return Err(Error::Unsupported(
+                "inline-value databases use close and open_runtime instead of checkpoints",
+            ));
+        }
         self.checkpoint_state
             .compare_exchange(
                 CHECKPOINT_IDLE,
@@ -733,7 +742,7 @@ fn create_snapshot(path: &Path, config: &Config, bank: u64) -> Result<SnapshotFi
         config.body_capacity,
         config.block_size,
     )?;
-    let blobs = if config.mode == Mode::Map {
+    let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
         Some(BlockAllocator::create(
             &snapshot_path(path, bank, "blobs"),
             &snapshot_path(path, bank, "blobs.counts"),
@@ -753,7 +762,7 @@ fn open_snapshot(path: &Path, config: &Config, bank: u64) -> Result<SnapshotFile
         config.body_capacity,
         config.block_size,
     )?;
-    let blobs = if config.mode == Mode::Map {
+    let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
         Some(BlockAllocator::open(
             &snapshot_path(path, bank, "blobs"),
             &snapshot_path(path, bank, "blobs.counts"),
@@ -794,6 +803,8 @@ fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
         mode,
         bucket_count: read_u64(&header, 24)?,
         key_size,
+        inline_value_size: usize::try_from(read_u64(&header, 88)?)
+            .map_err(|_| Error::Corrupt("inline value size does not fit memory"))?,
         body_capacity: read_u64(&header, 40)?,
         blob_capacity: read_u64(&header, 48)?,
         block_size: read_u64(&header, 56)?,

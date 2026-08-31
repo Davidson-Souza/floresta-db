@@ -13,7 +13,6 @@ const MAP_SHARED: c_int = 0x01;
 const MAP_POPULATE: c_int = 0x08_000;
 const MS_SYNC: c_int = 0x4;
 const MADV_RANDOM: c_int = 1;
-const MADV_WILLNEED: c_int = 3;
 const MADV_DONTDUMP: c_int = 16;
 const POSIX_FADV_RANDOM: c_int = 1;
 const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
@@ -97,9 +96,6 @@ pub(crate) fn advise_random(
 }
 
 pub(crate) fn advise_heads(pointer: NonNull<u8>, length: usize) -> Result<()> {
-    // SAFETY: pointer and length identify an active mapped range.
-    let needed = unsafe { madvise(pointer.as_ptr().cast::<c_void>(), length, MADV_WILLNEED) };
-    errno_result(needed)?;
     // SAFETY: pointer and length identify an active mapped range.
     let no_dump = unsafe { madvise(pointer.as_ptr().cast::<c_void>(), length, MADV_DONTDUMP) };
     errno_result(no_dump)

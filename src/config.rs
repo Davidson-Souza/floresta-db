@@ -3,6 +3,7 @@ use crate::layout::{PAGE_SIZE, align_up};
 
 pub const DEFAULT_HASH_SEED: u64 = 0;
 pub const MAX_KEY_SIZE: usize = 4_096;
+pub const MAX_INLINE_VALUE_SIZE: usize = size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -16,6 +17,7 @@ pub struct Config {
     pub mode: Mode,
     pub bucket_count: u64,
     pub key_size: usize,
+    pub inline_value_size: usize,
     pub body_capacity: u64,
     pub blob_capacity: u64,
     pub block_size: u64,
@@ -30,6 +32,7 @@ impl Config {
             mode,
             bucket_count,
             key_size,
+            inline_value_size: 0,
             body_capacity: 1 << 30,
             blob_capacity: if mode == Mode::Map { 1 << 30 } else { 0 },
             block_size: 1 << 20,
@@ -56,13 +59,23 @@ impl Config {
         if self.body_capacity == 0 {
             return Err(Error::InvalidConfig("body capacity must be nonzero"));
         }
-        if self.mode == Mode::Map && self.blob_capacity == 0 {
+        if self.inline_value_size > MAX_INLINE_VALUE_SIZE {
             return Err(Error::InvalidConfig(
-                "map mode requires nonzero blob capacity",
+                "inline value size cannot exceed eight bytes",
             ));
         }
-        if self.mode == Mode::Set && self.blob_capacity != 0 {
-            return Err(Error::InvalidConfig("set mode cannot have blob capacity"));
+        if self.mode == Mode::Map && self.inline_value_size == 0 && self.blob_capacity == 0 {
+            return Err(Error::InvalidConfig(
+                "map mode without inline values requires nonzero blob capacity",
+            ));
+        }
+        if self.mode == Mode::Map && self.inline_value_size != 0 && self.blob_capacity != 0 {
+            return Err(Error::InvalidConfig(
+                "inline map values cannot use blob capacity",
+            ));
+        }
+        if self.mode == Mode::Set && (self.blob_capacity != 0 || self.inline_value_size != 0) {
+            return Err(Error::InvalidConfig("set mode cannot have values"));
         }
         if self.block_size < PAGE_SIZE || !self.block_size.is_power_of_two() {
             return Err(Error::InvalidConfig(

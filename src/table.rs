@@ -11,8 +11,8 @@ use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-pub(crate) const FORMAT_VERSION: u64 = 2;
-pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 88;
+pub(crate) const FORMAT_VERSION: u64 = 3;
+pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 96;
 pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +32,7 @@ pub struct Database {
     pub(crate) config: Config,
     pub(crate) node_size: u64,
     pub(crate) heads: MappedFile,
+    pub(crate) runtime_heads: Box<[AtomicU64]>,
     pub(crate) body: BlockAllocator,
     pub(crate) blobs: Option<BlockAllocator>,
     pub(crate) hazards: HazardRegistry,
@@ -39,6 +40,10 @@ pub struct Database {
     pub(crate) checkpoint_state: AtomicU64,
     pub(crate) checkpoint_generation: AtomicU64,
     pub(crate) path: PathBuf,
+}
+
+pub struct WriteOnlyWriter<'database> {
+    database: &'database Database,
 }
 
 impl Database {
@@ -56,16 +61,17 @@ impl Database {
         let path = path.as_ref();
         std::fs::create_dir(path)?;
         let heads_length = heads_length(config.bucket_count)?;
-        let heads = MappedFile::create(&path.join("heads"), heads_length, false, true)?;
+        let heads = MappedFile::create(&path.join("heads"), heads_length, false, false)?;
         initialize_header(&heads, &config, node_size)?;
         heads.advise_heads()?;
+        let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
         let body = BlockAllocator::create(
             &path.join("body"),
             &path.join("body.counts"),
             config.body_capacity,
             config.block_size,
         )?;
-        let blobs = if config.mode == Mode::Map {
+        let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
             Some(BlockAllocator::create(
                 &path.join("blobs"),
                 &path.join("blobs.counts"),
@@ -79,6 +85,7 @@ impl Database {
             config,
             node_size,
             heads,
+            runtime_heads,
             body,
             blobs,
             hazards,
@@ -145,6 +152,21 @@ impl Database {
         }
     }
 
+    /// Creates a range-scoped writer for unique map keys.
+    ///
+    /// The writer skips hazard registration, lookup, replacement, deletion, and reclamation.
+    /// Callers must guarantee that every key is globally unique for the database build.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called on a set.
+    pub fn write_only(&self) -> Result<WriteOnlyWriter<'_>> {
+        if self.config.mode != Mode::Map {
+            return Err(Error::Unsupported("write_only is available only for maps"));
+        }
+        Ok(WriteOnlyWriter { database: self })
+    }
+
     /// Returns a copied map value, allowing mapped storage to be reclaimed.
     ///
     /// # Errors
@@ -162,6 +184,17 @@ impl Database {
         let Some(node) = found.node else {
             return Ok(None);
         };
+        if self.config.inline_value_size != 0 {
+            if node.blob_length != self.config.inline_value_size as u64 {
+                return Err(Error::Corrupt("inline map value length does not match"));
+            }
+            let value = inline_value_bytes(node.blob_offset, self.config.inline_value_size)?;
+            if node.blob_checksum != blob_checksum(&value) {
+                return Err(Error::Corrupt("inline map value checksum does not match"));
+            }
+            guard.clear()?;
+            return Ok(Some(value));
+        }
         if node.blob_length == 0 {
             if node.blob_checksum != blob_checksum(&[]) {
                 return Err(Error::Corrupt("empty map value checksum does not match"));
@@ -266,6 +299,7 @@ impl Database {
         if let Some(blobs) = &self.blobs {
             blobs.sync_all()?;
         }
+        self.persist_runtime_heads()?;
         self.heads.sync_all()
     }
 
@@ -278,6 +312,34 @@ impl Database {
         self.sync()
     }
 
+    fn persist_runtime_heads(&self) -> Result<()> {
+        const HEAD_BATCH: usize = 1 << 17;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(HEAD_BATCH * size_of::<u64>())
+            .map_err(|_| Error::OutOfMemory)?;
+        for (batch, heads) in self.runtime_heads.chunks(HEAD_BATCH).enumerate() {
+            bytes.clear();
+            for head in heads {
+                bytes.extend_from_slice(&head.load(Ordering::Acquire).to_le_bytes());
+            }
+            let first = batch
+                .checked_mul(HEAD_BATCH)
+                .ok_or(Error::Corrupt("head batch offset overflow"))?;
+            let offset = HEADS_START
+                .checked_add(
+                    u64::try_from(first)
+                        .map_err(|_| Error::Corrupt("head batch offset overflow"))?
+                        .checked_mul(size_of::<u64>() as u64)
+                        .ok_or(Error::Corrupt("head batch offset overflow"))?,
+                )
+                .ok_or(Error::Corrupt("head batch offset overflow"))?;
+            // SAFETY: close/sync owns the serialized destination bytes; atomics are copied above.
+            unsafe { self.heads.copy_in(offset, &bytes)? };
+        }
+        Ok(())
+    }
+
     fn put_inner(
         &self,
         key: &[u8],
@@ -286,11 +348,16 @@ impl Database {
         replace_existing: bool,
     ) -> Result<PutOutcome> {
         self.validate_key(key)?;
+        self.validate_value(value)?;
         if replace_existing {
             self.reclaim_retired()?;
         }
         let blob = self.allocate_blob(value)?;
-        let blob_offset = blob.map_or(0, |allocation| allocation.offset);
+        let blob_offset = if self.config.inline_value_size == 0 {
+            blob.map_or(0, |allocation| allocation.offset)
+        } else {
+            inline_value_word(value.ok_or(Error::Corrupt("inline map value is missing"))?)?
+        };
         let blob_length = value.map_or(0, <[u8]>::len);
         let blob_length_u64 =
             u64::try_from(blob_length).map_err(|_| Error::CapacityExhausted("blob length"))?;
@@ -379,7 +446,65 @@ impl Database {
         }
     }
 
+    fn put_unique_inner(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.validate_key(key)?;
+        self.validate_value(Some(value))?;
+        let blob = self.allocate_blob(Some(value))?;
+        let blob_offset = if self.config.inline_value_size == 0 {
+            blob.map_or(0, |allocation| allocation.offset)
+        } else {
+            inline_value_word(value)?
+        };
+        let blob_length =
+            u64::try_from(value.len()).map_err(|_| Error::CapacityExhausted("blob length"))?;
+        let value_checksum = blob_checksum(value);
+        let hash = xxh64(key, self.config.hash_seed);
+        let node = match allocate_node(
+            &self.body,
+            self.node_size,
+            key,
+            hash,
+            blob_offset,
+            blob_length,
+            value_checksum,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                if let Some(blob) = blob {
+                    let _released = self.release_blob(blob);
+                }
+                return Err(error);
+            }
+        };
+        let bucket = hash % self.config.bucket_count;
+        let incoming = match self.head(bucket) {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                self.release_private(node, blob)?;
+                return Err(error);
+            }
+        };
+        let mut private_next = 0;
+        loop {
+            let observed = incoming.load(Ordering::Acquire);
+            if let Err(error) = set_private_next(&self.body, node.offset, private_next, observed) {
+                self.release_private(node, blob)?;
+                return Err(error);
+            }
+            private_next = observed;
+            if incoming
+                .compare_exchange(observed, node.offset, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
     fn allocate_blob(&self, value: Option<&[u8]>) -> Result<Option<Allocation>> {
+        if self.config.inline_value_size != 0 {
+            return Ok(None);
+        }
         let Some(value) = value else {
             return Ok(None);
         };
@@ -602,7 +727,7 @@ impl Database {
 
     fn release_retired(&self, offset: u64) -> Result<(u64, Option<u64>)> {
         let node = read_node(&self.body, offset, self.node_size, self.config.key_size)?;
-        let blob_allocation = if node.blob_length == 0 {
+        let blob_allocation = if self.config.inline_value_size != 0 || node.blob_length == 0 {
             None
         } else {
             let length = u32::try_from(node.blob_length)
@@ -639,15 +764,28 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn head(&self, bucket: u64) -> Result<&AtomicU64> {
-        if bucket >= self.config.bucket_count {
-            return Err(Error::Corrupt("bucket index is out of range"));
+    fn validate_value(&self, value: Option<&[u8]>) -> Result<()> {
+        if self.config.mode == Mode::Set {
+            if value.is_some() {
+                return Err(Error::Unsupported("sets cannot store values"));
+            }
+            return Ok(());
         }
-        let offset = bucket
-            .checked_mul(size_of::<u64>() as u64)
-            .and_then(|value| value.checked_add(HEADS_START))
-            .ok_or(Error::Corrupt("head offset overflow"))?;
-        self.heads.atomic_u64(offset)
+        let value = value.ok_or(Error::Corrupt("map value is missing"))?;
+        if self.config.inline_value_size != 0 && value.len() != self.config.inline_value_size {
+            return Err(Error::InvalidConfig(
+                "map value length does not match inline value size",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn head(&self, bucket: u64) -> Result<&AtomicU64> {
+        let bucket =
+            usize::try_from(bucket).map_err(|_| Error::Corrupt("bucket index overflow"))?;
+        self.runtime_heads
+            .get(bucket)
+            .ok_or(Error::Corrupt("bucket index is out of range"))
     }
 
     fn link_atomic(&self, link: Link) -> Result<&AtomicU64> {
@@ -656,6 +794,63 @@ impl Database {
             Link::Node(offset) => self.body.atomic_u64(offset),
         }
     }
+}
+
+impl WriteOnlyWriter<'_> {
+    /// Publishes one globally unique key and value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid widths or exhausted mapped capacity.
+    pub fn put_unique(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.database.put_unique_inner(key, value)
+    }
+}
+
+pub(crate) fn create_runtime_heads(
+    bucket_count: u64,
+    heads: &MappedFile,
+    load_persisted: bool,
+) -> Result<Box<[AtomicU64]>> {
+    let count = usize::try_from(bucket_count)
+        .map_err(|_| Error::InvalidConfig("bucket count does not fit memory"))?;
+    let mut runtime_heads = Vec::new();
+    runtime_heads
+        .try_reserve_exact(count)
+        .map_err(|_| Error::OutOfMemory)?;
+    for bucket in 0..bucket_count {
+        let value = if load_persisted {
+            let offset = HEADS_START
+                .checked_add(
+                    bucket
+                        .checked_mul(size_of::<u64>() as u64)
+                        .ok_or(Error::Corrupt("head offset overflow"))?,
+                )
+                .ok_or(Error::Corrupt("head offset overflow"))?;
+            heads.atomic_u64(offset)?.load(Ordering::Acquire)
+        } else {
+            0
+        };
+        runtime_heads.push(AtomicU64::new(value));
+    }
+    Ok(runtime_heads.into_boxed_slice())
+}
+
+fn inline_value_word(value: &[u8]) -> Result<u64> {
+    if value.len() > size_of::<u64>() {
+        return Err(Error::InvalidConfig("inline value exceeds eight bytes"));
+    }
+    let mut bytes = [0u8; 8];
+    bytes[..value.len()].copy_from_slice(value);
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn inline_value_bytes(word: u64, length: usize) -> Result<Vec<u8>> {
+    let bytes = word.to_le_bytes();
+    bytes
+        .get(..length)
+        .map(<[u8]>::to_vec)
+        .ok_or(Error::Corrupt("inline value length exceeds eight bytes"))
 }
 
 #[derive(Clone, Copy)]
@@ -712,6 +907,7 @@ pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: 
     write_header_u64(&mut header, 8, FORMAT_VERSION)?;
     write_header_u64(&mut header, 16, config.mode as u64)?;
     write_header_u64(&mut header, 24, config.bucket_count)?;
+
     write_header_u64(
         &mut header,
         32,
@@ -723,6 +919,12 @@ pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: 
     write_header_u64(&mut header, 64, u64::from(config.max_threads))?;
     write_header_u64(&mut header, 72, config.hash_seed)?;
     write_header_u64(&mut header, 80, node_size)?;
+    write_header_u64(
+        &mut header,
+        88,
+        u64::try_from(config.inline_value_size)
+            .map_err(|_| Error::InvalidConfig("inline value size overflow"))?,
+    )?;
     let checksum = header_checksum(&header)?;
     write_header_u64(&mut header, HEADER_CHECKSUM_OFFSET, checksum)?;
     // SAFETY: database creation is single-threaded and heads are not published yet.
@@ -859,6 +1061,34 @@ mod tests {
         database.close()?;
         let reopened = Database::open_runtime(&path)?;
         assert_eq!(reopened.get(b"same-key")?, Some(expected));
+        drop(reopened);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn write_only_inline_values_survive_clean_reopen() -> Result<()> {
+        let path = test_directory("write-only-inline");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut inline_config = config(Mode::Map, 16, 8);
+        inline_config.inline_value_size = 8;
+        inline_config.blob_capacity = 0;
+        let database = Database::create(&path, inline_config)?;
+        {
+            let writer = database.write_only()?;
+            for value in 0_u64..128 {
+                writer.put_unique(&value.to_le_bytes(), &(value * 2).to_le_bytes())?;
+            }
+        }
+        assert!(!path.join("blobs").exists());
+        database.close()?;
+        let reopened = Database::open_runtime(&path)?;
+        for value in 0_u64..128 {
+            assert_eq!(
+                reopened.get(&value.to_le_bytes())?,
+                Some((value * 2).to_le_bytes().to_vec())
+            );
+        }
         drop(reopened);
         std::fs::remove_dir_all(path)?;
         Ok(())
