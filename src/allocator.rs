@@ -420,7 +420,7 @@ fn validate_layout(capacity: u64, block_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn file_lengths(capacity: u64, block_size: u64) -> Result<(u64, u64, u64)> {
+pub(crate) fn file_lengths(capacity: u64, block_size: u64) -> Result<(u64, u64, u64)> {
     let block_count = capacity / block_size;
     let count_bytes = block_count
         .checked_mul(size_of::<u64>() as u64)

@@ -1,8 +1,10 @@
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::allocator::{Allocation, BlockAllocator};
+use crate::allocator::{Allocation, BlockAllocator, file_lengths};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
@@ -12,7 +14,7 @@ use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 use crate::table::{
     Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, create_runtime_heads,
-    header_checksum, heads_length, snapshot_bank_start,
+    header_checksum, heads_length, snapshot_bank_start, write_header_u64,
 };
 
 const CHECKPOINT_IDLE: u64 = 0;
@@ -86,6 +88,79 @@ impl Database {
             checkpoint_generation: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
+    }
+
+    /// Ensures an unopened runtime database has at least `headroom` bytes available after the
+    /// allocator's current body block. Existing offsets stay stable; only zeroed allocator blocks
+    /// are appended.
+    ///
+    /// Returns `true` when the runtime files and persisted configuration were enlarged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid headroom, corrupt allocator metadata, file growth failure, or
+    /// failure to persist the enlarged runtime configuration.
+    pub fn ensure_runtime_body_headroom(path: impl AsRef<Path>, headroom: u64) -> Result<bool> {
+        let path = path.as_ref();
+        let heads_path = path.join("heads");
+        let mapped_length = std::fs::metadata(&heads_path)?.len();
+        let heads = MappedFile::open(&heads_path, mapped_length, false)?;
+        let (mut config, _) = read_config(&heads)?;
+        if headroom == 0 {
+            return Err(Error::InvalidConfig(
+                "runtime body headroom must be nonzero",
+            ));
+        }
+        let required_headroom = headroom
+            .div_ceil(config.block_size)
+            .checked_mul(config.block_size)
+            .ok_or(Error::InvalidConfig("runtime body headroom overflow"))?;
+
+        let counts_path = path.join("body.counts");
+        let mut counts = std::fs::File::open(&counts_path)?;
+        let mut current_bytes = [0u8; 8];
+        counts.read_exact(&mut current_bytes)?;
+        let current_block = u64::from_le_bytes(current_bytes);
+        let block_count = config.body_capacity / config.block_size;
+        if current_block > block_count {
+            return Err(Error::Corrupt(
+                "body allocator current block is out of range",
+            ));
+        }
+        let remaining = block_count
+            .checked_sub(current_block)
+            .and_then(|blocks| blocks.checked_mul(config.block_size))
+            .ok_or(Error::Corrupt("body allocator remaining capacity overflow"))?;
+        if remaining >= required_headroom {
+            return Ok(false);
+        }
+
+        let new_capacity = current_block
+            .checked_mul(config.block_size)
+            .and_then(|used| used.checked_add(required_headroom))
+            .ok_or(Error::InvalidConfig("runtime body capacity overflow"))?;
+        let (body_length, counts_length, _) = file_lengths(new_capacity, config.block_size)?;
+        OpenOptions::new()
+            .write(true)
+            .open(path.join("body"))?
+            .set_len(body_length)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&counts_path)?
+            .set_len(counts_length)?;
+
+        let page_size = usize::try_from(PAGE_SIZE)
+            .map_err(|_| Error::Corrupt("page size does not fit memory"))?;
+        let mut header = heads.copy_out(0, page_size)?;
+        config.body_capacity = new_capacity;
+        write_header_u64(&mut header, 40, config.body_capacity)?;
+        let checksum = header_checksum(&header)?;
+        write_header_u64(&mut header, HEADER_CHECKSUM_OFFSET, checksum)?;
+        // SAFETY: callers must invoke this before opening the runtime database, so no header
+        // readers or allocator mappings are published.
+        unsafe { heads.copy_in(0, &header)? };
+        heads.sync_all()?;
+        Ok(true)
     }
 
     /// Opens the newest valid checkpoint and rebuilds fresh mutable runtime files.
@@ -991,6 +1066,33 @@ mod tests {
         config.body_capacity = config.block_size * 8;
         config.blob_capacity = config.block_size * 8;
         config
+    }
+
+    #[test]
+    fn grows_closed_runtime_body_with_stable_offsets() -> Result<()> {
+        let path = test_directory("runtime-body-growth");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let config = test_config();
+        let block_size = config.block_size;
+        let database = Database::create(&path, config)?;
+        database.put(b"firstkey", b"one")?;
+        database.close()?;
+
+        assert!(Database::ensure_runtime_body_headroom(
+            &path,
+            block_size * 16
+        )?);
+        assert!(!Database::ensure_runtime_body_headroom(
+            &path,
+            block_size * 16
+        )?);
+        let database = Database::open_runtime(&path)?;
+        assert_eq!(database.get(b"firstkey")?, Some(b"one".to_vec()));
+        database.put(b"secondky", b"two")?;
+        assert_eq!(database.get(b"secondky")?, Some(b"two".to_vec()));
+        database.close()?;
+        std::fs::remove_dir_all(path)?;
+        Ok(())
     }
 
     #[test]
