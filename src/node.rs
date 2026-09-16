@@ -11,9 +11,8 @@ use crate::allocator::{Allocation, BlockAllocator};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
 use crate::layout::{
-    DELETED_BIT, NODE_BLOB_CHECKSUM_OFFSET, NODE_BLOB_LENGTH_OFFSET, NODE_BLOB_OFFSET,
-    NODE_CHECKSUM_OFFSET, NODE_HASH_OFFSET, NODE_KEY_OFFSET, NODE_MAGIC, NODE_MAGIC_OFFSET,
-    NODE_NEXT_OFFSET,
+    NODE_BLOB_CHECKSUM_OFFSET, NODE_BLOB_LENGTH_OFFSET, NODE_BLOB_OFFSET, NODE_CHECKSUM_OFFSET,
+    NODE_HASH_OFFSET, NODE_KEY_OFFSET, NODE_MAGIC, NODE_MAGIC_OFFSET, NODE_NEXT_OFFSET,
 };
 
 #[derive(Debug)]
@@ -25,16 +24,6 @@ pub(crate) struct Node {
     pub(crate) blob_length: u64,
     pub(crate) blob_checksum: u64,
     pub(crate) key: Vec<u8>,
-}
-
-impl Node {
-    pub(crate) fn deleted(&self) -> bool {
-        self.next & DELETED_BIT != 0
-    }
-
-    pub(crate) fn successor(&self) -> u64 {
-        self.next & !DELETED_BIT
-    }
 }
 
 pub(crate) fn allocate_node(
@@ -81,8 +70,8 @@ pub(crate) fn read_node(
     node_size: u64,
     key_size: usize,
 ) -> Result<Node> {
-    if offset == 0 || offset & DELETED_BIT != 0 {
-        return Err(Error::Corrupt("body node offset is null or tagged"));
+    if offset == 0 {
+        return Err(Error::Corrupt("body node offset is null"));
     }
     let next = body
         .atomic_u64(offset + NODE_NEXT_OFFSET)?

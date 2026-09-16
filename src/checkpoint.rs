@@ -6,23 +6,20 @@
 //! generations. Checksummed manifests select the newest valid generation when
 //! [`Database::open`] rebuilds mutable runtime files.
 
-use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::allocator::{Allocation, BlockAllocator, file_lengths};
+use crate::allocator::{Allocation, BlockAllocator, read_high_water};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
-use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue};
-use crate::layout::{DELETED_BIT, PAGE_SIZE};
+use crate::layout::{HEADS_START, PAGE_SIZE};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 use crate::table::{
-    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, create_runtime_heads,
-    header_checksum, heads_length, snapshot_bank_start, write_header_u64,
+    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, bank_size,
+    create_runtime_heads, header_checksum, heads_length, snapshot_bank_start, write_header_u64,
 };
 
 const CHECKPOINT_IDLE: u64 = 0;
@@ -79,6 +76,8 @@ impl Database {
                 "heads file length does not match its configuration",
             ));
         }
+        heads.advise_heads()?;
+        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, true)?;
         let body = BlockAllocator::open(
             &path.join("body"),
@@ -96,8 +95,6 @@ impl Database {
         } else {
             None
         };
-        let hazards = HazardRegistry::new(config.max_threads)?;
-        let retired = RetireQueue::new(config.max_threads)?;
         Ok(Self {
             config,
             node_size,
@@ -105,24 +102,25 @@ impl Database {
             runtime_heads,
             body,
             blobs,
-            hazards,
-            retired,
             checkpoint_state: AtomicU64::new(CHECKPOINT_IDLE),
             checkpoint_generation: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
     }
 
-    /// Ensures an unopened runtime database has at least `headroom` bytes available after the
-    /// allocator's current body block. Existing offsets stay stable; only zeroed allocator blocks
-    /// are appended.
+    /// Ensures an unopened runtime database can map at least `headroom` bytes
+    /// beyond the allocator's body high-water mark.
     ///
-    /// Returns `true` when the runtime files and persisted configuration were enlarged.
+    /// Existing offsets and backing-file lengths stay unchanged. The next open
+    /// reserves the larger maximum mapping; the allocator grows the file only
+    /// after its free list is empty.
+    ///
+    /// Returns `true` when the persisted maximum capacity was enlarged.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid headroom, corrupt allocator metadata, file growth failure, or
-    /// failure to persist the enlarged runtime configuration.
+    /// Returns an error for invalid headroom, corrupt allocator metadata, or
+    /// failure to persist the enlarged configuration.
     ///
     /// # Examples
     ///
@@ -150,38 +148,27 @@ impl Database {
             .checked_mul(config.block_size)
             .ok_or(Error::InvalidConfig("runtime body headroom overflow"))?;
 
-        let counts_path = path.join("body.counts");
-        let mut counts = std::fs::File::open(&counts_path)?;
-        let mut current_bytes = [0u8; 8];
-        counts.read_exact(&mut current_bytes)?;
-        let current_block = u64::from_le_bytes(current_bytes);
+        let next_block = read_high_water(&path.join("body.counts"))?;
         let block_count = config.body_capacity / config.block_size;
-        if current_block > block_count {
+        if next_block > block_count {
             return Err(Error::Corrupt(
-                "body allocator current block is out of range",
+                "body allocator high-water mark is out of range",
             ));
         }
-        let remaining = block_count
-            .checked_sub(current_block)
-            .and_then(|blocks| blocks.checked_mul(config.block_size))
+        let used = next_block
+            .checked_mul(config.block_size)
+            .ok_or(Error::Corrupt("body allocator used capacity overflow"))?;
+        let remaining = config
+            .body_capacity
+            .checked_sub(used)
             .ok_or(Error::Corrupt("body allocator remaining capacity overflow"))?;
         if remaining >= required_headroom {
             return Ok(false);
         }
 
-        let new_capacity = current_block
-            .checked_mul(config.block_size)
-            .and_then(|used| used.checked_add(required_headroom))
+        let new_capacity = used
+            .checked_add(required_headroom)
             .ok_or(Error::InvalidConfig("runtime body capacity overflow"))?;
-        let (body_length, counts_length, _) = file_lengths(new_capacity, config.block_size)?;
-        OpenOptions::new()
-            .write(true)
-            .open(path.join("body"))?
-            .set_len(body_length)?;
-        OpenOptions::new()
-            .write(true)
-            .open(&counts_path)?
-            .set_len(counts_length)?;
 
         let page_size = usize::try_from(PAGE_SIZE)
             .map_err(|_| Error::Corrupt("page size does not fit memory"))?;
@@ -256,6 +243,8 @@ impl Database {
         let heads = MappedFile::open(&path.join("heads"), mapped_length, false)?;
         let snapshot = open_snapshot(path, config, manifest.bank)?;
         validate_snapshot(&heads, &snapshot, config, node_size, manifest)?;
+        heads.advise_heads()?;
+        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         remove_runtime_files(path, config.mode)?;
         let body = BlockAllocator::create(
             &path.join("body"),
@@ -273,8 +262,6 @@ impl Database {
         } else {
             None
         };
-        let hazards = HazardRegistry::new(config.max_threads)?;
-        let retired = RetireQueue::new(config.max_threads)?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
         let database = Self {
             config: config.clone(),
@@ -283,8 +270,6 @@ impl Database {
             runtime_heads,
             body,
             blobs,
-            hazards,
-            retired,
             checkpoint_state: AtomicU64::new(CHECKPOINT_IDLE),
             checkpoint_generation: AtomicU64::new(manifest.generation),
             path: path.to_path_buf(),
@@ -296,13 +281,15 @@ impl Database {
 
     /// Copies a concurrent per-bucket view into an immutable durable generation.
     ///
-    /// Operations completed before this call are included. Operations overlapping
-    /// it may appear depending on when their bucket is copied.
+    /// Append-only operations completed before this call are included; appends
+    /// that overlap it may appear depending on when their bucket is copied.
+    /// Deletions and replacements must be externally quiescent for the complete
+    /// checkpoint, as required by [`Database`]'s removal contract.
     ///
     /// # Errors
     ///
-    /// Returns an error when another checkpoint is active, worker registration
-    /// is exhausted, snapshot capacity is exhausted, or ordered flushing fails.
+    /// Returns an error when another checkpoint is active, snapshot capacity is
+    /// exhausted, or ordered flushing fails.
     ///
     /// # Examples
     ///
@@ -383,15 +370,13 @@ impl Database {
         self.clear_snapshot_bank(bank)?;
 
         let snapshot = create_snapshot(&self.path, &self.config, bank)?;
-        let guard = self.hazards.acquire()?;
         for bucket in 0..self.config.bucket_count {
-            let root = self.copy_bucket_to_snapshot(bucket, &snapshot, &guard)?;
+            let root = self.copy_bucket_to_snapshot(bucket, &snapshot)?;
             let destination = self.snapshot_root(bank, bucket)?;
             destination
                 .compare_exchange(0, root, Ordering::Release, Ordering::Acquire)
                 .map_err(|_| Error::Corrupt("checkpoint root bank was not empty"))?;
         }
-        guard.clear()?;
 
         let snapshot_checksum =
             snapshot_checksum(&self.heads, &snapshot, &self.config, self.node_size, bank)?;
@@ -421,24 +406,15 @@ impl Database {
         Ok(generation)
     }
 
-    fn copy_bucket_to_snapshot(
-        &self,
-        bucket: u64,
-        snapshot: &SnapshotFiles,
-        guard: &HazardGuard<'_>,
-    ) -> Result<u64> {
+    fn copy_bucket_to_snapshot(&self, bucket: u64, snapshot: &SnapshotFiles) -> Result<u64> {
         'restart: loop {
-            guard.clear()?;
             let runtime_head = self.head(bucket)?;
             let source_root = runtime_head.load(Ordering::Acquire);
-            guard.protect(1, source_root)?;
             if runtime_head.load(Ordering::Acquire) != source_root {
                 continue;
             }
             #[cfg(test)]
             checkpoint_capture_hook(bucket);
-            let mut predecessor_hazard = 0_usize;
-            let mut current_hazard = 1_usize;
             let mut current = source_root;
             let mut snapshot_root = 0_u64;
             let mut snapshot_tail = 0_u64;
@@ -456,16 +432,14 @@ impl Database {
                             return Err(error);
                         }
                     };
-                if !node.deleted()
-                    && !snapshot_chain_contains(
-                        &snapshot.body,
-                        snapshot_root,
-                        self.node_size,
-                        self.config.key_size,
-                        node.hash,
-                        &node.key,
-                    )?
-                {
+                if !snapshot_chain_contains(
+                    &snapshot.body,
+                    snapshot_root,
+                    self.node_size,
+                    self.config.key_size,
+                    node.hash,
+                    &node.key,
+                )? {
                     match copy_node(
                         self.blobs.as_ref(),
                         &snapshot.body,
@@ -508,14 +482,12 @@ impl Database {
                     }
                 }
                 let observed_next = node.next;
-                let successor = node.successor();
-                guard.protect(predecessor_hazard, successor)?;
+                let successor = node.next;
                 if self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next {
                     release_snapshot_chain(snapshot, snapshot_root, &self.config, self.node_size)?;
                     continue 'restart;
                 }
                 current = successor;
-                std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
             }
             if runtime_head.load(Ordering::Acquire) != source_root {
                 release_snapshot_chain(snapshot, snapshot_root, &self.config, self.node_size)?;
@@ -531,9 +503,6 @@ impl Database {
             let mut runtime_root = 0_u64;
             while source != 0 {
                 let node = read_node(&snapshot.body, source, self.node_size, self.config.key_size)?;
-                if node.next & DELETED_BIT != 0 {
-                    return Err(Error::Corrupt("checkpoint contains a deleted node"));
-                }
                 runtime_root = copy_node(
                     snapshot.blobs.as_ref(),
                     &self.body,
@@ -542,7 +511,7 @@ impl Database {
                     runtime_root,
                     self.node_size,
                 )?;
-                source = node.successor();
+                source = node.next;
             }
             self.head(bucket)?
                 .compare_exchange(0, runtime_root, Ordering::Release, Ordering::Acquire)
@@ -658,7 +627,7 @@ fn release_snapshot_chain(
 ) -> Result<()> {
     while root != 0 {
         let node = read_node(&snapshot.body, root, node_size, config.key_size)?;
-        let successor = node.successor();
+        let successor = node.next;
         release_snapshot_node(snapshot, root, config, node_size)?;
         root = successor;
     }
@@ -701,7 +670,7 @@ fn snapshot_chain_contains(
         if node.hash == hash && node.key == key {
             return Ok(true);
         }
-        root = node.successor();
+        root = node.next;
     }
     Ok(false)
 }
@@ -752,9 +721,6 @@ fn snapshot_checksum(
             }
             snapshot.body.allocation_for(current, node_length)?;
             let node = read_node(&snapshot.body, current, node_size, config.key_size)?;
-            if node.deleted() {
-                return Err(Error::Corrupt("checkpoint contains a deleted body node"));
-            }
             if node.hash != xxh64(&node.key, config.hash_seed)
                 || node.hash % config.bucket_count != bucket
             {
@@ -782,7 +748,7 @@ fn snapshot_checksum(
             checksum = mix_checksum(checksum, node.blob_length);
             checksum = mix_checksum(checksum, node.blob_checksum);
             checksum = xxh64(&node.key, checksum);
-            current = node.successor();
+            current = node.next;
         }
     }
     Ok(checksum)
@@ -817,7 +783,7 @@ fn snapshot_prefix_contains(
         if node.hash == hash && node.key == key {
             return Ok(true);
         }
-        current = node.successor();
+        current = node.next;
     }
     Ok(false)
 }
@@ -934,8 +900,6 @@ fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
         2 => Mode::Map,
         _ => return Err(Error::Corrupt("database mode is invalid")),
     };
-    let max_threads = u16::try_from(read_u64(&header, 64)?)
-        .map_err(|_| Error::Corrupt("maximum thread count is invalid"))?;
     let key_size = usize::try_from(read_u64(&header, 32)?)
         .map_err(|_| Error::Corrupt("key size does not fit memory"))?;
     let config = Config {
@@ -947,7 +911,6 @@ fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
         body_capacity: read_u64(&header, 40)?,
         blob_capacity: read_u64(&header, 48)?,
         block_size: read_u64(&header, 56)?,
-        max_threads,
         hash_seed: read_u64(&header, 72)?,
     };
     config.validate()?;
@@ -1215,35 +1178,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_checkpoint_does_not_skip_to_the_active_bank() -> Result<()> {
-        let path = test_directory("checkpoint-retry");
-        let _ignored = std::fs::remove_dir_all(&path);
-        let mut config = test_config();
-        config.max_threads = 1;
-        let database = Database::create(&path, config)?;
-        database.put(b"only-key", b"value")?;
-        assert_eq!(database.checkpoint()?, 1);
-
-        let occupied = database.hazards.acquire()?;
-        assert!(matches!(database.checkpoint(), Err(Error::Busy(_))));
-        drop(occupied);
-        assert!(!snapshot_path(&path, 0, "body").exists());
-        assert!(!snapshot_path(&path, 0, "body.counts").exists());
-        assert!(!snapshot_path(&path, 0, "blobs").exists());
-        assert!(!snapshot_path(&path, 0, "blobs.counts").exists());
-        assert_eq!(database.checkpoint()?, 2);
-        drop(database);
-
-        let reopened = Database::open(&path)?;
-        assert_eq!(reopened.get(b"only-key")?, Some(b"value".to_vec()));
-        drop(reopened);
-        std::fs::remove_dir_all(path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn checkpoint_restarts_when_replacement_marks_its_captured_root() -> Result<()> {
-        let path = test_directory("checkpoint-replace-root");
+    fn checkpoint_restarts_when_append_changes_its_captured_root() -> Result<()> {
+        let path = test_directory("checkpoint-append-root");
         let _ignored = std::fs::remove_dir_all(&path);
         let mut config = test_config();
         config.bucket_count = 1;
@@ -1257,7 +1193,7 @@ mod tests {
             while CHECKPOINT_CAPTURE_HOOK.load(Ordering::SeqCst) != 2 {
                 std::hint::spin_loop();
             }
-            database.put(b"only-key", b"new")?;
+            assert!(database.put_new(b"otherkey", b"new")?);
             CHECKPOINT_CAPTURE_HOOK
                 .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
                 .map_err(|_| Error::Corrupt("checkpoint test hook changed unexpectedly"))?;
@@ -1269,7 +1205,8 @@ mod tests {
         drop(database);
 
         let reopened = Database::open(&path)?;
-        assert_eq!(reopened.get(b"only-key")?, Some(b"new".to_vec()));
+        assert_eq!(reopened.get(b"only-key")?, Some(b"old".to_vec()));
+        assert_eq!(reopened.get(b"otherkey")?, Some(b"new".to_vec()));
         drop(reopened);
         std::fs::remove_dir_all(path)?;
         Ok(())

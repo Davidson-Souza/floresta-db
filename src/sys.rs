@@ -2,8 +2,8 @@
 
 //! Minimal Linux syscall boundary for mapped storage.
 //!
-//! The wrappers centralize `mmap`, advice, synchronous writeback, allocation,
-//! and hole punching while translating operating-system failures into [`Error`].
+//! The wrappers centralize `mmap`, `mlock`, advice, synchronous writeback, and
+//! physical allocation while translating operating-system failures into [`Error`].
 
 #![allow(dead_code)]
 
@@ -22,8 +22,6 @@ const MS_SYNC: c_int = 0x4;
 const MADV_RANDOM: c_int = 1;
 const MADV_DONTDUMP: c_int = 16;
 const POSIX_FADV_RANDOM: c_int = 1;
-const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
-const FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 const SC_PAGE_SIZE: c_int = 30;
 
@@ -37,6 +35,7 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> c_int;
+    fn mlock(address: *const c_void, length: usize) -> c_int;
     fn madvise(address: *mut c_void, length: usize, advice: c_int) -> c_int;
     fn msync(address: *mut c_void, length: usize, flags: c_int) -> c_int;
     fn fallocate(file_descriptor: c_int, mode: c_int, offset: i64, length: i64) -> c_int;
@@ -84,6 +83,12 @@ pub(crate) fn unmap(pointer: NonNull<u8>, length: usize) -> Result<()> {
     errno_result(result)
 }
 
+pub(crate) fn lock(pointer: NonNull<u8>, length: usize) -> Result<()> {
+    // SAFETY: pointer and length identify an active mapped range.
+    let result = unsafe { mlock(pointer.as_ptr().cast::<c_void>(), length) };
+    errno_result(result)
+}
+
 pub(crate) fn advise_random(
     pointer: NonNull<u8>,
     length: usize,
@@ -119,21 +124,6 @@ pub(crate) fn reserve(file_descriptor: RawFd, offset: u64, length: u64) -> Resul
     let length = to_i64(length)?;
     // SAFETY: arguments are scalar values and the descriptor is open for writing.
     let result = unsafe { fallocate(file_descriptor, 0, offset, length) };
-    errno_result(result)
-}
-
-pub(crate) fn punch(file_descriptor: RawFd, offset: u64, length: u64) -> Result<()> {
-    let offset = to_i64(offset)?;
-    let length = to_i64(length)?;
-    // SAFETY: arguments are scalar values and the descriptor is open for writing.
-    let result = unsafe {
-        fallocate(
-            file_descriptor,
-            FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-            offset,
-            length,
-        )
-    };
     errno_result(result)
 }
 

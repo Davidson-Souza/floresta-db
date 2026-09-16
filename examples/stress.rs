@@ -63,8 +63,6 @@ fn run_case(threads: usize, blocks: usize, outputs_per_block: usize) -> Result<C
     config.block_size = BLOCK_SIZE;
     config.body_capacity = body_capacity;
     config.blob_capacity = blob_capacity;
-    config.max_threads = u16::try_from(threads)
-        .map_err(|_| Error::InvalidConfig("stress thread count exceeds u16"))?;
     let database = Database::create(&path, config)?;
 
     let started = Instant::now();

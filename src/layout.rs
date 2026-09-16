@@ -20,7 +20,6 @@ pub(crate) const NODE_CHECKSUM_OFFSET: usize = 40;
 pub(crate) const NODE_BLOB_CHECKSUM_OFFSET: usize = 48;
 pub(crate) const NODE_KEY_OFFSET: usize = 56;
 pub(crate) const NODE_MAGIC: u64 = 0x4341_534e_4f44_4531;
-pub(crate) const DELETED_BIT: u64 = 1;
 
 pub(crate) const fn align_up(value: u64, alignment: u64) -> Option<u64> {
     if alignment == 0 || !alignment.is_power_of_two() {

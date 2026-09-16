@@ -2,8 +2,8 @@
 
 //! Database modes and validated storage configuration.
 //!
-//! [`Config`] describes the persistent layout and concurrency limits. Validation
-//! rejects combinations that cannot be represented safely by the on-disk format.
+//! [`Config`] describes the persistent layout. Validation rejects combinations
+//! that cannot be represented safely by the on-disk format.
 
 use crate::error::{Error, Result};
 use crate::layout::{PAGE_SIZE, align_up};
@@ -57,10 +57,10 @@ pub enum Mode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Defines the persistent layout and concurrency limits of a database.
+/// Defines the persistent layout of a database.
 ///
-/// Capacities are reserved as sparse files and must be multiples of
-/// [`Config::block_size`]. They do not represent immediate physical allocation.
+/// Capacities are maximum virtual mappings and must be multiples of
+/// [`Config::block_size`]. Backing files grow one block at a time as needed.
 ///
 /// # Examples
 ///
@@ -95,9 +95,6 @@ pub struct Config {
     /// Allocation and reclamation granularity in bytes.
     pub block_size: u64,
 
-    /// Maximum number of simultaneous hazard-pointer registrations.
-    pub max_threads: u16,
-
     /// Seed supplied to XXH64 when selecting buckets.
     pub hash_seed: u64,
 }
@@ -128,7 +125,6 @@ impl Config {
             body_capacity: 1 << 30,
             blob_capacity: if mode == Mode::Map { 1 << 30 } else { 0 },
             block_size: 1 << 20,
-            max_threads: 64,
             hash_seed: DEFAULT_HASH_SEED,
         }
     }
@@ -192,9 +188,6 @@ impl Config {
         }
         if self.blob_capacity % self.block_size != 0 {
             return Err(Error::InvalidConfig("blob capacity must be block aligned"));
-        }
-        if self.max_threads == 0 {
-            return Err(Error::InvalidConfig("maximum thread count must be nonzero"));
         }
         let node_size = self.node_size()?;
         if node_size > self.block_size {

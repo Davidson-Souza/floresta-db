@@ -49,10 +49,9 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
     config.body_capacity = FUZZ_CAPACITY;
     config.blob_capacity = FUZZ_CAPACITY;
     config.block_size = BLOCK_SIZE;
-    config.max_threads = 1;
 
     let mut database = Database::create(path, config)?;
-    let mut model = BTreeMap::<[u8; 8], [u8; 8]>::new();
+    let mut model = BTreeMap::<[u8; 8], Vec<[u8; 8]>>::new();
 
     for (step, record) in input
         .chunks_exact(RECORD_BYTES)
@@ -65,10 +64,20 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
         let mut value = [0_u8; 8];
         value.copy_from_slice(&record[9..17]);
 
-        match record[0] % 7 {
+        match record[0] % 9 {
             0 => {
                 database.put(&key, &value)?;
-                model.insert(key, value);
+                match model.get_mut(&key) {
+                    Some(values) => {
+                        let current = values
+                            .last_mut()
+                            .ok_or_else(|| mismatch(step, "empty value stack"))?;
+                        *current = value;
+                    }
+                    None => {
+                        model.insert(key, vec![value]);
+                    }
+                }
             }
 
             1 => {
@@ -76,17 +85,21 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
                 let inserted = database.put_new(&key, &value)?;
                 ensure_equal(step, "put_new result", inserted, expected)?;
                 if inserted {
-                    model.insert(key, value);
+                    model.insert(key, vec![value]);
                 }
             }
 
             2 => {
-                let expected = model.remove(&key).is_some();
+                let expected = delete_model(&mut model, &key);
                 let deleted = database.delete(&key)?;
                 ensure_equal(step, "delete result", deleted, expected)?;
             }
 
-            3 => compare_value(step, database.get(&key)?.as_deref(), model.get(&key))?,
+            3 => compare_value(
+                step,
+                database.get(&key)?.as_deref(),
+                model.get(&key).and_then(|values| values.last()),
+            )?,
 
             4 => {
                 let expected = model.contains_key(&key);
@@ -102,7 +115,42 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
             }
 
             6 => {
-                database.reclaim()?;
+                let entries = [
+                    (key.as_slice(), value.as_slice()),
+                    (value.as_slice(), key.as_slice()),
+                ];
+                database.write_only()?.put_batch(entries)?;
+                model.entry(key).or_default().push(value);
+                model.entry(value).or_default().push(key);
+            }
+
+            7 => {
+                let keys = [key.as_slice(), value.as_slice()];
+                let actual = database.batch_fetch(keys)?;
+                compare_value(
+                    step,
+                    actual[0].as_deref(),
+                    model.get(&key).and_then(|values| values.last()),
+                )?;
+                compare_value(
+                    step,
+                    actual[1].as_deref(),
+                    model.get(&value).and_then(|values| values.last()),
+                )?;
+            }
+
+            8 => {
+                let mut second_key = value;
+                if second_key == key {
+                    second_key[0] ^= 1;
+                }
+                let expected = [
+                    delete_model(&mut model, &key),
+                    delete_model(&mut model, &second_key),
+                ];
+                let actual = database.batch_delete([key.as_slice(), second_key.as_slice()])?;
+                ensure_equal(step, "first batch_delete result", actual[0], expected[0])?;
+                ensure_equal(step, "second batch_delete result", actual[1], expected[1])?;
             }
 
             _ => return Err(mismatch(step, "operation selector").into()),
@@ -115,13 +163,27 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
 fn verify_model(
     step: usize,
     database: &Database,
-    model: &BTreeMap<[u8; 8], [u8; 8]>,
+    model: &BTreeMap<[u8; 8], Vec<[u8; 8]>>,
 ) -> Result<(), Box<dyn StdError>> {
-    for (key, expected) in model {
+    for (key, values) in model {
+        let expected = values
+            .last()
+            .ok_or_else(|| mismatch(step, "empty value stack"))?;
         compare_value(step, database.get(key)?.as_deref(), Some(expected))?;
     }
 
     Ok(())
+}
+
+fn delete_model(model: &mut BTreeMap<[u8; 8], Vec<[u8; 8]>>, key: &[u8; 8]) -> bool {
+    let Some(values) = model.get_mut(key) else {
+        return false;
+    };
+    values.pop();
+    if values.is_empty() {
+        model.remove(key);
+    }
+    true
 }
 
 fn compare_value(

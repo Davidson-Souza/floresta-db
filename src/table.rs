@@ -2,9 +2,10 @@
 
 //! Concurrent hash-table operations and the primary database API.
 //!
-//! Buckets are separate chains headed by in-memory atomics. Insertions publish a
-//! private node with CAS; replacement and deletion mark before unlinking and
-//! defer physical reclamation through the hazard registry.
+//! Buckets are separate chains headed by in-memory atomics. Batch APIs SIMD-hash
+//! keys and visit heads in ascending bucket order. Append-only collisions are
+//! privately linked before one head CAS; fetches and unique deletions traverse
+//! each requested bucket once. Empty blocks return to a CAS-managed free list.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,19 +13,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::allocator::{Allocation, BlockAllocator};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
-use crate::hash::xxh64;
-use crate::hazard::{HazardGuard, HazardRegistry, RetireQueue, RetireReservation};
-use crate::layout::{DELETED_BIT, HEADS_START, PAGE_SIZE, align_up};
+use crate::hash::{xxh64, xxh64_batch4};
+use crate::layout::{HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-pub(crate) const FORMAT_VERSION: u64 = 3;
+pub(crate) const FORMAT_VERSION: u64 = 4;
 pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 96;
 pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Reports whether an upsert inserted a new key or replaced an existing one.
+/// Reports whether an operation published a new node or replaced one.
 ///
 /// # Examples
 ///
@@ -34,7 +34,7 @@ pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 /// assert_ne!(PutResult::Inserted, PutResult::Replaced);
 /// ```
 pub enum PutResult {
-    /// The key was absent and a new node was published.
+    /// A new node was published; append-only set adds may retain an equivalent older node.
     Inserted,
 
     /// An existing node for the key was replaced.
@@ -48,11 +48,57 @@ enum PutOutcome {
     Replaced,
 }
 
+struct PreparedKey<'key> {
+    key: &'key [u8],
+
+    hash: u64,
+
+    bucket: u64,
+
+    order: usize,
+}
+
+struct PreparedInsert<'entry> {
+    key: &'entry [u8],
+
+    value: Option<&'entry [u8]>,
+
+    hash: u64,
+
+    bucket: u64,
+
+    order: usize,
+}
+
+struct PrivateInsert {
+    node: Allocation,
+
+    blob: Option<Allocation>,
+
+    bucket: u64,
+}
+
+struct PrivateGroup<'database> {
+    head: &'database AtomicU64,
+
+    tail_next: &'database AtomicU64,
+
+    root: u64,
+}
+
 /// A concurrent handle to one memory-mapped map or set.
 ///
 /// Cloned handles are intentionally not provided; share one `Database` by
 /// reference between scoped threads. All keys must match the fixed width in
 /// [`Config`].
+///
+/// # Removal contract
+///
+/// Append-only writes may run concurrently. Operations that remove an existing
+/// node—[`Database::delete`] and replacing [`Database::put`] calls—require the
+/// caller to provide unique ownership of that logical key and quiescence from
+/// reads or checkpoints that could retain an offset in the affected bucket.
+/// Empty blocks can be reused immediately after the unlink CAS succeeds.
 ///
 /// # Examples
 ///
@@ -73,18 +119,17 @@ pub struct Database {
     pub(crate) runtime_heads: Box<[AtomicU64]>,
     pub(crate) body: BlockAllocator,
     pub(crate) blobs: Option<BlockAllocator>,
-    pub(crate) hazards: HazardRegistry,
-    pub(crate) retired: RetireQueue,
     pub(crate) checkpoint_state: AtomicU64,
     pub(crate) checkpoint_generation: AtomicU64,
     pub(crate) path: PathBuf,
 }
 
-/// An optimized writer for building a map from globally unique keys.
+/// An optimized batch writer for building a map without lookups.
 ///
-/// The writer skips lookup, replacement, hazard registration, and reclamation.
-/// Publishing a duplicate key violates its contract and can leave duplicates in
-/// the bucket chain.
+/// The writer hashes and validates the complete batch before allocating nodes,
+/// then publishes buckets in ascending order. Entries targeting one bucket are
+/// linked privately and exposed by one successful head CAS. Duplicate keys are
+/// retained; the last duplicate in a batch is encountered first by readers.
 ///
 /// # Examples
 ///
@@ -95,7 +140,11 @@ pub struct Database {
 ///     "floresta-db-writer-example",
 ///     Config::new(Mode::Map, 1_024, 8),
 /// )?;
-/// database.write_only()?.put_unique(b"key-0001", b"value")?;
+/// let entries = [
+///     (b"key-0001".as_slice(), b"value-01".as_slice()),
+///     (b"key-0002".as_slice(), b"value-02".as_slice()),
+/// ];
+/// database.write_only()?.put_batch(entries)?;
 /// # Ok::<(), floresta_db::Error>(())
 /// ```
 pub struct WriteOnlyWriter<'database> {
@@ -125,14 +174,13 @@ impl Database {
     pub fn create(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         config.validate()?;
         let node_size = config.node_size()?;
-        let hazards = HazardRegistry::new(config.max_threads)?;
-        let retired = RetireQueue::new(config.max_threads)?;
         let path = path.as_ref();
         std::fs::create_dir(path)?;
         let heads_length = heads_length(config.bucket_count)?;
         let heads = MappedFile::create(&path.join("heads"), heads_length, false, false)?;
         initialize_header(&heads, &config, node_size)?;
         heads.advise_heads()?;
+        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
         let body = BlockAllocator::create(
             &path.join("body"),
@@ -157,19 +205,21 @@ impl Database {
             runtime_heads,
             body,
             blobs,
-            hazards,
-            retired,
             checkpoint_state: AtomicU64::new(0),
             checkpoint_generation: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
     }
 
-    /// Adds a key to a set, replacing an existing equivalent entry.
+    /// Adds one key to a set without searching the bucket.
+    ///
+    /// Every call publishes a new node and therefore returns
+    /// [`PutResult::Inserted`], even when an equivalent key already exists.
     ///
     /// # Errors
     ///
-    /// Returns an error when called on a map or when allocation fails.
+    /// Returns an error when called on a map, when the key width differs from
+    /// the configured width, or when allocation fails.
     ///
     /// # Examples
     ///
@@ -181,21 +231,60 @@ impl Database {
     ///     Config::new(Mode::Set, 1_024, 32),
     /// )?;
     /// assert_eq!(database.add(&[1; 32])?, PutResult::Inserted);
+    /// assert_eq!(database.add(&[1; 32])?, PutResult::Inserted);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn add(&self, key: &[u8]) -> Result<PutResult> {
         if self.config.mode != Mode::Set {
             return Err(Error::Unsupported("add is available only for sets"));
         }
-        let guard = self.hazards.acquire()?;
-        match self.put_inner(key, None, &guard, true)? {
-            PutOutcome::Inserted => Ok(PutResult::Inserted),
-            PutOutcome::Replaced => Ok(PutResult::Replaced),
-            PutOutcome::Existing => Err(Error::Corrupt("upsert reported an existing key")),
+        self.insert_one_inner(key, None)?;
+        Ok(PutResult::Inserted)
+    }
+
+    /// Adds a batch of keys to a set without duplicate lookups.
+    ///
+    /// The complete batch is validated and hashed first. Entries are sorted by
+    /// bucket while retaining input order within each bucket. All nodes for one
+    /// bucket are linked privately, and the final input for that bucket becomes
+    /// its new head after one successful head CAS. Buckets are published in
+    /// ascending order to keep head accesses local.
+    ///
+    /// Duplicate keys are retained as separate nodes. The returned count is the
+    /// number of nodes published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when called on a map, when any key has the wrong width,
+    /// or when validation, metadata allocation, or mapped allocation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-add-batch-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// let keys = [b"key-0001".as_slice(), b"key-0002".as_slice()];
+    /// assert_eq!(database.add_batch(keys)?, 2);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    pub fn add_batch<'key, I>(&self, keys: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        if self.config.mode != Mode::Set {
+            return Err(Error::Unsupported("add_batch is available only for sets"));
         }
+        self.insert_batch_inner(keys.into_iter().map(|key| (key, None)))
     }
 
     /// Inserts or replaces a map value.
+    ///
+    /// Replacing an existing value follows the [`Database`] removal contract;
+    /// inserting an absent key remains append-only.
     ///
     /// # Errors
     ///
@@ -218,8 +307,7 @@ impl Database {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("put is available only for maps"));
         }
-        let guard = self.hazards.acquire()?;
-        match self.put_inner(key, Some(value), &guard, true)? {
+        match self.put_inner(key, Some(value), true)? {
             PutOutcome::Inserted => Ok(PutResult::Inserted),
             PutOutcome::Replaced => Ok(PutResult::Replaced),
             PutOutcome::Existing => Err(Error::Corrupt("upsert reported an existing key")),
@@ -228,8 +316,8 @@ impl Database {
 
     /// Inserts a map value only when its key does not exist.
     ///
-    /// This write-once path never replaces nodes and therefore skips retirement reclamation.
-    /// Concurrent attempts for the same key produce exactly one insertion.
+    /// This write-once path never replaces nodes. Concurrent attempts for the
+    /// same key produce exactly one insertion.
     ///
     /// # Errors
     ///
@@ -253,18 +341,17 @@ impl Database {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("put_new is available only for maps"));
         }
-        let guard = self.hazards.acquire()?;
-        match self.put_inner(key, Some(value), &guard, false)? {
+        match self.put_inner(key, Some(value), false)? {
             PutOutcome::Inserted => Ok(true),
             PutOutcome::Existing => Ok(false),
             PutOutcome::Replaced => Err(Error::Corrupt("insert-only put replaced a key")),
         }
     }
 
-    /// Creates a range-scoped writer for unique map keys.
+    /// Creates a batch writer for append-only map construction.
     ///
-    /// The writer skips hazard registration, lookup, replacement, deletion, and reclamation.
-    /// Callers must guarantee that every key is globally unique for the database build.
+    /// The writer skips lookup, replacement, deletion, and reclamation.
+    /// Duplicate keys are valid and remain as separate nodes.
     ///
     /// # Errors
     ///
@@ -279,8 +366,8 @@ impl Database {
     ///     "floresta-db-write-only-example",
     ///     Config::new(Mode::Map, 1_024, 8),
     /// )?;
-    /// let writer = database.write_only()?;
-    /// writer.put_unique(b"key-0001", b"value")?;
+    /// let entries = [(b"key-0001".as_slice(), b"value-01".as_slice())];
+    /// database.write_only()?.put_batch(entries)?;
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn write_only(&self) -> Result<WriteOnlyWriter<'_>> {
@@ -314,43 +401,68 @@ impl Database {
             return Err(Error::Unsupported("get is available only for maps"));
         }
         self.validate_key(key)?;
-        let guard = self.hazards.acquire()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let found = self.find(bucket, hash, key, &guard)?;
+        let found = self.find(bucket, hash, key)?;
         let Some(node) = found.node else {
             return Ok(None);
         };
-        if self.config.inline_value_size != 0 {
-            if node.blob_length != self.config.inline_value_size as u64 {
-                return Err(Error::Corrupt("inline map value length does not match"));
-            }
-            let value = inline_value_bytes(node.blob_offset, self.config.inline_value_size)?;
-            if node.blob_checksum != blob_checksum(&value) {
-                return Err(Error::Corrupt("inline map value checksum does not match"));
-            }
-            guard.clear()?;
-            return Ok(Some(value));
+        Ok(Some(self.read_node_value(&node)?))
+    }
+
+    /// Fetches map values in a bucket-local batch.
+    ///
+    /// All keys are validated and hashed first, four at a time with AVX2 when
+    /// available. Requests are sorted by ascending bucket, each bucket chain is
+    /// traversed once, and results are restored to input order. Duplicate input
+    /// keys produce duplicate output values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a wrong key width, set mode, failed result
+    /// allocation, or corrupt storage.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-batch-fetch-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// database.put_new(b"key-0001", b"value-01")?;
+    /// let keys = [b"key-0001".as_slice(), b"missing!".as_slice()];
+    /// let values = database.batch_fetch(keys)?;
+    /// assert_eq!(values[0].as_deref(), Some(b"value-01".as_slice()));
+    /// assert_eq!(values[1], None);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    pub fn batch_fetch<'key, I>(&self, keys: I) -> Result<Vec<Option<Vec<u8>>>>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        if self.config.mode != Mode::Map {
+            return Err(Error::Unsupported("batch_fetch is available only for maps"));
         }
-        if node.blob_length == 0 {
-            if node.blob_checksum != blob_checksum(&[]) {
-                return Err(Error::Corrupt("empty map value checksum does not match"));
+        let prepared = self.prepare_keys(keys)?;
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        results.resize_with(prepared.len(), || None);
+
+        let mut start = 0;
+        while start < prepared.len() {
+            let bucket = prepared[start].bucket;
+            let mut end = start + 1;
+            while end < prepared.len() && prepared[end].bucket == bucket {
+                end += 1;
             }
-            guard.clear()?;
-            return Ok(Some(Vec::new()));
+            self.fetch_bucket_batch(bucket, &prepared[start..end], &mut results)?;
+            start = end;
         }
-        let length = usize::try_from(node.blob_length)
-            .map_err(|_| Error::Corrupt("blob length does not fit memory"))?;
-        let blobs = self
-            .blobs
-            .as_ref()
-            .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        let value = blobs.read(node.blob_offset, length)?;
-        if node.blob_checksum != blob_checksum(&value) {
-            return Err(Error::Corrupt("map value checksum does not match"));
-        }
-        guard.clear()?;
-        Ok(Some(value))
+        Ok(results)
     }
 
     /// Tests membership in either a set or map.
@@ -374,19 +486,22 @@ impl Database {
     /// ```
     pub fn contains(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
-        let guard = self.hazards.acquire()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let contains = self.find(bucket, hash, key, &guard)?.node.is_some();
-        guard.clear()?;
-        Ok(contains)
+        Ok(self.find(bucket, hash, key)?.node.is_some())
     }
 
-    /// Logically marks and physically unlinks one key using CAS operations.
+    /// Unlinks one uniquely owned key and immediately recycles empty blocks.
+    ///
+    /// The caller must guarantee that no other thread can delete the same live
+    /// key. Since reclaimed blocks may be reused immediately, deletion also
+    /// requires external quiescence from reads or checkpoints that could still
+    /// retain an offset in the affected bucket.
     ///
     /// # Errors
     ///
-    /// Returns an error for a wrong key width or corrupt storage.
+    /// Returns an error for a wrong key width, corrupt storage, or a detected
+    /// violation of the unique-deletion contract.
     ///
     /// # Examples
     ///
@@ -403,43 +518,35 @@ impl Database {
     /// ```
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
-        let guard = self.hazards.acquire()?;
-        self.reclaim_retired()?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let found = self.find(bucket, hash, key, &guard)?;
-        let Some(target) = found.node else {
-            return Ok(false);
-        };
-        let retirement = self.reserve_retirement(target.offset)?;
-        let target_next = self.body.atomic_u64(target.offset)?;
-        let next = loop {
-            let observed = target_next.load(Ordering::Acquire);
-            if observed & DELETED_BIT != 0 {
-                break observed & !DELETED_BIT;
+        loop {
+            let found = self.find(bucket, hash, key)?;
+            let Some(target) = found.node else {
+                return Ok(false);
+            };
+            match self.unlink_link(found.link, &target) {
+                Ok(()) => return Ok(true),
+                Err(Error::Busy(_)) => std::hint::spin_loop(),
+                Err(error) => return Err(error),
             }
-            if target_next
-                .compare_exchange(
-                    observed,
-                    observed | DELETED_BIT,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                break observed;
-            }
-        };
-        self.unlink_offset(bucket, target.offset, next, &guard, retirement)?;
-        guard.clear()?;
-        Ok(true)
+        }
     }
 
-    /// Reclaims currently unprotected retired nodes and their values.
+    /// Deletes uniquely owned keys in a bucket-local batch.
+    ///
+    /// Keys are SIMD-hashed, sorted by ascending bucket, and each bucket chain
+    /// is traversed once. Results retain input order and report whether each key
+    /// was present. Duplicate input keys are rejected because they violate the
+    /// unique-deletion contract.
+    ///
+    /// This method has the same removal and quiescence requirements as
+    /// [`Database::delete`].
     ///
     /// # Errors
     ///
-    /// Returns a storage error if block counts or hole punching fail.
+    /// Returns an error for duplicate inputs, wrong key widths, corrupt storage,
+    /// allocation failure, or a detected unique-deletion violation.
     ///
     /// # Examples
     ///
@@ -447,25 +554,37 @@ impl Database {
     /// use floresta_db::{Config, Database, Mode};
     ///
     /// let database = Database::create(
-    ///     "floresta-db-reclaim-example",
+    ///     "floresta-db-batch-delete-example",
     ///     Config::new(Mode::Set, 1_024, 8),
     /// )?;
-    /// let reclaimed = database.reclaim()?;
-    /// assert_eq!(reclaimed, 0);
+    /// database.add(b"key-0001")?;
+    /// let keys = [b"key-0001".as_slice(), b"missing!".as_slice()];
+    /// assert_eq!(database.batch_delete(keys)?, vec![true, false]);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
-    pub fn reclaim(&self) -> Result<usize> {
-        let _guard = self.hazards.acquire()?;
-        let reclaimed = self.reclaim_retired();
-        let body_retry = self.body.reclaim_empty_blocks();
-        let blob_retry = self
-            .blobs
-            .as_ref()
-            .map_or(Ok(()), BlockAllocator::reclaim_empty_blocks);
-        let reclaimed = reclaimed?;
-        body_retry?;
-        blob_retry?;
-        Ok(reclaimed)
+    pub fn batch_delete<'key, I>(&self, keys: I) -> Result<Vec<bool>>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        let prepared = self.prepare_keys(keys)?;
+        Self::validate_unique_batch_keys(&prepared)?;
+        let mut deleted = Vec::new();
+        deleted
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        deleted.resize(prepared.len(), false);
+
+        let mut start = 0;
+        while start < prepared.len() {
+            let bucket = prepared[start].bucket;
+            let mut end = start + 1;
+            while end < prepared.len() && prepared[end].bucket == bucket {
+                end += 1;
+            }
+            self.delete_bucket_batch(bucket, &prepared[start..end], &mut deleted)?;
+            start = end;
+        }
+        Ok(deleted)
     }
 
     /// Flushes mapped contents without defining a checkpoint generation.
@@ -549,14 +668,10 @@ impl Database {
         &self,
         key: &[u8],
         value: Option<&[u8]>,
-        guard: &HazardGuard<'_>,
         replace_existing: bool,
     ) -> Result<PutOutcome> {
         self.validate_key(key)?;
         self.validate_value(value)?;
-        if replace_existing {
-            self.reclaim_retired()?;
-        }
         let blob = self.allocate_blob(value)?;
         let blob_offset = if self.config.inline_value_size == 0 {
             blob.map_or(0, |allocation| allocation.offset)
@@ -588,33 +703,23 @@ impl Database {
         let bucket = hash % self.config.bucket_count;
         let mut private_next = 0;
         loop {
-            let found = match self.find(bucket, hash, key, guard) {
+            let found = match self.find(bucket, hash, key) {
                 Ok(found) => found,
                 Err(error) => {
                     self.release_private(node, blob)?;
                     return Err(error);
                 }
             };
+            let existing_link = found.link;
             let existing = found.node;
             if existing.is_some() && !replace_existing {
                 self.release_private(node, blob)?;
-                guard.clear()?;
                 return Ok(PutOutcome::Existing);
             }
             let result = if existing.is_some() {
                 PutOutcome::Replaced
             } else {
                 PutOutcome::Inserted
-            };
-            let retirement = match &existing {
-                Some(existing) => match self.reserve_retirement(existing.offset) {
-                    Ok(retirement) => Some(retirement),
-                    Err(error) => {
-                        self.release_private(node, blob)?;
-                        return Err(error);
-                    }
-                },
-                None => None,
             };
             if let Err(error) = set_private_next(&self.body, node.offset, private_next, found.root)
             {
@@ -639,31 +744,365 @@ impl Database {
                 .is_ok()
             {
                 if let Some(existing) = existing {
-                    let successor = self.mark_node(existing.offset)?;
-                    let retirement = retirement.ok_or(Error::Corrupt(
-                        "replacement retirement reservation is missing",
-                    ))?;
-                    self.unlink_offset(bucket, existing.offset, successor, guard, retirement)?;
+                    let link = match existing_link {
+                        Link::Head(_) => Link::Node(node.offset),
+                        Link::Node(offset) => Link::Node(offset),
+                    };
+                    self.unlink_link(link, &existing)?;
                 }
-                guard.clear()?;
                 return Ok(result);
             }
         }
     }
 
-    fn put_unique_inner(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    fn insert_one_inner(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         self.validate_key(key)?;
-        self.validate_value(Some(value))?;
-        let blob = self.allocate_blob(Some(value))?;
+        self.validate_value(value)?;
+        let hash = xxh64(key, self.config.hash_seed);
+        let bucket = hash % self.config.bucket_count;
+        let private = self.allocate_private_insert(key, value, hash, bucket)?;
+        let head = match self.head(private.bucket) {
+            Ok(head) => head,
+            Err(error) => {
+                self.release_private(private.node, private.blob)?;
+                return Err(error);
+            }
+        };
+        let tail_next = match self.body.atomic_u64(private.node.offset) {
+            Ok(tail_next) => tail_next,
+            Err(error) => {
+                self.release_private(private.node, private.blob)?;
+                return Err(error);
+            }
+        };
+        let group = PrivateGroup {
+            head,
+            tail_next,
+            root: private.node.offset,
+        };
+        Self::commit_private_group(&group);
+        Ok(())
+    }
+
+    fn insert_batch_inner<'entry, I>(&self, entries: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (&'entry [u8], Option<&'entry [u8]>)>,
+    {
+        let prepared = self.prepare_batch(entries)?;
+        let count = prepared.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut private = Vec::new();
+        private
+            .try_reserve_exact(count)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(count)
+            .map_err(|_| Error::OutOfMemory)?;
+
+        for entry in prepared {
+            match self.allocate_private_insert(entry.key, entry.value, entry.hash, entry.bucket) {
+                Ok(insert) => private.push(insert),
+                Err(error) => {
+                    self.release_private_batch(private)?;
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Err(error) = self.link_private_batch(&private) {
+            self.release_private_batch(private)?;
+            return Err(error);
+        }
+        if let Err(error) = self.collect_private_groups(&private, &mut groups) {
+            self.release_private_batch(private)?;
+            return Err(error);
+        }
+
+        for group in &groups {
+            Self::commit_private_group(group);
+        }
+        Ok(count)
+    }
+
+    fn prepare_batch<'entry, I>(&self, entries: I) -> Result<Vec<PreparedInsert<'entry>>>
+    where
+        I: IntoIterator<Item = (&'entry [u8], Option<&'entry [u8]>)>,
+    {
+        let entries = entries.into_iter();
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve(entries.size_hint().0)
+            .map_err(|_| Error::OutOfMemory)?;
+
+        for (order, (key, value)) in entries.enumerate() {
+            self.validate_key(key)?;
+            self.validate_value(value)?;
+            prepared.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            prepared.push(PreparedInsert {
+                key,
+                value,
+                hash: 0,
+                bucket: 0,
+                order,
+            });
+        }
+
+        self.hash_prepared_inserts(&mut prepared);
+
+        prepared.sort_unstable_by_key(|entry| (entry.bucket, entry.order));
+        Ok(prepared)
+    }
+
+    fn hash_prepared_inserts(&self, prepared: &mut [PreparedInsert<'_>]) {
+        for chunk in prepared.chunks_mut(4) {
+            if let [first, second, third, fourth] = chunk {
+                let hashes = xxh64_batch4(
+                    [first.key, second.key, third.key, fourth.key],
+                    self.config.hash_seed,
+                );
+                for (entry, hash) in chunk.iter_mut().zip(hashes) {
+                    entry.hash = hash;
+                    entry.bucket = hash % self.config.bucket_count;
+                }
+            } else {
+                for entry in chunk {
+                    entry.hash = xxh64(entry.key, self.config.hash_seed);
+                    entry.bucket = entry.hash % self.config.bucket_count;
+                }
+            }
+        }
+    }
+
+    fn prepare_keys<'key, I>(&self, keys: I) -> Result<Vec<PreparedKey<'key>>>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        let keys = keys.into_iter();
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve(keys.size_hint().0)
+            .map_err(|_| Error::OutOfMemory)?;
+        for (order, key) in keys.enumerate() {
+            self.validate_key(key)?;
+            prepared.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            prepared.push(PreparedKey {
+                key,
+                hash: 0,
+                bucket: 0,
+                order,
+            });
+        }
+        self.hash_prepared_keys(&mut prepared);
+        prepared.sort_unstable_by_key(|entry| (entry.bucket, entry.hash, entry.order));
+        Ok(prepared)
+    }
+
+    fn hash_prepared_keys(&self, prepared: &mut [PreparedKey<'_>]) {
+        for chunk in prepared.chunks_mut(4) {
+            if let [first, second, third, fourth] = chunk {
+                let hashes = xxh64_batch4(
+                    [first.key, second.key, third.key, fourth.key],
+                    self.config.hash_seed,
+                );
+                for (entry, hash) in chunk.iter_mut().zip(hashes) {
+                    entry.hash = hash;
+                    entry.bucket = hash % self.config.bucket_count;
+                }
+            } else {
+                for entry in chunk {
+                    entry.hash = xxh64(entry.key, self.config.hash_seed);
+                    entry.bucket = entry.hash % self.config.bucket_count;
+                }
+            }
+        }
+    }
+
+    fn validate_unique_batch_keys(prepared: &[PreparedKey<'_>]) -> Result<()> {
+        let mut start = 0;
+        while start < prepared.len() {
+            let bucket = prepared[start].bucket;
+            let hash = prepared[start].hash;
+            let mut end = start + 1;
+            while end < prepared.len()
+                && prepared[end].bucket == bucket
+                && prepared[end].hash == hash
+            {
+                end += 1;
+            }
+            for (index, entry) in prepared[start..end].iter().enumerate() {
+                if prepared[start + index + 1..end]
+                    .iter()
+                    .any(|other| entry.key == other.key)
+                {
+                    return Err(Error::InvalidConfig(
+                        "batch_delete keys must be globally unique",
+                    ));
+                }
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn fetch_bucket_batch(
+        &self,
+        bucket: u64,
+        prepared: &[PreparedKey<'_>],
+        results: &mut [Option<Vec<u8>>],
+    ) -> Result<()> {
+        'restart: loop {
+            for entry in prepared {
+                let result = results
+                    .get_mut(entry.order)
+                    .ok_or(Error::Corrupt("batch-fetch result index is out of range"))?;
+                *result = None;
+            }
+            let mut remaining = prepared.len();
+            let mut link = Link::Head(bucket);
+            let root = self.link_atomic(link)?.load(Ordering::Acquire);
+            let mut current = root;
+            while current != 0 {
+                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
+                let observed_next = node.next;
+                if self.link_atomic(link)?.load(Ordering::Acquire) != current
+                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                {
+                    continue 'restart;
+                }
+
+                let first = prepared.partition_point(|entry| entry.hash < node.hash);
+                for entry in &prepared[first..] {
+                    if entry.hash != node.hash {
+                        break;
+                    }
+                    let result = results
+                        .get_mut(entry.order)
+                        .ok_or(Error::Corrupt("batch-fetch result index is out of range"))?;
+                    if result.is_none() && entry.key == node.key {
+                        *result = Some(self.read_node_value(&node)?);
+                        remaining = remaining
+                            .checked_sub(1)
+                            .ok_or(Error::Corrupt("batch-fetch match count underflow"))?;
+                    }
+                }
+                if remaining == 0 {
+                    if self.head(bucket)?.load(Ordering::Acquire) == root {
+                        return Ok(());
+                    }
+                    continue 'restart;
+                }
+                link = Link::Node(current);
+                current = observed_next;
+            }
+            if self.head(bucket)?.load(Ordering::Acquire) == root {
+                return Ok(());
+            }
+        }
+    }
+
+    fn delete_bucket_batch(
+        &self,
+        bucket: u64,
+        prepared: &[PreparedKey<'_>],
+        deleted: &mut [bool],
+    ) -> Result<()> {
+        'restart: loop {
+            let mut link = Link::Head(bucket);
+            let head = self.head(bucket)?;
+            let mut expected_head = head.load(Ordering::Acquire);
+            let mut current = expected_head;
+            while current != 0 {
+                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
+                let observed_next = node.next;
+                if self.link_atomic(link)?.load(Ordering::Acquire) != current
+                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                {
+                    continue 'restart;
+                }
+
+                let first = prepared.partition_point(|entry| entry.hash < node.hash);
+                let matching = prepared[first..].iter().find(|entry| {
+                    entry.hash == node.hash
+                        && !deleted.get(entry.order).copied().unwrap_or(false)
+                        && entry.key == node.key
+                });
+                if let Some(entry) = matching {
+                    let removes_head = matches!(link, Link::Head(_));
+                    match self.unlink_link(link, &node) {
+                        Ok(()) => {
+                            let result = deleted.get_mut(entry.order).ok_or(Error::Corrupt(
+                                "batch-delete result index is out of range",
+                            ))?;
+                            *result = true;
+                            if removes_head {
+                                expected_head = observed_next;
+                            }
+                            current = observed_next;
+                            continue;
+                        }
+                        Err(Error::Busy(_)) => continue 'restart,
+                        Err(error) => return Err(error),
+                    }
+                }
+                link = Link::Node(current);
+                current = observed_next;
+            }
+            if head.load(Ordering::Acquire) == expected_head {
+                return Ok(());
+            }
+        }
+    }
+
+    fn read_node_value(&self, node: &Node) -> Result<Vec<u8>> {
+        if self.config.inline_value_size != 0 {
+            if node.blob_length != self.config.inline_value_size as u64 {
+                return Err(Error::Corrupt("inline map value length does not match"));
+            }
+            let value = inline_value_bytes(node.blob_offset, self.config.inline_value_size)?;
+            if node.blob_checksum != blob_checksum(&value) {
+                return Err(Error::Corrupt("inline map value checksum does not match"));
+            }
+            return Ok(value);
+        }
+        if node.blob_length == 0 {
+            if node.blob_checksum != blob_checksum(&[]) {
+                return Err(Error::Corrupt("empty map value checksum does not match"));
+            }
+            return Ok(Vec::new());
+        }
+        let length = usize::try_from(node.blob_length)
+            .map_err(|_| Error::Corrupt("blob length does not fit memory"))?;
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or(Error::Corrupt("map has no blob allocator"))?;
+        let value = blobs.read(node.blob_offset, length)?;
+        if node.blob_checksum != blob_checksum(&value) {
+            return Err(Error::Corrupt("map value checksum does not match"));
+        }
+        Ok(value)
+    }
+
+    fn allocate_private_insert(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        hash: u64,
+        bucket: u64,
+    ) -> Result<PrivateInsert> {
+        let blob = self.allocate_blob(value)?;
         let blob_offset = if self.config.inline_value_size == 0 {
             blob.map_or(0, |allocation| allocation.offset)
         } else {
-            inline_value_word(value)?
+            inline_value_word(value.ok_or(Error::Corrupt("inline map value is missing"))?)?
         };
-        let blob_length =
-            u64::try_from(value.len()).map_err(|_| Error::CapacityExhausted("blob length"))?;
-        let value_checksum = blob_checksum(value);
-        let hash = xxh64(key, self.config.hash_seed);
+        let blob_length = u64::try_from(value.map_or(0, <[u8]>::len))
+            .map_err(|_| Error::CapacityExhausted("blob length"))?;
+        let value_checksum = value.map_or(0, blob_checksum);
         let node = match allocate_node(
             &self.body,
             self.node_size,
@@ -681,28 +1120,77 @@ impl Database {
                 return Err(error);
             }
         };
-        let bucket = hash % self.config.bucket_count;
-        let incoming = match self.head(bucket) {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                self.release_private(node, blob)?;
-                return Err(error);
+        Ok(PrivateInsert { node, blob, bucket })
+    }
+
+    fn link_private_batch(&self, private: &[PrivateInsert]) -> Result<()> {
+        for pair in private.windows(2) {
+            let previous = &pair[0];
+            let current = &pair[1];
+            if previous.bucket == current.bucket {
+                set_private_next(&self.body, current.node.offset, 0, previous.node.offset)?;
             }
-        };
-        let mut private_next = 0;
+        }
+        Ok(())
+    }
+
+    fn collect_private_groups<'database>(
+        &'database self,
+        private: &[PrivateInsert],
+        groups: &mut Vec<PrivateGroup<'database>>,
+    ) -> Result<()> {
+        let mut start = 0;
+        while start < private.len() {
+            let bucket = private[start].bucket;
+            let mut end = start + 1;
+            while end < private.len() && private[end].bucket == bucket {
+                end += 1;
+            }
+            groups.push(PrivateGroup {
+                head: self.head(bucket)?,
+                tail_next: self.body.atomic_u64(private[start].node.offset)?,
+                root: private[end - 1].node.offset,
+            });
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn commit_private_group(group: &PrivateGroup<'_>) {
+        let mut previous_next = group.tail_next.load(Ordering::Acquire);
         loop {
-            let observed = incoming.load(Ordering::Acquire);
-            if let Err(error) = set_private_next(&self.body, node.offset, private_next, observed) {
-                self.release_private(node, blob)?;
-                return Err(error);
+            let observed = group.head.load(Ordering::Acquire);
+            while let Err(actual) = group.tail_next.compare_exchange(
+                previous_next,
+                observed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                previous_next = actual;
             }
-            private_next = observed;
-            if incoming
-                .compare_exchange(observed, node.offset, Ordering::Release, Ordering::Acquire)
+            previous_next = observed;
+            if group
+                .head
+                .compare_exchange(observed, group.root, Ordering::Release, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(());
+                return;
             }
+        }
+    }
+
+    fn release_private_batch(&self, private: Vec<PrivateInsert>) -> Result<()> {
+        let mut first_error = None;
+        for insert in private.into_iter().rev() {
+            if let Err(error) = self.release_private(insert.node, insert.blob) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -734,15 +1222,7 @@ impl Database {
             blobs.validate_release(blob)?;
             blobs.release_count(blob)?;
         }
-        self.body.release_count(node)?;
-
-        let body_result = self.body.reclaim_block(node.block);
-        let blob_result = match (&self.blobs, blob) {
-            (Some(blobs), Some(blob)) => blobs.reclaim_block(blob.block),
-            _ => Ok(()),
-        };
-        body_result?;
-        blob_result
+        self.body.release_count(node)
     }
 
     fn release_blob(&self, allocation: Allocation) -> Result<()> {
@@ -750,213 +1230,80 @@ impl Database {
             .blobs
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        blobs.release_count(allocation)?;
-        blobs.reclaim_block(allocation.block)
+        blobs.release_count(allocation)
     }
 
-    fn find(&self, bucket: u64, hash: u64, key: &[u8], guard: &HazardGuard<'_>) -> Result<Found> {
+    fn find(&self, bucket: u64, hash: u64, key: &[u8]) -> Result<Found> {
         'restart: loop {
-            guard.clear()?;
             let mut link = Link::Head(bucket);
             let root = self.link_atomic(link)?.load(Ordering::Acquire);
-            let mut predecessor_hazard = 0_usize;
-            let mut current_hazard = 1_usize;
-            guard.protect(current_hazard, root)?;
-            if self.link_atomic(link)?.load(Ordering::Acquire) != root {
-                continue;
-            }
             let mut current = root;
             while current != 0 {
-                if current & DELETED_BIT != 0 {
-                    continue 'restart;
-                }
                 let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
-                if node.deleted() {
-                    let successor = node.successor();
-                    let retirement = self.reserve_retirement(current)?;
-                    if self
-                        .link_atomic(link)?
-                        .compare_exchange(current, successor, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        continue 'restart;
-                    }
-                    retirement.commit()?;
+                let observed_next = node.next;
+                if self.link_atomic(link)?.load(Ordering::Acquire) != current
+                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                {
                     continue 'restart;
                 }
                 if node.hash == hash && node.key == key {
                     return Ok(Found {
                         node: Some(node),
                         root,
+                        link,
                     });
                 }
-                let observed_next = node.next;
-                let successor = node.successor();
-                guard.protect(predecessor_hazard, successor)?;
-                if self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next {
-                    continue 'restart;
-                }
                 link = Link::Node(current);
-                current = successor;
-                std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
+                current = observed_next;
             }
-            return Ok(Found { node: None, root });
-        }
-    }
-
-    fn unlink_offset(
-        &self,
-        bucket: u64,
-        target: u64,
-        successor: u64,
-        guard: &HazardGuard<'_>,
-        retirement: RetireReservation<'_>,
-    ) -> Result<()> {
-        let mut target_retirement = Some(retirement);
-        'restart: loop {
-            guard.clear()?;
-            let mut link = Link::Head(bucket);
-            let root = self.link_atomic(link)?.load(Ordering::Acquire);
-            let mut predecessor_hazard = 0_usize;
-            let mut current_hazard = 1_usize;
-            guard.protect(current_hazard, root)?;
-            if self.link_atomic(link)?.load(Ordering::Acquire) != root {
+            if self.head(bucket)?.load(Ordering::Acquire) != root {
                 continue;
             }
-            let mut current = root;
-            while current != 0 {
-                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
-                if current == target {
-                    if self
-                        .link_atomic(link)?
-                        .compare_exchange(target, successor, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        let retirement = target_retirement.take().ok_or(Error::Corrupt(
-                            "target retirement reservation was already consumed",
-                        ))?;
-                        retirement.commit()?;
-                        return Ok(());
-                    }
-                    continue 'restart;
-                }
-                if node.deleted() {
-                    let next = node.successor();
-                    let retirement = match self.retired.reserve(current) {
-                        Ok(retirement) => retirement,
-                        Err(Error::Busy(_)) => {
-                            std::hint::spin_loop();
-                            continue 'restart;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if self
-                        .link_atomic(link)?
-                        .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        continue 'restart;
-                    }
-                    retirement.commit()?;
-                    continue 'restart;
-                }
-                let observed_next = node.next;
-                let next = node.successor();
-                guard.protect(predecessor_hazard, next)?;
-                if self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next {
-                    continue 'restart;
-                }
-                link = Link::Node(current);
-                current = next;
-                std::mem::swap(&mut predecessor_hazard, &mut current_hazard);
-            }
-            return Ok(());
+            return Ok(Found {
+                node: None,
+                root,
+                link,
+            });
         }
     }
 
-    fn mark_node(&self, offset: u64) -> Result<u64> {
-        let next = self.body.atomic_u64(offset)?;
-        loop {
-            let observed = next.load(Ordering::Acquire);
-            if observed & DELETED_BIT != 0 {
-                return Ok(observed & !DELETED_BIT);
-            }
-            if next
-                .compare_exchange(
-                    observed,
-                    observed | DELETED_BIT,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(observed);
-            }
+    fn unlink_link(&self, link: Link, target: &Node) -> Result<()> {
+        let (body_allocation, blob_allocation) = self.node_allocations(target)?;
+        self.link_atomic(link)?
+            .compare_exchange(
+                target.offset,
+                target.next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| Error::Busy("unique deletion link changed before unlink"))?;
+        if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
+            blobs.release_count(allocation)?;
         }
+        self.body.release_count(body_allocation)
     }
 
-    fn reserve_retirement(&self, offset: u64) -> Result<RetireReservation<'_>> {
-        match self.retired.reserve(offset) {
-            Ok(reservation) => Ok(reservation),
-            Err(Error::Busy(_)) => {
-                self.reclaim_retired()?;
-                self.retired.reserve(offset)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn reclaim_retired(&self) -> Result<usize> {
-        let mut first_punch_error = None;
-        let reclaimed = self.retired.reclaim(&self.hazards, |offset| {
-            let (body_block, blob_block) = self.release_retired(offset)?;
-            if let Err(error) = self.body.reclaim_block(body_block) {
-                if first_punch_error.is_none() {
-                    first_punch_error = Some(error);
-                }
-            }
-            if let (Some(blobs), Some(block)) = (&self.blobs, blob_block) {
-                if let Err(error) = blobs.reclaim_block(block) {
-                    if first_punch_error.is_none() {
-                        first_punch_error = Some(error);
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        match first_punch_error {
-            Some(error) => Err(error),
-            None => Ok(reclaimed),
-        }
-    }
-
-    fn release_retired(&self, offset: u64) -> Result<(u64, Option<u64>)> {
-        let node = read_node(&self.body, offset, self.node_size, self.config.key_size)?;
+    fn node_allocations(&self, node: &Node) -> Result<(Allocation, Option<Allocation>)> {
         let blob_allocation = if self.config.inline_value_size != 0 || node.blob_length == 0 {
             None
         } else {
             let length = u32::try_from(node.blob_length)
-                .map_err(|_| Error::Corrupt("retired blob length exceeds one block"))?;
+                .map_err(|_| Error::Corrupt("deleted blob length exceeds one block"))?;
             let blob = self
                 .blobs
                 .as_ref()
-                .ok_or(Error::Corrupt("retired map node has no blob allocator"))?;
+                .ok_or(Error::Corrupt("deleted map node has no blob allocator"))?;
             Some(blob.allocation_for(node.blob_offset, length)?)
         };
         let node_length = u32::try_from(self.node_size)
-            .map_err(|_| Error::Corrupt("retired body node length overflow"))?;
-        let body_allocation = self.body.allocation_for(offset, node_length)?;
+            .map_err(|_| Error::Corrupt("deleted body node length overflow"))?;
+        let body_allocation = self.body.allocation_for(node.offset, node_length)?;
 
         self.body.validate_release(body_allocation)?;
         if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
             blobs.validate_release(allocation)?;
-            blobs.release_count(allocation)?;
         }
-        self.body.release_count(body_allocation)?;
-        Ok((
-            body_allocation.block,
-            blob_allocation.map(|allocation| allocation.block),
-        ))
+        Ok((body_allocation, blob_allocation))
     }
 
     fn validate_key(&self, key: &[u8]) -> Result<()> {
@@ -1002,11 +1349,19 @@ impl Database {
 }
 
 impl WriteOnlyWriter<'_> {
-    /// Publishes one globally unique key and value.
+    /// Publishes a batch of key-value pairs without duplicate lookups.
+    ///
+    /// The complete batch is hashed before publication. Entries are sorted by
+    /// bucket, input order is retained within a bucket, and each bucket is
+    /// exposed with one successful head CAS. Duplicate keys remain in the chain;
+    /// the final duplicate in the input is returned by [`Database::get`] first.
+    ///
+    /// The returned count is the number of nodes published.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid widths or exhausted mapped capacity.
+    /// Returns an error when any key or inline value has the wrong width, or
+    /// when validation, metadata allocation, or mapped allocation fails.
     ///
     /// # Examples
     ///
@@ -1014,15 +1369,22 @@ impl WriteOnlyWriter<'_> {
     /// use floresta_db::{Config, Database, Mode};
     ///
     /// let database = Database::create(
-    ///     "floresta-db-put-unique-example",
+    ///     "floresta-db-put-batch-example",
     ///     Config::new(Mode::Map, 1_024, 8),
     /// )?;
-    /// let writer = database.write_only()?;
-    /// writer.put_unique(b"key-0001", b"value")?;
+    /// let entries = [
+    ///     (b"key-0001".as_slice(), b"value-01".as_slice()),
+    ///     (b"key-0002".as_slice(), b"value-02".as_slice()),
+    /// ];
+    /// assert_eq!(database.write_only()?.put_batch(entries)?, 2);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
-    pub fn put_unique(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.database.put_unique_inner(key, value)
+    pub fn put_batch<'entry, I>(&self, entries: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (&'entry [u8], &'entry [u8])>,
+    {
+        self.database
+            .insert_batch_inner(entries.into_iter().map(|(key, value)| (key, Some(value))))
     }
 }
 
@@ -1081,6 +1443,7 @@ enum Link {
 struct Found {
     node: Option<Node>,
     root: u64,
+    link: Link,
 }
 
 pub(crate) fn bank_size(bucket_count: u64) -> Result<u64> {
@@ -1135,7 +1498,6 @@ pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: 
     write_header_u64(&mut header, 40, config.body_capacity)?;
     write_header_u64(&mut header, 48, config.blob_capacity)?;
     write_header_u64(&mut header, 56, config.block_size)?;
-    write_header_u64(&mut header, 64, u64::from(config.max_threads))?;
     write_header_u64(&mut header, 72, config.hash_seed)?;
     write_header_u64(&mut header, 80, node_size)?;
     write_header_u64(
@@ -1232,20 +1594,126 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_replacements_do_not_leave_duplicates() -> Result<()> {
-        let path = test_directory("replace-concurrent");
+    fn set_adds_retain_duplicates() -> Result<()> {
+        let path = test_directory("set-duplicates");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
+
+        assert_eq!(database.add(b"same-key")?, PutResult::Inserted);
+        assert_eq!(database.add(b"same-key")?, PutResult::Inserted);
+        let batch = [b"batchkey".as_slice(), b"batchkey".as_slice()];
+        assert_eq!(database.add_batch(batch)?, 2);
+
+        assert!(database.delete(b"same-key")?);
+        assert!(database.contains(b"same-key")?);
+        assert!(database.delete(b"same-key")?);
+        assert!(!database.contains(b"same-key")?);
+        assert!(database.delete(b"batchkey")?);
+        assert!(database.contains(b"batchkey")?);
+        assert!(database.delete(b"batchkey")?);
+        assert!(!database.contains(b"batchkey")?);
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepares_batches_by_ascending_bucket_and_input_order() -> Result<()> {
+        let path = test_directory("batch-order");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Set, 8, 8))?;
+        let keys: Vec<[u8; 8]> = (0_u64..64).map(u64::to_le_bytes).rev().collect();
+        let prepared =
+            database.prepare_batch(keys.iter().map(|key| (key.as_slice(), None::<&[u8]>)))?;
+
+        for pair in prepared.windows(2) {
+            assert!(pair[0].bucket <= pair[1].bucket);
+            if pair[0].bucket == pair[1].bucket {
+                assert!(pair[0].order < pair[1].order);
+            }
+        }
+
+        let prepared_keys = database.prepare_keys(keys.iter().map(<[u8; 8]>::as_slice))?;
+        for pair in prepared_keys.windows(2) {
+            assert!(pair[0].bucket <= pair[1].bucket);
+            if pair[0].bucket == pair[1].bucket {
+                assert!(pair[0].hash <= pair[1].hash);
+            }
+        }
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_prelinks_collisions_and_retains_duplicate_values() -> Result<()> {
+        let path = test_directory("batch-collisions");
         let _ignored = std::fs::remove_dir_all(&path);
         let database = Database::create(&path, config(Mode::Map, 1, 8))?;
-        std::thread::scope(|scope| {
-            for value in 0_u64..8 {
-                let database_ref = &database;
-                scope.spawn(move || {
-                    assert!(database_ref.put(b"same-key", &value.to_le_bytes()).is_ok());
-                });
-            }
-        });
+        database.put(b"key-000A", b"value-a")?;
+
+        let entries = [
+            (b"key-000B".as_slice(), b"value-b".as_slice()),
+            (b"key-000C".as_slice(), b"value-c".as_slice()),
+        ];
+        assert_eq!(database.write_only()?.put_batch(entries)?, 2);
+
+        let root = database.head(0)?.load(Ordering::Acquire);
+        let node_c = read_node(&database.body, root, database.node_size, 8)?;
+        let node_b = read_node(&database.body, node_c.next, database.node_size, 8)?;
+        let node_a = read_node(&database.body, node_b.next, database.node_size, 8)?;
+        assert_eq!(node_c.key, b"key-000C");
+        assert_eq!(node_b.key, b"key-000B");
+        assert_eq!(node_a.key, b"key-000A");
+
+        let duplicates = [
+            (b"same-key".as_slice(), b"first".as_slice()),
+            (b"same-key".as_slice(), b"second".as_slice()),
+        ];
+        assert_eq!(database.write_only()?.put_batch(duplicates)?, 2);
+        assert_eq!(database.get(b"same-key")?, Some(b"second".to_vec()));
         assert!(database.delete(b"same-key")?);
-        assert_eq!(database.get(b"same-key")?, None);
+        assert_eq!(database.get(b"same-key")?, Some(b"first".to_vec()));
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_fetch_restores_input_order_across_buckets() -> Result<()> {
+        let path = test_directory("batch-fetch");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Map, 8, 8))?;
+        let entries: Vec<([u8; 8], [u8; 8])> = (0_u64..8)
+            .map(|key| (key.to_le_bytes(), (key + 100).to_le_bytes()))
+            .collect();
+        assert_eq!(
+            database.write_only()?.put_batch(
+                entries
+                    .iter()
+                    .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            )?,
+            entries.len()
+        );
+
+        let missing = [255_u8; 8];
+        let queries = [
+            entries[5].0.as_slice(),
+            missing.as_slice(),
+            entries[1].0.as_slice(),
+            entries[5].0.as_slice(),
+            entries[7].0.as_slice(),
+        ];
+        let values = database.batch_fetch(queries)?;
+        assert_eq!(values[0], Some(entries[5].1.to_vec()));
+        assert_eq!(values[1], None);
+        assert_eq!(values[2], Some(entries[1].1.to_vec()));
+        assert_eq!(values[3], Some(entries[5].1.to_vec()));
+        assert_eq!(values[4], Some(entries[7].1.to_vec()));
+
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())
@@ -1294,10 +1762,18 @@ mod tests {
         inline_config.blob_capacity = 0;
         let database = Database::create(&path, inline_config)?;
         {
+            let entries: Vec<([u8; 8], [u8; 8])> = (0_u64..128)
+                .map(|value| (value.to_le_bytes(), (value * 2).to_le_bytes()))
+                .collect();
             let writer = database.write_only()?;
-            for value in 0_u64..128 {
-                writer.put_unique(&value.to_le_bytes(), &(value * 2).to_le_bytes())?;
-            }
+            assert_eq!(
+                writer.put_batch(
+                    entries
+                        .iter()
+                        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                )?,
+                entries.len()
+            );
         }
         assert!(!path.join("blobs").exists());
         database.close()?;
@@ -1314,83 +1790,85 @@ mod tests {
     }
 
     #[test]
-    fn hazard_delays_online_hole_punching() -> Result<()> {
-        let path = test_directory("hazard-reclaim");
+    fn deletion_reuses_freed_block_before_growing_body() -> Result<()> {
+        let path = test_directory("delete-free-list");
         let _ignored = std::fs::remove_dir_all(&path);
         let mut test_config = config(Mode::Set, 1, 4_000);
         test_config.block_size = PAGE_SIZE;
-        test_config.body_capacity = PAGE_SIZE * 8;
+        test_config.body_capacity = PAGE_SIZE * 2;
         let database = Database::create(&path, test_config)?;
-        let key = vec![7; 4_000];
-        database.add(&key)?;
+        let first = vec![1; 4_000];
+        let second = vec![2; 4_000];
+        let third = vec![3; 4_000];
+        database.add(&first)?;
+        database.add(&second)?;
+        let grown_length = std::fs::metadata(path.join("body"))?.len();
 
-        let guard = database.hazards.acquire()?;
-        let hash = xxh64(&key, database.config.hash_seed);
-        let found = database.find(0, hash, &key, &guard)?;
-        let old_offset = found
+        assert!(database.delete(&first)?);
+        database.add(&third)?;
+        let hash = xxh64(&third, database.config.hash_seed);
+        let node = database
+            .find(0, hash, &third)?
             .node
-            .ok_or(Error::Corrupt("test could not find inserted key"))?
-            .offset;
-        std::thread::scope(|scope| scope.spawn(|| database.add(&key)).join())
-            .map_err(|_| Error::Corrupt("replacement test thread panicked"))??;
-        assert!(
-            database
-                .body
-                .read(old_offset, 8)?
-                .iter()
-                .any(|byte| *byte != 0)
-        );
+            .ok_or(Error::Corrupt("reused key is missing"))?;
+        let allocation = database.body.allocation_for(
+            node.offset,
+            u32::try_from(database.node_size)
+                .map_err(|_| Error::Corrupt("node size does not fit test allocation"))?,
+        )?;
+        assert_eq!(allocation.block, 0);
+        assert_eq!(std::fs::metadata(path.join("body"))?.len(), grown_length);
 
-        guard.clear()?;
-        assert!(database.reclaim()? > 0);
-        assert!(
-            database
-                .body
-                .read(old_offset, 8)?
-                .iter()
-                .all(|byte| *byte == 0)
-        );
-        drop(guard);
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
 
     #[test]
-    fn readers_never_observe_invalid_replacement_state() -> Result<()> {
-        let path = test_directory("read-replace-race");
+    fn batch_delete_reuses_colliding_blocks_and_preserves_result_order() -> Result<()> {
+        let path = test_directory("batch-delete-free-list");
         let _ignored = std::fs::remove_dir_all(&path);
-        let mut test_config = config(Mode::Map, 1, 8);
-        test_config.body_capacity = test_config.block_size * 16;
-        test_config.blob_capacity = test_config.block_size * 16;
+        let mut test_config = config(Mode::Set, 1, 4_000);
+        test_config.block_size = PAGE_SIZE;
+        test_config.body_capacity = PAGE_SIZE * 3;
         let database = Database::create(&path, test_config)?;
-        database.put(b"race-key", &0_u64.to_le_bytes())?;
-        std::thread::scope(|scope| -> Result<()> {
-            let writer = scope.spawn(|| -> Result<()> {
-                for value in 1_u64..1_000 {
-                    database.put(b"race-key", &value.to_le_bytes())?;
-                }
-                Ok(())
-            });
-            let reader = scope.spawn(|| -> Result<()> {
-                for _iteration in 0..1_000 {
-                    let value = database
-                        .get(b"race-key")?
-                        .ok_or(Error::Corrupt("replacement made the key disappear"))?;
-                    if value.len() != size_of::<u64>() {
-                        return Err(Error::Corrupt("reader observed an invalid value"));
-                    }
-                }
-                Ok(())
-            });
-            writer
-                .join()
-                .map_err(|_| Error::Corrupt("writer test thread panicked"))??;
-            reader
-                .join()
-                .map_err(|_| Error::Corrupt("reader test thread panicked"))??;
-            Ok(())
-        })?;
+        let first = vec![1; 4_000];
+        let second = vec![2; 4_000];
+        let third = vec![3; 4_000];
+        let fourth = vec![4; 4_000];
+        let missing = vec![9; 4_000];
+        assert_eq!(
+            database.add_batch([first.as_slice(), second.as_slice(), third.as_slice()])?,
+            3
+        );
+        let grown_length = std::fs::metadata(path.join("body"))?.len();
+
+        assert!(matches!(
+            database.batch_delete([first.as_slice(), first.as_slice()]),
+            Err(Error::InvalidConfig(_))
+        ));
+        assert_eq!(
+            database.batch_delete([first.as_slice(), missing.as_slice(), second.as_slice()])?,
+            vec![true, false, true]
+        );
+        assert!(!database.contains(&first)?);
+        assert!(!database.contains(&second)?);
+        assert!(database.contains(&third)?);
+
+        database.add(&fourth)?;
+        let hash = xxh64(&fourth, database.config.hash_seed);
+        let node = database
+            .find(0, hash, &fourth)?
+            .node
+            .ok_or(Error::Corrupt("batch-delete replacement key is missing"))?;
+        let allocation = database.body.allocation_for(
+            node.offset,
+            u32::try_from(database.node_size)
+                .map_err(|_| Error::Corrupt("node size does not fit test allocation"))?,
+        )?;
+        assert_eq!(allocation.block, 0);
+        assert_eq!(std::fs::metadata(path.join("body"))?.len(), grown_length);
+
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())

@@ -3,9 +3,10 @@
 //! A CAS-only concurrent, memory-mapped database for Floresta.
 //!
 //! The crate stores fixed-width keys in a separately chained hash table. Writers
-//! publish fully initialized nodes with compare-and-swap operations, while
-//! readers use hazard pointers so replaced storage can be reclaimed safely.
-//! Checkpoints copy a concurrent view into alternating immutable generations.
+//! publish fully initialized nodes with compare-and-swap operations. Batch APIs
+//! SIMD-hash keys and process buckets in ascending order. Unique deletions unlink
+//! nodes directly, and empty blocks enter a tagged CAS free list for reuse before
+//! mapped backing files grow.
 //!
 //! The database supports one Linux x86-64 process with many threads.
 //!
@@ -34,7 +35,6 @@ mod checkpoint;
 mod config;
 mod error;
 mod hash;
-mod hazard;
 mod layout;
 mod mapped_file;
 mod node;

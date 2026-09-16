@@ -12,11 +12,11 @@ We have four parts:
  - The heads file
  - The blk cout (one per file above)
 
-This database will work as a linear probing hash map, the heads are the bucket heads. This file must be small enough to fit in memory, but not too small to create a huge collision rate. We don't re-hash within the same session, so it must be allocated to a big size at startup. The body file will hold the excess buckets, they will be organized as linked lists, each pointer will be a position inside the body file. All files are memory-mapped. You should use every single bit of API the linux kernel gives you (don't touch sysctls though) to ask for the kernel to **not reclaim that space unless it's really needed, and to be very lazy on flushing, waiting until there's a big chunk of things to flush**. Things must live in memory for as long as we can, to improve performance.
+The database uses separate chaining: `heads` stores one atomic root per bucket, while fixed-width nodes in `body` carry the next offset. The heads mapping is sized at startup and should balance resident memory against collision depth. All files are memory-mapped, with Linux advice favoring random access and retaining hot pages.
 
-With the exception of the heads file, all files will grow. We should however, allocate a pretty big sparce file to avoid needing to call resize every time on them. Threads allocate space by changing a pointer that points to the first free position inside the file. They should CAS it and retry until they succeed. They might batch allocate for say, and entire block, but never overcommit without needing. This could hurt locality.
+With the exception of the heads file, data files reserve a large stable virtual mapping but begin with only their header page. A tagged CAS high-water mark extends the backing file one block at a time. Allocation must first pop the tagged LIFO free-list head; only an empty free list permits high-water growth.
 
-The blk cout will track blocks of N bytes, and how many objects there are. When deleting something, you must remove that from the map and decrease this counter the respective block, also using CAS. If a block count goes to zero, you must open a hole there, giving this space back to the system.
+The block-count file tracks each block's allocation cursor, live-object count, and lifecycle state. When the last object leaves a sealed block, the deleter writes the previous free-list head into that block and publishes the block by CASing the tagged head. Reused blocks retain their physical storage; no holes are punched.
 
 Adding elements requires:
  - Allocate space inside the blobs file if it's a map — we should also support a set where the blobs file isn't used
@@ -28,7 +28,7 @@ This database is **eventually consistent**, this means you might see an **older 
  - Making incomplete or invalid states invisible to others — this is why we fill everything up before making it visible inside the map
  - Whenever something becomes visible, we use an atomic CAS for that.
 
-Deleting an element must also use CAS to update the bucket head or predecessor pointer that points to the deleted body node.
+Deleting an element CAS-unlinks the uniquely owned node and immediately decrements its block counts. The caller guarantees that no competing deletion targets the same live key and that no reader or checkpoint retains an affected bucket offset during removal.
 
 ## Stack
 
