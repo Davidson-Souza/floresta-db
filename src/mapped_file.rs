@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Checked ownership of a shared memory-mapped file.
+//!
+//! [`MappedFile`] validates ranges and alignment before exposing atomic words or
+//! copying bytes, and delegates Linux-specific operations to [`crate::sys`].
+
 #![allow(dead_code)]
 
 use std::fs::{File, OpenOptions};
@@ -190,7 +197,7 @@ mod tests {
     use super::*;
 
     fn test_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("db-experiment-{}-{name}.data", std::process::id()))
+        std::env::temp_dir().join(format!("floresta-db-{}-{name}.data", std::process::id()))
     }
 
     #[test]

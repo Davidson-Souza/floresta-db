@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Bounded flat-file ring shared by block producers and ordered consumers.
+//!
+//! Producers claim slots and publish complete serialized blocks with CAS.
+//! Consumers advance only the contiguous completed frontier before reusing slots.
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileExt;
@@ -5,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use db_experiment::xxh64;
+use floresta_db::xxh64;
 
 const EMPTY: u64 = 0;
 const WRITING: u64 = 1;
@@ -436,7 +443,7 @@ mod tests {
     use super::*;
 
     fn test_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("db-experiment-ring-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("floresta-db-ring-{}-{name}", std::process::id()))
     }
 
     #[test]

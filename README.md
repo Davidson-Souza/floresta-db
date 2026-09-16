@@ -1,6 +1,8 @@
-# db-experiment
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
-A dependency-free, Linux x86-64 experiment in CAS-only concurrent storage for Bitcoin-style data.
+# floresta-db
+
+A dependency-free-by-default, Linux x86-64 CAS-only concurrent storage engine for Floresta and Bitcoin-style data.
 
 ## Properties
 
@@ -19,18 +21,21 @@ The database supports one process with many threads. Every shared state mutation
 ## Example
 
 ```rust
-use db_experiment::{Config, Database, Mode};
+use floresta_db::{Config, Database, Mode};
 
-let mut config = Config::new(Mode::Map, 1 << 20, 36);
+let outpoint = [0_u8; 36];
+let serialized_output = b"serialized output";
+let mut config = Config::new(Mode::Map, 1 << 20, outpoint.len());
 config.body_capacity = 8 << 30;
 config.blob_capacity = 8 << 30;
 
 let database = Database::create("utxo.db", config)?;
-database.put(&outpoint, &serialized_output)?;
+database.put(&outpoint, serialized_output)?;
 let output = database.get(&outpoint)?;
+assert_eq!(output.as_deref(), Some(serialized_output.as_slice()));
 database.delete(&outpoint)?;
 database.checkpoint()?;
-# Ok::<(), db_experiment::Error>(())
+# Ok::<(), floresta_db::Error>(())
 ```
 
 `Database::open` restores the newest valid checkpoint into fresh mutable runtime files. Mutations after the checkpoint may be lost after a crash. A concurrent checkpoint contains every operation completed before checkpoint invocation; overlapping operations may or may not be included.
@@ -38,37 +43,55 @@ database.checkpoint()?;
 ## Validation
 
 ```text
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo +nightly fmt --check
+cargo +nightly clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo test --doc
+cargo doc --no-deps --all-features
 cargo +nightly miri test
-cargo run --release --bin fuzz -- 1 100000
 ```
 
 The real mmap and hole-punch integration tests are disabled under Miri; pure layout, hashing, and hazard-pointer tests still run there. Valgrind can run the compiled unit-test executable:
 
 ```text
 cargo test --no-run
-valgrind --tool=memcheck --leak-check=full target/debug/deps/db_experiment-<hash>
+valgrind --tool=memcheck --leak-check=full target/debug/deps/floresta_db-<hash>
+```
+
+## Fuzzing
+
+Install [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) once, then run the `database` target:
+
+```text
+cargo install cargo-fuzz
+cargo +nightly fuzz run database
+```
+
+The target in `fuzz/fuzz_targets/database.rs` decodes inputs into `put`, `put_new`, `get`, `contains`, `delete`, reclamation, and checkpoint/reopen operations. Every result is checked against a `BTreeMap` reference model.
+
+If ASan reports that its shadow range overlaps the executable on a hardened kernel, build the fuzz target as non-PIE:
+
+```text
+RUSTFLAGS="-C link-arg=-no-pie" cargo +nightly fuzz run database
 ```
 
 ## Stress Evaluation
 
-The stress runner gives 75% of generated outputs a spend lifetime from 1 through 100 blocks. Each worker owns an independent block stream, avoiding a benchmark barrier in the database hot path.
+The stress example gives 75% of generated outputs a spend lifetime from 1 through 100 blocks. Each worker owns an independent block stream, avoiding a benchmark barrier in the database hot path.
 
 ```text
-cargo run --release --bin stress -- 1000 100 16 stress
+cargo run --release --example stress -- 1000 100 16 stress
 ```
 
 Arguments are blocks, outputs per block, maximum workers, and output prefix. The runner tests powers of two through the requested worker count and writes `stress.csv` plus a dependency-free `stress.svg` throughput chart.
 
 ## Bitcoin Core Load Test
 
-The optional `bitcoin-load` binary fetches real blocks with a producer pool, stores them in a bounded flat-file ring, indexes outputs in height order, and removes spent inputs with a consumer pool. It skips the genesis output and scripts Bitcoin Core excludes from its UTXO set. At completion it compares the live output count with `gettxoutsetinfo` at the exact selected block, which requires a synced `coinstatsindex` at that height.
+The optional `bitcoin-load` example fetches real blocks with a producer pool, stores them in a bounded flat-file ring, indexes outputs in height order, and removes spent inputs with a consumer pool. It skips the genesis output and scripts Bitcoin Core excludes from its UTXO set. At completion it compares the live output count with `gettxoutsetinfo` at the exact selected block, which requires a synced `coinstatsindex` at that height.
 
 ```text
 set -a && source .env && set +a
-cargo run --release --features bitcoin-load --bin bitcoin-load -- \
+cargo run --release --features bitcoin-load --example bitcoin-load -- \
   COOKIE_FILE|USER:PASSWORD|none RPC_URL [TIP|tip] [FETCH_THREADS] \
   [SPEND_THREADS] [RING_SLOTS] [WORK_DIR]
 ```

@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Hazard pointers and deferred storage reclamation.
+//!
+//! Readers publish offsets before dereferencing mapped nodes. Writers reserve
+//! retirement slots and reclaim an offset only after no hazard protects it.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};

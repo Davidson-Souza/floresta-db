@@ -1,32 +1,124 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Database modes and validated storage configuration.
+//!
+//! [`Config`] describes the persistent layout and concurrency limits. Validation
+//! rejects combinations that cannot be represented safely by the on-disk format.
+
 use crate::error::{Error, Result};
 use crate::layout::{PAGE_SIZE, align_up};
 
+/// The default seed used for key hashing.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(floresta_db::DEFAULT_HASH_SEED, 0);
+/// ```
 pub const DEFAULT_HASH_SEED: u64 = 0;
+
+/// The largest fixed key width accepted by [`Config`].
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(floresta_db::MAX_KEY_SIZE, 4_096);
+/// ```
 pub const MAX_KEY_SIZE: usize = 4_096;
+
+/// The largest value width that can be stored directly inside a node.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(floresta_db::MAX_INLINE_VALUE_SIZE, 8);
+/// ```
 pub const MAX_INLINE_VALUE_SIZE: usize = size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
+/// Selects whether a database stores keys alone or key-value pairs.
+///
+/// # Examples
+///
+/// ```
+/// use floresta_db::{Config, Mode};
+///
+/// let set = Config::new(Mode::Set, 1_024, 32);
+/// let map = Config::new(Mode::Map, 1_024, 32);
+/// assert_ne!(set.mode, map.mode);
+/// ```
 pub enum Mode {
+    /// Stores fixed-width keys without values.
     Set = 1,
+
+    /// Stores a value for every fixed-width key.
     Map = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Defines the persistent layout and concurrency limits of a database.
+///
+/// Capacities are reserved as sparse files and must be multiples of
+/// [`Config::block_size`]. They do not represent immediate physical allocation.
+///
+/// # Examples
+///
+/// ```
+/// use floresta_db::{Config, Mode};
+///
+/// let mut config = Config::new(Mode::Map, 1 << 20, 36);
+/// config.body_capacity = 8 << 30;
+/// config.blob_capacity = 8 << 30;
+/// config.validate()?;
+/// # Ok::<(), floresta_db::Error>(())
+/// ```
 pub struct Config {
+    /// Whether the database is a set or a map.
     pub mode: Mode,
+
+    /// Number of hash buckets fixed at database creation.
     pub bucket_count: u64,
+
+    /// Required key width in bytes.
     pub key_size: usize,
+
+    /// Fixed value width stored inside each node, or zero to use the blob file.
     pub inline_value_size: usize,
+
+    /// Maximum logical bytes reserved for body nodes.
     pub body_capacity: u64,
+
+    /// Maximum logical bytes reserved for map values.
     pub blob_capacity: u64,
+
+    /// Allocation and reclamation granularity in bytes.
     pub block_size: u64,
+
+    /// Maximum number of simultaneous hazard-pointer registrations.
     pub max_threads: u16,
+
+    /// Seed supplied to XXH64 when selecting buckets.
     pub hash_seed: u64,
 }
 
 impl Config {
     #[must_use]
+    /// Creates a configuration with one-GiB sparse capacities and one-MiB blocks.
+    ///
+    /// Set mode starts with zero blob capacity. Map mode starts with one GiB of
+    /// blob capacity and stores variable-width values there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use floresta_db::{Config, Mode};
+    ///
+    /// let config = Config::new(Mode::Set, 4_096, 32);
+    /// assert_eq!(config.bucket_count, 4_096);
+    /// assert_eq!(config.key_size, 32);
+    /// assert_eq!(config.blob_capacity, 0);
+    /// ```
     pub fn new(mode: Mode, bucket_count: u64, key_size: usize) -> Self {
         Self {
             mode,
@@ -47,6 +139,16 @@ impl Config {
     ///
     /// Returns [`Error::InvalidConfig`] when the configuration cannot produce
     /// a valid database layout.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use floresta_db::{Config, Mode};
+    ///
+    /// let config = Config::new(Mode::Map, 1_024, 36);
+    /// config.validate()?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn validate(&self) -> Result<()> {
         if self.bucket_count == 0 {
             return Err(Error::InvalidConfig("bucket count must be nonzero"));

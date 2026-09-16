@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Lock-free allocation within sparse memory-mapped files.
+//!
+//! Each block stores its allocation cursor, live-object count, and lifecycle
+//! state in one atomic word. Empty sealed blocks are reclaimed by hole punching.
+
 #![allow(dead_code)]
 
 use std::path::Path;
@@ -463,7 +470,7 @@ mod tests {
     use super::*;
 
     fn test_paths(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let prefix = format!("db-experiment-{}-{name}", std::process::id());
+        let prefix = format!("floresta-db-{}-{name}", std::process::id());
         let directory = std::env::temp_dir();
         (
             directory.join(format!("{prefix}.data")),

@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Dependency-free XXH64 hashing.
+//!
+//! The table uses XXH64 for bucket selection and for checksums over persistent
+//! metadata, nodes, and values.
+
 const PRIME_1: u64 = 11_400_714_785_074_694_791;
 const PRIME_2: u64 = 14_029_467_366_897_019_727;
 const PRIME_3: u64 = 1_609_587_929_392_839_161;
@@ -5,6 +12,19 @@ const PRIME_4: u64 = 9_650_029_242_287_828_579;
 const PRIME_5: u64 = 2_870_177_450_012_600_261;
 
 #[must_use]
+/// Computes the XXH64 digest of `input` with the supplied seed.
+///
+/// This implementation matches the canonical XXH64 vectors and performs no
+/// allocation.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(
+///     floresta_db::xxh64(b"", 0),
+///     0xef46_db37_51d8_e999,
+/// );
+/// ```
 pub fn xxh64(input: &[u8], seed: u64) -> u64 {
     let mut remaining = input;
     let mut hash = if remaining.len() >= 32 {

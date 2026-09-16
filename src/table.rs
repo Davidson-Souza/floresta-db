@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Concurrent hash-table operations and the primary database API.
+//!
+//! Buckets are separate chains headed by in-memory atomics. Insertions publish a
+//! private node with CAS; replacement and deletion mark before unlinking and
+//! defer physical reclamation through the hazard registry.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,8 +24,20 @@ pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 96;
 pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Reports whether an upsert inserted a new key or replaced an existing one.
+///
+/// # Examples
+///
+/// ```
+/// use floresta_db::PutResult;
+///
+/// assert_ne!(PutResult::Inserted, PutResult::Replaced);
+/// ```
 pub enum PutResult {
+    /// The key was absent and a new node was published.
     Inserted,
+
+    /// An existing node for the key was replaced.
     Replaced,
 }
 
@@ -28,6 +48,24 @@ enum PutOutcome {
     Replaced,
 }
 
+/// A concurrent handle to one memory-mapped map or set.
+///
+/// Cloned handles are intentionally not provided; share one `Database` by
+/// reference between scoped threads. All keys must match the fixed width in
+/// [`Config`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use floresta_db::{Config, Database, Mode};
+///
+/// let database = Database::create(
+///     "floresta-db-example",
+///     Config::new(Mode::Set, 1_024, 32),
+/// )?;
+/// assert!(!database.contains(&[0; 32])?);
+/// # Ok::<(), floresta_db::Error>(())
+/// ```
 pub struct Database {
     pub(crate) config: Config,
     pub(crate) node_size: u64,
@@ -42,6 +80,24 @@ pub struct Database {
     pub(crate) path: PathBuf,
 }
 
+/// An optimized writer for building a map from globally unique keys.
+///
+/// The writer skips lookup, replacement, hazard registration, and reclamation.
+/// Publishing a duplicate key violates its contract and can leave duplicates in
+/// the bucket chain.
+///
+/// # Examples
+///
+/// ```no_run
+/// use floresta_db::{Config, Database, Mode};
+///
+/// let database = Database::create(
+///     "floresta-db-writer-example",
+///     Config::new(Mode::Map, 1_024, 8),
+/// )?;
+/// database.write_only()?.put_unique(b"key-0001", b"value")?;
+/// # Ok::<(), floresta_db::Error>(())
+/// ```
 pub struct WriteOnlyWriter<'database> {
     database: &'database Database,
 }
@@ -53,6 +109,19 @@ impl Database {
     ///
     /// Returns an error for invalid configuration, existing paths, unsupported
     /// filesystems, or failed mappings and allocations.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-create-example",
+    ///     Config::new(Mode::Set, 1_024, 32),
+    /// )?;
+    /// assert!(!database.contains(&[0; 32])?);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn create(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         config.validate()?;
         let node_size = config.node_size()?;
@@ -101,6 +170,19 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when called on a map or when allocation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode, PutResult};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-add-example",
+    ///     Config::new(Mode::Set, 1_024, 32),
+    /// )?;
+    /// assert_eq!(database.add(&[1; 32])?, PutResult::Inserted);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn add(&self, key: &[u8]) -> Result<PutResult> {
         if self.config.mode != Mode::Set {
             return Err(Error::Unsupported("add is available only for sets"));
@@ -119,6 +201,19 @@ impl Database {
     ///
     /// Returns an error when called on a set, when the key length differs from
     /// the configured width, or when allocation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode, PutResult};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-put-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// assert_eq!(database.put(b"key-0001", b"value")?, PutResult::Inserted);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<PutResult> {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("put is available only for maps"));
@@ -140,6 +235,20 @@ impl Database {
     ///
     /// Returns an error when called on a set, when the key length differs from the configured
     /// width, or when allocation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-put-new-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// assert!(database.put_new(b"key-0001", b"value")?);
+    /// assert!(!database.put_new(b"key-0001", b"other")?);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn put_new(&self, key: &[u8], value: &[u8]) -> Result<bool> {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("put_new is available only for maps"));
@@ -160,6 +269,20 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when called on a set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-write-only-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// let writer = database.write_only()?;
+    /// writer.put_unique(b"key-0001", b"value")?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn write_only(&self) -> Result<WriteOnlyWriter<'_>> {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("write_only is available only for maps"));
@@ -172,6 +295,20 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error for a wrong key width, set mode, or corrupt storage.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-get-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// database.put(b"key-0001", b"value")?;
+    /// assert_eq!(database.get(b"key-0001")?.as_deref(), Some(b"value".as_slice()));
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("get is available only for maps"));
@@ -221,6 +358,20 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error for a wrong key width or corrupt storage.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-contains-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// database.add(b"key-0001")?;
+    /// assert!(database.contains(b"key-0001")?);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn contains(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
         let guard = self.hazards.acquire()?;
@@ -236,6 +387,20 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error for a wrong key width or corrupt storage.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-delete-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// database.add(b"key-0001")?;
+    /// assert!(database.delete(b"key-0001")?);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
         let guard = self.hazards.acquire()?;
@@ -275,6 +440,20 @@ impl Database {
     /// # Errors
     ///
     /// Returns a storage error if block counts or hole punching fail.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-reclaim-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// let reclaimed = database.reclaim()?;
+    /// assert_eq!(reclaimed, 0);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn reclaim(&self) -> Result<usize> {
         let _guard = self.hazards.acquire()?;
         let reclaimed = self.reclaim_retired();
@@ -294,6 +473,19 @@ impl Database {
     /// # Errors
     ///
     /// Returns the first kernel writeback error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-sync-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// database.sync()?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn sync(&self) -> Result<()> {
         self.body.sync_all()?;
         if let Some(blobs) = &self.blobs {
@@ -308,6 +500,19 @@ impl Database {
     /// # Errors
     ///
     /// Returns the first kernel writeback error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-close-example",
+    ///     Config::new(Mode::Set, 1_024, 8),
+    /// )?;
+    /// database.close()?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn close(self) -> Result<()> {
         self.sync()
     }
@@ -802,6 +1007,20 @@ impl WriteOnlyWriter<'_> {
     /// # Errors
     ///
     /// Returns an error for invalid widths or exhausted mapped capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-put-unique-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// let writer = database.write_only()?;
+    /// writer.put_unique(b"key-0001", b"value")?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn put_unique(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.database.put_unique_inner(key, value)
     }
@@ -954,7 +1173,7 @@ mod tests {
     use super::*;
 
     fn test_directory(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("db-experiment-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("floresta-db-{}-{name}", std::process::id()))
     }
 
     fn config(mode: Mode, buckets: u64, key_size: usize) -> Config {

@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Loads Bitcoin Core blocks into `floresta-db` and verifies the resulting UTXO set.
+//!
+//! This feature-gated example uses producer threads, a bounded flat-file ring,
+//! and ordered consumers. Run it with `cargo run --release --features
+//! bitcoin-load --example bitcoin-load -- <auth> <rpc-url> [tip]`.
+
 mod ring;
 
 use std::error::Error as StdError;
@@ -11,7 +19,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint, TxOut};
 use corepc_client::client_sync::{Auth, v31::Client};
-use db_experiment::{Config, Database, Mode, PutResult};
+use floresta_db::{Config, Database, Mode, PutResult};
 use ring::BlockRing;
 
 type AnyError = Box<dyn StdError + Send + Sync>;

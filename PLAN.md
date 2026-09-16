@@ -1,6 +1,8 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 ## Intro
 
-This is a super scalar database experiment, our goal is to prove that we can accieve a high level of concurrency using a specially designed database for a specific problem. We are interested in indexing Bitcoin-related data, such as transaction inputs/outputs. The database must allow for concurrent threads working toghether, with no strong syncronization mechanism being used. That means no mutex, fence or anything that would otherwise severely disrupt other threads. **The only syncronization technique allowed here is a Compare and Swap (CAS) operation**, anything else can only be used if explicitely allowed.
+This is the original design plan for `floresta-db`, a specialized database intended to demonstrate high concurrency for Bitcoin transaction inputs and outputs. Threads cooperate without broad synchronization mechanisms such as mutexes. **Shared database state is synchronized with compare-and-swap (CAS) operations unless a documented exception applies.**
 
 ## How it works
 

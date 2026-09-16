@@ -1,10 +1,17 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Measures concurrent insert/delete throughput with Bitcoin-like spend lifetimes.
+//!
+//! Run with `cargo run --release --example stress -- <blocks> <outputs-per-block>
+//! <maximum-workers> <output-prefix>`. The example writes CSV data and an SVG chart.
+
 use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use db_experiment::{Config, Database, Error, Mode, Result};
+use floresta_db::{Config, Database, Error, Mode, Result};
 
 const SPEND_PERCENT: u64 = 75;
 const SPEND_WINDOW: usize = 100;
@@ -323,7 +330,7 @@ fn write_svg(path: &Path, results: &[CaseResult]) -> io::Result<()> {
 
 fn stress_path(threads: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "db-experiment-stress-{}-{threads}",
+        "floresta-db-stress-{}-{threads}",
         std::process::id()
     ))
 }

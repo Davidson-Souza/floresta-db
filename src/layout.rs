@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Constants and alignment helpers for the persistent file format.
+//!
+//! Offsets in this module are shared by serialization, traversal, allocation,
+//! and recovery code; changing them requires a format-version review.
+
 pub(crate) const PAGE_SIZE: u64 = 4_096;
 pub(crate) const DATA_START: u64 = PAGE_SIZE;
 pub(crate) const NODE_ALIGNMENT: u64 = 8;

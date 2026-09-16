@@ -1,19 +1,97 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Errors returned by database operations.
+//!
+//! The module keeps I/O failures distinct from configuration, capacity,
+//! corruption, lifecycle, and unsupported-operation failures.
+
 use std::fmt::{self, Display, Formatter};
 use std::io;
 
-pub type Result<T> = std::result::Result<T, Error>;
+/// The result type returned by `floresta-db` operations.
+///
+/// The error parameter defaults to [`Error`] but can be replaced when a caller
+/// needs to compose this alias with another precise error type.
+///
+/// # Examples
+///
+/// ```
+/// use floresta_db::{Config, Mode, Result};
+///
+/// fn validate(config: &Config) -> Result<()> {
+///     config.validate()
+/// }
+///
+/// validate(&Config::new(Mode::Set, 64, 32))?;
+/// # Ok::<(), floresta_db::Error>(())
+/// ```
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
+/// A precise failure category for database configuration, storage, and lifecycle operations.
+///
+/// # Examples
+///
+/// ```
+/// use floresta_db::Error;
+///
+/// let error = Error::InvalidKeyLength {
+///     expected: 36,
+///     actual: 32,
+/// };
+/// assert_eq!(error.to_string(), "invalid key length: expected 36, got 32");
+/// ```
 pub enum Error {
-    Io(io::Error),
-    InvalidConfig(&'static str),
-    InvalidKeyLength { expected: usize, actual: usize },
+    /// An operating-system or filesystem operation failed.
+    Io(
+        /// The original I/O error.
+        io::Error,
+    ),
+
+    /// The requested configuration cannot form a valid persistent layout.
+    InvalidConfig(
+        /// A description of the violated invariant.
+        &'static str,
+    ),
+
+    /// A key does not match the width fixed at database creation.
+    InvalidKeyLength {
+        /// The configured key width.
+        expected: usize,
+
+        /// The supplied key width.
+        actual: usize,
+    },
+
+    /// A required in-memory allocation failed.
     OutOfMemory,
-    CapacityExhausted(&'static str),
-    Corrupt(&'static str),
-    Busy(&'static str),
+
+    /// A fixed-capacity storage area has no remaining space.
+    CapacityExhausted(
+        /// The exhausted storage area.
+        &'static str,
+    ),
+
+    /// Persistent data violates a format or checksum invariant.
+    Corrupt(
+        /// A description of the invalid state.
+        &'static str,
+    ),
+
+    /// An exclusive lifecycle operation is already active.
+    Busy(
+        /// A description of the conflicting operation.
+        &'static str,
+    ),
+
+    /// The requested operation used a closed lifecycle state.
     Closed,
-    Unsupported(&'static str),
+
+    /// The selected mode or platform does not support the operation.
+    Unsupported(
+        /// A description of the unsupported operation.
+        &'static str,
+    ),
 }
 
 impl Display for Error {

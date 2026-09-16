@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
-name = "db-experiment"
+name = "floresta-db"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "A CAS-only concurrent mmap database experiment"
+rust-version = "1.85.0"
+description = "A CAS-only concurrent mmap database for Floresta"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -14,13 +16,17 @@ corepc-client = { version = "0.16.0", features = ["client-sync"], optional = tru
 default = []
 bitcoin-load = ["dep:bitcoin", "dep:corepc-client"]
 
-[[bin]]
+[[example]]
 name = "bitcoin-load"
-path = "src/bin/bitcoin_load/main.rs"
+path = "examples/bitcoin_load/main.rs"
 required-features = ["bitcoin-load"]
 
 [lints.rust]
+missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

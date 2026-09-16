@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Serialization and validation of bucket-chain nodes.
+//!
+//! Nodes are initialized in private allocator reservations, checksummed, and
+//! published only after their key and value metadata are complete.
+
 use std::sync::atomic::Ordering;
 
 use crate::allocator::{Allocation, BlockAllocator};

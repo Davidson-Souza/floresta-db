@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Durable checkpoint creation and recovery.
+//!
+//! Checkpoints copy each live bucket chain into one of two immutable snapshot
+//! generations. Checksummed manifests select the newest valid generation when
+//! [`Database::open`] rebuilds mutable runtime files.
+
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::Read;
@@ -45,6 +53,21 @@ impl Database {
     /// # Errors
     ///
     /// Returns an error when the runtime layout is invalid or mapped files cannot be reopened.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let path = "floresta-db-open-runtime-example";
+    /// let database = Database::create(path, Config::new(Mode::Set, 1_024, 8))?;
+    /// database.add(b"key-0001")?;
+    /// database.close()?;
+    ///
+    /// let reopened = Database::open_runtime(path)?;
+    /// assert!(reopened.contains(b"key-0001")?);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn open_runtime(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let heads_path = path.join("heads");
@@ -100,6 +123,17 @@ impl Database {
     ///
     /// Returns an error for invalid headroom, corrupt allocator metadata, file growth failure, or
     /// failure to persist the enlarged runtime configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let path = "floresta-db-headroom-example";
+    /// Database::create(path, Config::new(Mode::Set, 1_024, 8))?.close()?;
+    /// let _grew = Database::ensure_runtime_body_headroom(path, 64 << 20)?;
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn ensure_runtime_body_headroom(path: impl AsRef<Path>, headroom: u64) -> Result<bool> {
         let path = path.as_ref();
         let heads_path = path.join("heads");
@@ -169,6 +203,22 @@ impl Database {
     ///
     /// Returns an error when no valid checkpoint exists, the format is invalid,
     /// or rebuilding mapped files fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let path = "floresta-db-open-example";
+    /// let database = Database::create(path, Config::new(Mode::Map, 1_024, 8))?;
+    /// database.put(b"key-0001", b"value")?;
+    /// database.checkpoint()?;
+    /// drop(database);
+    ///
+    /// let reopened = Database::open(path)?;
+    /// assert_eq!(reopened.get(b"key-0001")?.as_deref(), Some(b"value".as_slice()));
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let heads_path = path.join("heads");
@@ -253,6 +303,20 @@ impl Database {
     ///
     /// Returns an error when another checkpoint is active, worker registration
     /// is exhausted, snapshot capacity is exhausted, or ordered flushing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-checkpoint-example",
+    ///     Config::new(Mode::Map, 1_024, 8),
+    /// )?;
+    /// database.put(b"key-0001", b"value")?;
+    /// assert_eq!(database.checkpoint()?, 1);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
     pub fn checkpoint(&self) -> Result<u64> {
         if self.config.inline_value_size != 0 {
             return Err(Error::Unsupported(
@@ -1057,7 +1121,7 @@ mod tests {
     use crate::table::PutResult;
 
     fn test_directory(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("db-experiment-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("floresta-db-{}-{name}", std::process::id()))
     }
 
     fn test_config() -> Config {
@@ -1316,7 +1380,7 @@ mod tests {
     #[test]
     fn checkpoint_supports_single_component_relative_paths() -> Result<()> {
         let path = PathBuf::from(format!(
-            "db-experiment-relative-checkpoint-{}",
+            "floresta-db-relative-checkpoint-{}",
             std::process::id()
         ));
         let _ignored = std::fs::remove_dir_all(&path);

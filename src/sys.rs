@@ -1,3 +1,10 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Minimal Linux syscall boundary for mapped storage.
+//!
+//! The wrappers centralize `mmap`, advice, synchronous writeback, allocation,
+//! and hole punching while translating operating-system failures into [`Error`].
+
 #![allow(dead_code)]
 
 use std::ffi::{c_int, c_long, c_void};

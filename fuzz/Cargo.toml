@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "floresta-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.floresta-db]
+path = ".."
+
+[[bin]]
+name = "database"
+path = "fuzz_targets/database.rs"
+test = false
+doc = false
+bench = false
