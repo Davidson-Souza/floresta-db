@@ -6,7 +6,7 @@
 
 `floresta-db` is a Rust 2024 CAS-only concurrent storage engine for fixed-width, Bitcoin-style data. It provides map and set modes over growable sparse `mmap` files, with separate-chaining buckets, tagged LIFO free lists, and checkpoint-based recovery. The default crate has no external dependencies.
 
-The supported deployment model is one Linux x86-64 process with many threads. Filesystem calls, page faults, startup, and checkpoints are outside the lock-free progress guarantee. A checkpoint is the recovery boundary: `Database::open` restores the newest valid checkpoint, so later mutations may be lost after a crash.
+The supported deployment model is one 64-bit little-endian process with many threads. Storage is operational on Linux x86-64, AArch64, and RISC-V 64 plus macOS x86-64 and AArch64. Windows builds expose the API but return `Error::Unsupported` for storage because Windows cannot preserve stable maximum mappings together with block-by-block logical file growth. Filesystem calls, page faults, startup, and checkpoints are outside the lock-free progress guarantee. A checkpoint is the recovery boundary: `Database::open` restores the newest valid checkpoint, so later mutations may be lost after a crash.
 
 ## Architecture & Data Flow
 
@@ -41,6 +41,10 @@ cargo test --all-targets --all-features
 cargo test --doc
 cargo doc --no-deps --all-features
 cargo +nightly miri test
+cross test --target aarch64-unknown-linux-gnu --no-default-features --locked
+cross test --target riscv64gc-unknown-linux-gnu --no-default-features --locked
+cargo check --tests --target aarch64-apple-darwin --no-default-features
+cargo check --tests --target aarch64-pc-windows-msvc --no-default-features
 cargo +nightly fuzz run database
 cargo run --release --example stress -- 1000 100 16 stress
 ```
@@ -77,7 +81,7 @@ Use a new work directory; the loader intentionally fails if it already exists. I
 - `src/table.rs`: primary `Database` API and bucket-list mutation/read paths.
 - `src/checkpoint.rs`: `Database::open`, checkpoint capture, manifests, validation, and recovery.
 - `src/allocator.rs`: CAS block allocator, object counts, tagged free list, and high-water growth.
-- `src/mapped_file.rs` / `src/sys.rs`: stable growable mapping wrapper and Linux syscall boundary.
+- `src/mapped_file.rs` / `src/platform/`: stable growable mapping wrapper and isolated Linux, macOS, and Windows backends.
 - `src/layout.rs` / `src/node.rs`: persistent layout, tags, serialization, and checksums.
 - `src/hash.rs`: canonical scalar XXH64 plus the four-key AVX2 implementation and scalar fallback.
 - `src/config.rs` / `src/error.rs`: validated configuration and canonical errors.
@@ -88,7 +92,7 @@ Use a new work directory; the loader intentionally fails if it already exists. I
 ## Runtime/Tooling Preferences
 
 - Use Cargo with Rust 1.85 or newer; the crate uses edition 2024. No `rust-toolchain` file pins a compiler. Nightly is needed for Miri, formatting/Clippy parity with Floresta, and `cargo-fuzz`.
-- The crate deliberately fails compilation outside Linux x86-64 and expects 4 KiB pages plus Linux `mmap`, `madvise`, `msync`, and `fallocate` allocation behavior.
+- Linux uses `mmap`, `madvise`, `msync`, `posix_fadvise`, and `fallocate`; macOS uses reserved virtual space, fixed-address `mmap` segments, `madvise`, `msync`, and `F_PREALLOCATE`. Format version 5 uses a 64 KiB format page independently of the host VM page size.
 - Database create/open advises the persisted head mapping for random access but does not pin pages; deployments do not require a raised `RLIMIT_MEMLOCK`.
 - Default features are empty. `bitcoin`, `bitcoinkernel`, and `hintsfile` are optional and enabled only by `bitcoin-load`.
 - `.env` is gitignored. Loader tuning variables are `DB_LOAD_BUCKETS`, `DB_LOAD_BODY_GIB`, and `DB_LOAD_BLOCK_MIB`.

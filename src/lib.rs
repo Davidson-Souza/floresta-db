@@ -8,7 +8,9 @@
 //! nodes directly, and empty blocks enter a tagged CAS free list for reuse before
 //! mapped backing files grow.
 //!
-//! The database supports one Linux x86-64 process with many threads.
+//! Storage is supported on 64-bit little-endian Linux and macOS targets.
+//! Windows targets compile for API portability but storage operations return
+//! [`Error::Unsupported`] rather than weaken the stable-growth contract.
 //!
 //! # Example
 //!
@@ -26,7 +28,6 @@
 //! # Ok::<(), floresta_db::Error>(())
 //! ```
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
@@ -38,7 +39,7 @@ mod hash;
 mod layout;
 mod mapped_file;
 mod node;
-mod sys;
+mod platform;
 mod table;
 
 pub use config::{Config, DEFAULT_HASH_SEED, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE, Mode};
@@ -46,5 +47,9 @@ pub use error::{Error, Result};
 pub use hash::xxh64;
 pub use table::{Database, PutResult, WriteOnlyWriter};
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-compile_error!("floresta-db currently supports only Linux x86-64");
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("floresta-db requires a 64-bit target");
+#[cfg(not(target_has_atomic = "64"))]
+compile_error!("floresta-db requires lock-free 64-bit atomics");
+#[cfg(not(target_endian = "little"))]
+compile_error!("floresta-db currently requires a little-endian target");

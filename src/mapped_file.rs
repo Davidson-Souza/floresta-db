@@ -3,27 +3,25 @@
 //! Checked ownership of a shared memory-mapped file.
 //!
 //! [`MappedFile`] reserves a stable maximum mapping while allowing its backing
-//! file to grow page-by-page. Range checks use the published file length, so no
-//! thread accesses the portion of the mapping that still lies beyond EOF.
+//! file to grow block-by-block. Range checks use the published file length, so
+//! no thread accesses the portion of the mapping that still lies beyond EOF.
 
 #![allow(dead_code)]
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
-use crate::layout::PAGE_SIZE;
-use crate::sys;
+use crate::layout::FORMAT_PAGE_SIZE;
+use crate::platform;
 
 const GROWING_BIT: u64 = 1 << 63;
 
 pub(crate) struct MappedFile {
     file: File,
 
-    pointer: NonNull<u8>,
+    mapping: platform::Mapping,
 
     mapping_length: usize,
 
@@ -43,7 +41,7 @@ impl MappedFile {
         populate: bool,
         reserve_all: bool,
     ) -> Result<Self> {
-        Self::create_with_lengths(path, length, length, populate, reserve_all)
+        Self::create_with_lengths(path, length, length, populate, reserve_all, false)
     }
 
     pub(crate) fn create_growable(
@@ -52,7 +50,7 @@ impl MappedFile {
         initial_length: u64,
         populate: bool,
     ) -> Result<Self> {
-        Self::create_with_lengths(path, maximum_length, initial_length, populate, false)
+        Self::create_with_lengths(path, maximum_length, initial_length, populate, false, true)
     }
 
     fn create_with_lengths(
@@ -61,6 +59,7 @@ impl MappedFile {
         file_length: u64,
         populate: bool,
         reserve_all: bool,
+        reserve_initial: bool,
     ) -> Result<Self> {
         validate_mapping_length(mapping_length)?;
         validate_mapping_length(file_length)?;
@@ -75,8 +74,8 @@ impl MappedFile {
             .create_new(true)
             .open(path)?;
         file.set_len(file_length)?;
-        if reserve_all {
-            sys::reserve(file.as_raw_fd(), 0, file_length)?;
+        if reserve_all || reserve_initial {
+            platform::reserve(&file, 0, file_length)?;
         }
         Self::map(file, mapping_length, file_length, populate)
     }
@@ -106,21 +105,23 @@ impl MappedFile {
     fn map(file: File, mapping_length: u64, file_length: u64, populate: bool) -> Result<Self> {
         let length = usize::try_from(mapping_length)
             .map_err(|_| Error::InvalidConfig("mapping does not fit the address space"))?;
-        let pointer = sys::map_shared(file.as_raw_fd(), length, populate)?;
+        let mapped_file_length = usize::try_from(file_length)
+            .map_err(|_| Error::InvalidConfig("file length does not fit the address space"))?;
+        let mapping = platform::Mapping::new(&file, length, mapped_file_length, populate)?;
         Ok(Self {
             file,
-            pointer,
+            mapping,
             mapping_length: length,
             file_length: AtomicU64::new(file_length),
         })
     }
 
     pub(crate) fn advise_random(&self) -> Result<()> {
-        sys::advise_random(self.pointer, self.mapping_length, self.file.as_raw_fd())
+        self.mapping.advise_random(&self.file)
     }
 
     pub(crate) fn advise_heads(&self) -> Result<()> {
-        sys::advise_heads(self.pointer, self.mapping_length)
+        self.mapping.advise_heads()
     }
 
     pub(crate) fn grow(&self, new_length: u64) -> Result<bool> {
@@ -130,6 +131,8 @@ impl MappedFile {
         if new_length > maximum {
             return Err(Error::CapacityExhausted("mapped file"));
         }
+        let new_usize = usize::try_from(new_length)
+            .map_err(|_| Error::Corrupt("new file length does not fit memory"))?;
 
         loop {
             let old = self.file_length.load(Ordering::Acquire);
@@ -140,6 +143,8 @@ impl MappedFile {
             if old >= new_length {
                 return Ok(false);
             }
+            let old_usize = usize::try_from(old)
+                .map_err(|_| Error::Corrupt("old file length does not fit memory"))?;
             let growing = old | GROWING_BIT;
             if self
                 .file_length
@@ -149,7 +154,14 @@ impl MappedFile {
                 continue;
             }
 
-            let result = self.file.set_len(new_length);
+            let result = (|| -> Result<()> {
+                self.file.set_len(new_length)?;
+                if let Err(error) = self.mapping.grow(&self.file, old_usize, new_usize) {
+                    let _rolled_back = self.file.set_len(old);
+                    return Err(error);
+                }
+                Ok(())
+            })();
             let published = if result.is_ok() { new_length } else { old };
             self.file_length
                 .compare_exchange(growing, published, Ordering::Release, Ordering::Acquire)
@@ -171,13 +183,13 @@ impl MappedFile {
 
     pub(crate) fn reserve(&self, offset: u64, length: u64) -> Result<()> {
         self.checked_range(offset, length)?;
-        sys::reserve(self.file.as_raw_fd(), offset, length)
+        platform::reserve(&self.file, offset, length)
     }
 
     pub(crate) fn sync_all(&self) -> Result<()> {
         let length = usize::try_from(self.file_length())
             .map_err(|_| Error::Corrupt("file length does not fit memory"))?;
-        sys::sync(self.pointer, length)?;
+        self.mapping.sync(length)?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -187,7 +199,7 @@ impl MappedFile {
         let offset =
             usize::try_from(offset).map_err(|_| Error::Corrupt("atomic offset overflow"))?;
         // SAFETY: the checked offset is in this stable mapping. Alignment is checked below.
-        let pointer = unsafe { self.pointer.as_ptr().add(offset) };
+        let pointer = unsafe { self.mapping.pointer().as_ptr().add(offset) };
         if pointer as usize % align_of::<AtomicU64>() != 0 {
             return Err(Error::Corrupt("atomic offset is not aligned"));
         }
@@ -216,7 +228,7 @@ impl MappedFile {
         // is caller-owned memory outside this mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.pointer.as_ptr().add(offset),
+                self.mapping.pointer().as_ptr().add(offset),
                 output.as_mut_ptr(),
                 output.len(),
             );
@@ -239,7 +251,7 @@ impl MappedFile {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 input.as_ptr(),
-                self.pointer.as_ptr().add(offset),
+                self.mapping.pointer().as_ptr().add(offset),
                 input.len(),
             );
         }
@@ -257,27 +269,16 @@ impl MappedFile {
     }
 }
 
-impl Drop for MappedFile {
-    fn drop(&mut self) {
-        let _result = sys::unmap(self.pointer, self.mapping_length);
-    }
-}
-
 fn validate_mapping_length(length: u64) -> Result<()> {
-    if length == 0 || length % PAGE_SIZE != 0 || length & GROWING_BIT != 0 {
+    if length == 0 || length % FORMAT_PAGE_SIZE != 0 || length & GROWING_BIT != 0 {
         return Err(Error::InvalidConfig(
-            "mapping length must be page aligned, representable, and nonzero",
+            "mapping length must be format-page aligned, representable, and nonzero",
         ));
     }
-    if sys::page_size()? != PAGE_SIZE {
-        return Err(Error::Unsupported(
-            "only 4096-byte Linux pages are supported",
-        ));
-    }
-    Ok(())
+    platform::ensure_supported()
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::sync::atomic::Ordering;
 
@@ -292,17 +293,17 @@ mod tests {
         let path = test_path("mapping");
         let _ignored = std::fs::remove_file(&path);
         {
-            let mapping = MappedFile::create(&path, PAGE_SIZE * 2, false, true)?;
+            let mapping = MappedFile::create(&path, FORMAT_PAGE_SIZE * 2, false, true)?;
             let atomic = mapping.atomic_u64(0)?;
             atomic
                 .compare_exchange(0, 42, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| Error::Corrupt("test CAS failed"))?;
             // SAFETY: this range has no concurrent readers or writers in the test.
-            unsafe { mapping.copy_in(PAGE_SIZE, b"mapped")? };
-            assert_eq!(mapping.copy_out(PAGE_SIZE, 6)?, b"mapped");
+            unsafe { mapping.copy_in(FORMAT_PAGE_SIZE, b"mapped")? };
+            assert_eq!(mapping.copy_out(FORMAT_PAGE_SIZE, 6)?, b"mapped");
             mapping.sync_all()?;
         }
-        let reopened = MappedFile::open(&path, PAGE_SIZE * 2, false)?;
+        let reopened = MappedFile::open(&path, FORMAT_PAGE_SIZE * 2, false)?;
         assert_eq!(reopened.atomic_u64(0)?.load(Ordering::Acquire), 42);
         drop(reopened);
         std::fs::remove_file(path)?;
@@ -314,20 +315,40 @@ mod tests {
         let path = test_path("growth");
         let _ignored = std::fs::remove_file(&path);
         {
-            let mapping = MappedFile::create_growable(&path, PAGE_SIZE * 3, PAGE_SIZE, false)?;
-            assert_eq!(std::fs::metadata(&path)?.len(), PAGE_SIZE);
-            assert!(mapping.copy_out(PAGE_SIZE, 1).is_err());
-            assert!(mapping.grow(PAGE_SIZE * 2)?);
-            assert!(!mapping.grow(PAGE_SIZE * 2)?);
+            let mapping =
+                MappedFile::create_growable(&path, FORMAT_PAGE_SIZE * 3, FORMAT_PAGE_SIZE, false)?;
+            assert_eq!(std::fs::metadata(&path)?.len(), FORMAT_PAGE_SIZE);
+            assert!(mapping.copy_out(FORMAT_PAGE_SIZE, 1).is_err());
+            assert!(mapping.grow(FORMAT_PAGE_SIZE * 2)?);
+            assert!(!mapping.grow(FORMAT_PAGE_SIZE * 2)?);
             // SAFETY: the grown range has no concurrent readers or writers in the test.
-            unsafe { mapping.copy_in(PAGE_SIZE, b"grown")? };
+            unsafe { mapping.copy_in(FORMAT_PAGE_SIZE, b"grown")? };
             mapping.sync_all()?;
-            assert_eq!(std::fs::metadata(&path)?.len(), PAGE_SIZE * 2);
+            assert_eq!(std::fs::metadata(&path)?.len(), FORMAT_PAGE_SIZE * 2);
         }
-        let reopened = MappedFile::open_growable(&path, PAGE_SIZE * 3, false)?;
-        assert_eq!(reopened.copy_out(PAGE_SIZE, 5)?, b"grown");
+        let reopened = MappedFile::open_growable(&path, FORMAT_PAGE_SIZE * 3, false)?;
+        assert_eq!(reopened.copy_out(FORMAT_PAGE_SIZE, 5)?, b"grown");
         drop(reopened);
         std::fs::remove_file(path)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_storage_without_creating_a_file() {
+        let path = std::env::temp_dir().join(format!(
+            "floresta-db-{}-unsupported.data",
+            std::process::id()
+        ));
+        let _ignored = std::fs::remove_file(&path);
+        assert!(matches!(
+            MappedFile::create(&path, FORMAT_PAGE_SIZE, false, false),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(!path.exists());
     }
 }

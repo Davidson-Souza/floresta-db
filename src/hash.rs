@@ -3,8 +3,8 @@
 //! Dependency-free XXH64 hashing.
 //!
 //! The table uses scalar XXH64 for individual keys and checksums. Batch paths
-//! hash four fixed-width keys in parallel with AVX2 and fall back to scalar code
-//! when AVX2 is unavailable.
+//! use AVX2 on x86-64 when available and the same scalar implementation on all
+//! other supported architectures.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
@@ -18,6 +18,7 @@ const PRIME_2: u64 = 14_029_467_366_897_019_727;
 const PRIME_3: u64 = 1_609_587_929_392_839_161;
 const PRIME_4: u64 = 9_650_029_242_287_828_579;
 
+#[cfg(target_arch = "x86_64")]
 const fn u64_as_i64_bits(value: u64) -> i64 {
     i64::from_ne_bytes(value.to_ne_bytes())
 }

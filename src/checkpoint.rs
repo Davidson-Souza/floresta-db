@@ -14,7 +14,7 @@ use crate::allocator::{Allocation, BlockAllocator, read_high_water};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
-use crate::layout::PAGE_SIZE;
+use crate::layout::FORMAT_PAGE_SIZE;
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 use crate::table::{
@@ -171,7 +171,7 @@ impl Database {
             .checked_add(required_headroom)
             .ok_or(Error::InvalidConfig("runtime body capacity overflow"))?;
 
-        let page_size = usize::try_from(PAGE_SIZE)
+        let page_size = usize::try_from(FORMAT_PAGE_SIZE)
             .map_err(|_| Error::Corrupt("page size does not fit memory"))?;
         let mut header = heads.copy_out(0, page_size)?;
         config.body_capacity = new_capacity;
@@ -883,8 +883,8 @@ fn open_snapshot(path: &Path, config: &Config, bank: u64) -> Result<SnapshotFile
 }
 
 fn read_config(heads: &MappedFile) -> Result<(Config, u64)> {
-    let page_size =
-        usize::try_from(PAGE_SIZE).map_err(|_| Error::Corrupt("page size does not fit memory"))?;
+    let page_size = usize::try_from(FORMAT_PAGE_SIZE)
+        .map_err(|_| Error::Corrupt("page size does not fit memory"))?;
     let header = heads.copy_out(0, page_size)?;
     if header.get(0..8) != Some(HEADER_MAGIC.as_slice()) {
         return Err(Error::Corrupt("heads header magic does not match"));
@@ -1080,7 +1080,7 @@ fn checkpoint_capture_hook(bucket: u64) {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::table::PutResult;

@@ -10,9 +10,9 @@ We have four parts:
  - The blobs file (optional)
  - The body file
  - The heads file
- - The blk cout (one per file above)
+ - The block-count file (one per data file above)
 
-The database uses separate chaining: `heads` stores one atomic root per bucket, while fixed-width nodes in `body` carry the next offset. The heads mapping is sized at startup and should balance resident memory against collision depth. All files are memory-mapped, with Linux advice favoring random access and retaining hot pages.
+The database uses separate chaining: `heads` stores one atomic root per bucket, while fixed-width nodes in `body` carry the next offset. The heads mapping is sized at startup and should balance resident memory against collision depth. All files are memory-mapped, with each supported operating system applying its native random-access advice.
 
 With the exception of the heads file, data files reserve a large stable virtual mapping but begin with only their header page. A tagged CAS high-water mark extends the backing file one block at a time. Allocation must first pop the tagged LIFO free-list head; only an empty free list permits high-water growth.
 
@@ -32,7 +32,7 @@ Deleting an element CAS-unlinks the uniquely owned node and immediately decremen
 
 ## Stack
 
-This should be written in Rust, and use xxHash as the hash function. No dependencies are allowed, it should focus on linux-based systems for now. You should test everything with:
+This is written in Rust and uses xxHash as the hash function. The default crate has no dependencies. Storage backends are isolated by operating system: Linux and macOS preserve the same stable-mapping and block-growth principles, while Windows reports the unsupported invariant rather than substituting different semantics. Test with:
  - Functional and unit tests
  - Fuzz
  - Miri

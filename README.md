@@ -2,7 +2,7 @@
 
 # floresta-db
 
-`floresta-db` is a fixed-width, concurrent key-value store for Bitcoin-style indexes. It is designed for one Linux x86-64 process with many threads, large sparse files, append-heavy construction, and explicit checkpoint-based recovery. The default crate has no external dependencies.
+`floresta-db` is a fixed-width, concurrent key-value store for Bitcoin-style indexes. It is designed for one 64-bit process with many threads, large sparse files, append-heavy construction, and explicit checkpoint-based recovery. The default crate has no external dependencies.
 
 It is a good fit when:
 
@@ -105,14 +105,29 @@ A checkpoint may overlap append-only writes. It contains every append completed 
 
 Inline-value maps are intended for clean runtime reopen and do not support checkpoint creation. Close them cleanly and use `Database::open_runtime`.
 
+## Platform support
+
+| Operating system | Architectures | Storage support |
+| --- | --- | --- |
+| Linux | x86-64, AArch64, RISC-V 64 | Full |
+| macOS | x86-64, AArch64 | Full |
+| Windows | x86-64, AArch64 | Compile-time API compatibility only |
+
+Windows storage intentionally returns `Error::Unsupported`. A writable Windows file-mapping object sized to the configured maximum extends the file to that maximum immediately. That cannot preserve both of the engine's core invariants: one stable maximum mapping and a file whose logical and physically reserved tail grows one block at a time. Supporting Windows would require a different on-disk alignment/layout or weaker growth semantics, so this port does not pretend otherwise.
+
+The optional `bitcoin-load` integration remains validated only on Linux x86-64 because its `libbitcoinkernel` toolchain has separate platform requirements.
+
 ## Storage assumptions
 
-- Linux x86-64 with 4 KiB pages.
-- Sparse `mmap` files with stable maximum virtual reservations.
+- A 64-bit, little-endian target with native 64-bit atomics.
+- A fixed 64 KiB **format page**, divisible by Linux and macOS VM-page sizes and by Windows mapping granularity.
+- Stable shared mappings on Linux (`mmap`/`fallocate`) or macOS (`mmap`/`F_PREALLOCATE`).
 - Backing files grow one allocation block at a time.
 - Bucket heads rely on the operating system page cache; no `mlock` limit is required.
 - Filesystem calls, page faults, file growth, startup, and checkpoints are outside the lock-free progress guarantee.
 - Capacities are configured maxima, not eagerly allocated disk usage.
+
+This port advances the on-disk format to version 5 because the format page grew from 4 KiB to 64 KiB. Version 4 databases are rejected and must be rebuilt; there is no silent reinterpretation or platform-dependent layout.
 
 Important configuration fields:
 
@@ -170,6 +185,14 @@ RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --all-features --documen
 cargo +nightly miri test --locked
 ```
 
+Linux AArch64 and RISC-V exercise the same storage tests under QEMU:
+
+```text
+cargo install cross --version 0.2.5 --locked
+cross test --target aarch64-unknown-linux-gnu --no-default-features --locked
+cross test --target riscv64gc-unknown-linux-gnu --no-default-features --locked
+```
+
 Real mapping, growth, and allocation tests do not run under Miri; pure layout and hashing tests do. For native memory checking:
 
 ```text
@@ -192,6 +215,8 @@ GitHub Actions enforces:
 
 - formatting, spelling, Clippy, rustdoc warnings, and documentation tests;
 - default-feature tests on Rust 1.85, all-feature tests on stable Rust, and release builds;
+- native Linux AArch64, macOS x86-64/AArch64, and Windows x86-64/AArch64 compile-guard jobs;
+- full Linux RISC-V 64 tests under QEMU;
 - Miri checks for the dependency-free core;
 - `cargo-audit` for both lockfiles and `cargo-deny` for advisories, sources, bans, and licenses;
 - workflow security analysis with Zizmor and shell validation with ShellCheck;

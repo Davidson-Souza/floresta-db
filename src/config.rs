@@ -6,7 +6,7 @@
 //! that cannot be represented safely by the on-disk format.
 
 use crate::error::{Error, Result};
-use crate::layout::{PAGE_SIZE, align_up};
+use crate::layout::{FORMAT_PAGE_SIZE, align_up};
 
 /// The default seed used for key hashing.
 ///
@@ -175,9 +175,9 @@ impl Config {
         if self.mode == Mode::Set && (self.blob_capacity != 0 || self.inline_value_size != 0) {
             return Err(Error::InvalidConfig("set mode cannot have values"));
         }
-        if self.block_size < PAGE_SIZE || !self.block_size.is_power_of_two() {
+        if self.block_size < FORMAT_PAGE_SIZE || !self.block_size.is_power_of_two() {
             return Err(Error::InvalidConfig(
-                "block size must be a power of two no smaller than 4096",
+                "block size must be a power of two no smaller than 65536",
             ));
         }
         if self.block_size > u64::from(u32::MAX) {

@@ -19,7 +19,7 @@ use libfuzzer_sys::fuzz_target;
 const RECORD_BYTES: usize = 17;
 const MAX_OPERATIONS: usize = 1_024;
 const FUZZ_CAPACITY: u64 = 1 << 20;
-const BLOCK_SIZE: u64 = 4_096;
+const BLOCK_SIZE: u64 = 65_536;
 
 static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 

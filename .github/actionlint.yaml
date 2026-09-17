@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# actionlint 1.7.7 predates these standard GitHub-hosted ARM/Intel labels.
+self-hosted-runner:
+  labels:
+    - macos-15-intel
+    - windows-11-arm

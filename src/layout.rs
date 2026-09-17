@@ -5,11 +5,11 @@
 //! Offsets in this module are shared by serialization, traversal, allocation,
 //! and recovery code; changing them requires a format-version review.
 
-pub(crate) const PAGE_SIZE: u64 = 4_096;
-pub(crate) const DATA_START: u64 = PAGE_SIZE;
+pub(crate) const FORMAT_PAGE_SIZE: u64 = 65_536;
+pub(crate) const DATA_START: u64 = FORMAT_PAGE_SIZE;
 pub(crate) const NODE_ALIGNMENT: u64 = 8;
 pub(crate) const NODE_FIXED_SIZE: u64 = 56;
-pub(crate) const HEADS_START: u64 = PAGE_SIZE;
+pub(crate) const HEADS_START: u64 = FORMAT_PAGE_SIZE;
 
 pub(crate) const NODE_NEXT_OFFSET: u64 = 0;
 pub(crate) const NODE_HASH_OFFSET: usize = 8;

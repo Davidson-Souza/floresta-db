@@ -14,7 +14,7 @@ use crate::allocator::{Allocation, BlockAllocator};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::{xxh64, xxh64_batch4};
-use crate::layout::{HEADS_START, PAGE_SIZE, align_up};
+use crate::layout::{FORMAT_PAGE_SIZE, HEADS_START, align_up};
 use crate::mapped_file::MappedFile;
 use crate::node::{
     Node, NodeView, allocate_node, blob_checksum, read_node, read_node_into, set_private_next,
@@ -22,7 +22,7 @@ use crate::node::{
 };
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-pub(crate) const FORMAT_VERSION: u64 = 4;
+pub(crate) const FORMAT_VERSION: u64 = 5;
 pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 96;
 pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
@@ -1655,7 +1655,7 @@ struct Found {
 pub(crate) fn bank_size(bucket_count: u64) -> Result<u64> {
     bucket_count
         .checked_mul(size_of::<u64>() as u64)
-        .and_then(|bytes| align_up(bytes, PAGE_SIZE))
+        .and_then(|bytes| align_up(bytes, FORMAT_PAGE_SIZE))
         .ok_or(Error::InvalidConfig("checkpoint bank size overflow"))
 }
 
@@ -1681,7 +1681,7 @@ pub(crate) fn heads_length(bucket_count: u64) -> Result<u64> {
 }
 
 pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: u64) -> Result<()> {
-    let page_size = usize::try_from(PAGE_SIZE)
+    let page_size = usize::try_from(FORMAT_PAGE_SIZE)
         .map_err(|_| Error::InvalidConfig("page size does not fit memory"))?;
     let mut header = Vec::new();
     header
@@ -1736,7 +1736,7 @@ pub(crate) fn write_header_u64(header: &mut [u8], offset: usize, value: u64) -> 
     Ok(())
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -2029,8 +2029,8 @@ mod tests {
         let path = test_directory("delete-free-list");
         let _ignored = std::fs::remove_dir_all(&path);
         let mut test_config = config(Mode::Set, 1, 4_000);
-        test_config.block_size = PAGE_SIZE;
-        test_config.body_capacity = PAGE_SIZE * 2;
+        test_config.block_size = FORMAT_PAGE_SIZE;
+        test_config.body_capacity = FORMAT_PAGE_SIZE * 2;
         let database = Database::create(&path, test_config)?;
         let first = vec![1; 4_000];
         let second = vec![2; 4_000];
@@ -2103,8 +2103,8 @@ mod tests {
         let path = test_directory("batch-delete-free-list");
         let _ignored = std::fs::remove_dir_all(&path);
         let mut test_config = config(Mode::Set, 1, 4_000);
-        test_config.block_size = PAGE_SIZE;
-        test_config.body_capacity = PAGE_SIZE * 3;
+        test_config.block_size = FORMAT_PAGE_SIZE;
+        test_config.body_capacity = FORMAT_PAGE_SIZE * 3;
         let database = Database::create(&path, test_config)?;
         let first = vec![1; 4_000];
         let second = vec![2; 4_000];

@@ -101,6 +101,72 @@ jobs:
       - name: Build release artifacts
         run: cargo +${{ matrix.toolchain }} build --release ${{ matrix.feature-args }} --locked
 
+  platform:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AArch64
+            os: ubuntu-24.04-arm
+          - name: macOS AArch64
+            os: macos-15
+          - name: macOS x86-64
+            os: macos-15-intel
+          - name: Windows AArch64 Compile Guard
+            os: windows-11-arm
+          - name: Windows x86-64 Compile Guard
+            os: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.os }}-1.85.0
+
+      - name: Run platform tests
+        run: cargo +1.85.0 test --all-targets --no-default-features --locked
+
+      - name: Build platform release
+        run: cargo +1.85.0 build --release --no-default-features --locked
+
+  riscv:
+    name: Linux RISC-V 64 under QEMU
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+
+      - name: Install cross
+        uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
+        with:
+          tool: cross@0.2.5
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: riscv64gc-unknown-linux-gnu-1.85.0
+
+      - name: Run RISC-V tests
+        run: cross +1.85.0 test --target riscv64gc-unknown-linux-gnu --no-default-features --locked
+
   miri:
     name: Miri
     runs-on: ubuntu-latest

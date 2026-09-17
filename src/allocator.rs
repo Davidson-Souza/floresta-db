@@ -15,13 +15,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
-use crate::layout::{DATA_START, PAGE_SIZE, align_up};
+use crate::layout::{DATA_START, FORMAT_PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 
 const CURRENT_BLOCK_OFFSET: u64 = 0;
 const NEXT_BLOCK_OFFSET: u64 = 8;
 const FREE_HEAD_OFFSET: u64 = 16;
-const COUNTS_START: u64 = PAGE_SIZE;
+const COUNTS_START: u64 = FORMAT_PAGE_SIZE;
 const CURRENT_INSTALLING: u64 = u64::MAX;
 const NEXT_GROWING_BIT: u64 = 1 << 63;
 const FREE_INDEX_MASK: u64 = u32::MAX as u64;
@@ -684,7 +684,7 @@ impl BlockAllocator {
 }
 
 fn validate_layout(capacity: u64, block_size: u64) -> Result<()> {
-    if capacity == 0 || block_size < PAGE_SIZE || !block_size.is_power_of_two() {
+    if capacity == 0 || block_size < FORMAT_PAGE_SIZE || !block_size.is_power_of_two() {
         return Err(Error::InvalidConfig("invalid block allocator layout"));
     }
     if capacity % block_size != 0 || block_size > u64::from(u32::MAX) {
@@ -727,7 +727,7 @@ pub(crate) fn count_file_length(blocks: u64) -> Result<u64> {
     blocks
         .checked_mul(size_of::<u64>() as u64)
         .and_then(|bytes| bytes.checked_add(COUNTS_START))
-        .and_then(|bytes| align_up(bytes, PAGE_SIZE))
+        .and_then(|bytes| align_up(bytes, FORMAT_PAGE_SIZE))
         .ok_or(Error::InvalidConfig("block-count file size overflow"))
 }
 
@@ -801,7 +801,7 @@ fn cas_replace(atomic: &AtomicU64, replacement: u64) {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -819,16 +819,29 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-batch");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+        let allocator = BlockAllocator::create(
+            &data_path,
+            &count_path,
+            FORMAT_PAGE_SIZE * 2,
+            FORMAT_PAGE_SIZE,
+        )?;
 
-        let batch = allocator.allocate_batch(16, 8, 1_000)?;
-        assert_eq!(batch.len(), 256);
+        let expected = usize::try_from(FORMAT_PAGE_SIZE / 16)
+            .map_err(|_| Error::InvalidConfig("test batch size does not fit memory"))?;
+        let batch = allocator.allocate_batch(16, 8, expected + 1)?;
+        assert_eq!(batch.len(), expected);
         let allocations: Vec<Allocation> = batch.allocations().collect();
         assert_eq!(allocations[0].offset, DATA_START);
-        assert_eq!(allocations[255].offset, DATA_START + PAGE_SIZE - 16);
+        assert_eq!(
+            allocations[expected - 1].offset,
+            DATA_START + FORMAT_PAGE_SIZE - 16
+        );
         let word = allocator.block_word(0)?.load(Ordering::Acquire);
-        assert_eq!(used(word), u32::try_from(PAGE_SIZE).unwrap_or(u32::MAX));
-        assert_eq!(count(word), 256);
+        assert_eq!(
+            used(word),
+            u32::try_from(FORMAT_PAGE_SIZE).unwrap_or(u32::MAX)
+        );
+        assert_eq!(count(word), u32::try_from(expected).unwrap_or(u32::MAX));
 
         let next = allocator.allocate_batch(16, 8, 4)?;
         assert_eq!(next.block, 1);
@@ -845,8 +858,13 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-free-list");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 3, PAGE_SIZE)?;
-        let page_size = usize::try_from(PAGE_SIZE)
+        let allocator = BlockAllocator::create(
+            &data_path,
+            &count_path,
+            FORMAT_PAGE_SIZE * 3,
+            FORMAT_PAGE_SIZE,
+        )?;
+        let page_size = usize::try_from(FORMAT_PAGE_SIZE)
             .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
 
         assert_eq!(std::fs::metadata(&data_path)?.len(), DATA_START);
@@ -855,7 +873,7 @@ mod tests {
         let third = allocator.allocate(16, 8)?;
         assert_eq!((first.block, second.block, third.block), (0, 1, 2));
         let grown_length = std::fs::metadata(&data_path)?.len();
-        assert_eq!(grown_length, DATA_START + PAGE_SIZE * 3);
+        assert_eq!(grown_length, DATA_START + FORMAT_PAGE_SIZE * 3);
 
         allocator.release(first)?;
         allocator.release(second)?;
@@ -875,10 +893,11 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-reopen");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let capacity = PAGE_SIZE * 2;
+        let capacity = FORMAT_PAGE_SIZE * 2;
         {
-            let allocator = BlockAllocator::create(&data_path, &count_path, capacity, PAGE_SIZE)?;
-            let page_size = usize::try_from(PAGE_SIZE)
+            let allocator =
+                BlockAllocator::create(&data_path, &count_path, capacity, FORMAT_PAGE_SIZE)?;
+            let page_size = usize::try_from(FORMAT_PAGE_SIZE)
                 .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
             let first = allocator.allocate(page_size - 8, 8)?;
             let _second = allocator.allocate(16, 8)?;
@@ -888,7 +907,7 @@ mod tests {
         }
 
         let length = std::fs::metadata(&data_path)?.len();
-        let reopened = BlockAllocator::open(&data_path, &count_path, capacity, PAGE_SIZE)?;
+        let reopened = BlockAllocator::open(&data_path, &count_path, capacity, FORMAT_PAGE_SIZE)?;
         let reused = reopened.allocate(16, 8)?;
         assert_eq!(reused.block, 0);
         assert_eq!(std::fs::metadata(&data_path)?.len(), length);
@@ -904,7 +923,12 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-concurrent");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 4, PAGE_SIZE)?;
+        let allocator = BlockAllocator::create(
+            &data_path,
+            &count_path,
+            FORMAT_PAGE_SIZE * 4,
+            FORMAT_PAGE_SIZE,
+        )?;
         std::thread::scope(|scope| {
             for _index in 0..8 {
                 scope.spawn(|| {
@@ -926,7 +950,12 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-concurrent-batch");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+        let allocator = BlockAllocator::create(
+            &data_path,
+            &count_path,
+            FORMAT_PAGE_SIZE * 2,
+            FORMAT_PAGE_SIZE,
+        )?;
         std::thread::scope(|scope| {
             for _worker in 0..8 {
                 scope.spawn(|| {
@@ -955,10 +984,10 @@ mod tests {
         let allocator = BlockAllocator::create(
             &data_path,
             &count_path,
-            PAGE_SIZE * BLOCKS as u64,
-            PAGE_SIZE,
+            FORMAT_PAGE_SIZE * BLOCKS as u64,
+            FORMAT_PAGE_SIZE,
         )?;
-        let page_size = usize::try_from(PAGE_SIZE)
+        let page_size = usize::try_from(FORMAT_PAGE_SIZE)
             .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
         let mut allocations = Vec::new();
         allocations
@@ -1005,7 +1034,12 @@ mod tests {
         let (data_path, count_path) = test_paths("allocator-count-saturation");
         let _ignored_data = std::fs::remove_file(&data_path);
         let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+        let allocator = BlockAllocator::create(
+            &data_path,
+            &count_path,
+            FORMAT_PAGE_SIZE * 2,
+            FORMAT_PAGE_SIZE,
+        )?;
         let first = allocator.allocate(8, 8)?;
         let word = allocator.block_word(first.block)?;
         loop {
