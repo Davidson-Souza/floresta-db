@@ -3,8 +3,9 @@
 //! Lock-free allocation within growable memory-mapped files.
 //!
 //! Each block stores its allocation cursor, live-object count, and lifecycle
-//! state in one atomic word. Empty sealed blocks are pushed onto a tagged LIFO
-//! free list and reused before the backing files grow to another block.
+//! state in one atomic word. Fixed-width batches reserve all fitting objects with
+//! one metadata CAS. Empty sealed blocks enter a tagged LIFO free list and are
+//! reused before the backing files grow.
 
 #![allow(dead_code)]
 
@@ -53,6 +54,33 @@ pub(crate) struct Allocation {
     pub(crate) length: u32,
 
     pub(crate) block: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AllocationBatch {
+    offset: u64,
+
+    length: u32,
+
+    stride: u32,
+
+    count: u32,
+
+    block: u64,
+}
+
+impl AllocationBatch {
+    pub(crate) fn len(&self) -> usize {
+        usize::try_from(self.count).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn allocations(&self) -> impl ExactSizeIterator<Item = Allocation> + '_ {
+        (0..self.count).map(|index| Allocation {
+            offset: self.offset + u64::from(index) * u64::from(self.stride),
+            length: self.length,
+            block: self.block,
+        })
+    }
 }
 
 pub(crate) struct BlockAllocator {
@@ -114,13 +142,31 @@ impl BlockAllocator {
     }
 
     pub(crate) fn allocate(&self, length: usize, alignment: u64) -> Result<Allocation> {
+        self.allocate_batch(length, alignment, 1)?
+            .allocations()
+            .next()
+            .ok_or(Error::Corrupt("single allocation batch is empty"))
+    }
+
+    pub(crate) fn allocate_batch(
+        &self,
+        length: usize,
+        alignment: u64,
+        maximum_count: usize,
+    ) -> Result<AllocationBatch> {
         let length = u64::try_from(length).map_err(|_| Error::CapacityExhausted("allocation"))?;
-        if length == 0 || length > self.block_size {
+        if length == 0 || length > self.block_size || maximum_count == 0 {
             return Err(Error::CapacityExhausted("single-block allocation"));
         }
         if alignment == 0 || !alignment.is_power_of_two() || alignment > self.block_size {
             return Err(Error::InvalidConfig("allocation alignment is invalid"));
         }
+        let stride =
+            align_up(length, alignment).ok_or(Error::CapacityExhausted("allocation stride"))?;
+        let requested = match u32::try_from(maximum_count) {
+            Ok(count) => count.min(MAX_COUNT),
+            Err(_) => MAX_COUNT,
+        };
 
         let current = self.current_block()?;
         loop {
@@ -144,14 +190,14 @@ impl BlockAllocator {
                 continue;
             }
 
-            let used_bytes = u64::from(used(old));
-            let start =
-                align_up(used_bytes, alignment).ok_or(Error::CapacityExhausted("block offset"))?;
-            let end = start
-                .checked_add(length)
+            let start = align_up(u64::from(used(old)), alignment)
                 .ok_or(Error::CapacityExhausted("block offset"))?;
             let old_count = count(old);
-            if end > self.block_size || old_count == MAX_COUNT {
+            let available_count = MAX_COUNT.saturating_sub(old_count);
+            let first_end = start
+                .checked_add(length)
+                .ok_or(Error::CapacityExhausted("block offset"))?;
+            if first_end > self.block_size || available_count == 0 {
                 let sealed = pack(BlockState::Sealed, used(old), old_count);
                 if word
                     .compare_exchange(old, sealed, Ordering::AcqRel, Ordering::Acquire)
@@ -164,8 +210,18 @@ impl BlockAllocator {
                 continue;
             }
 
+            let available_bytes = self.block_size - first_end;
+            let fitting = 1_u64
+                .checked_add(available_bytes / stride)
+                .ok_or(Error::CapacityExhausted("batch allocation count"))?;
+            let fitting = u32::try_from(fitting).unwrap_or(u32::MAX);
+            let reserved = requested.min(available_count).min(fitting);
+            let end = start
+                .checked_add(u64::from(reserved - 1).saturating_mul(stride))
+                .and_then(|offset| offset.checked_add(length))
+                .ok_or(Error::CapacityExhausted("block offset"))?;
             let new_count = old_count
-                .checked_add(1)
+                .checked_add(reserved)
                 .ok_or(Error::CapacityExhausted("block object count"))?;
             let end_u32 =
                 u32::try_from(end).map_err(|_| Error::CapacityExhausted("block offset"))?;
@@ -178,10 +234,13 @@ impl BlockAllocator {
                     .data_offset(block)?
                     .checked_add(start)
                     .ok_or(Error::CapacityExhausted("allocation offset"))?;
-                return Ok(Allocation {
+                return Ok(AllocationBatch {
                     offset,
                     length: u32::try_from(length)
                         .map_err(|_| Error::CapacityExhausted("allocation length"))?,
+                    stride: u32::try_from(stride)
+                        .map_err(|_| Error::CapacityExhausted("allocation stride"))?,
+                    count: reserved,
                     block,
                 });
             }
@@ -301,6 +360,11 @@ impl BlockAllocator {
     pub(crate) fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
         self.validate_data_range(offset, length)?;
         self.data.copy_out(offset, length)
+    }
+
+    pub(crate) fn read_into(&self, offset: u64, output: &mut [u8]) -> Result<()> {
+        self.validate_data_range(offset, output.len())?;
+        self.data.copy_out_into(offset, output)
     }
 
     pub(crate) fn atomic_u64(&self, offset: u64) -> Result<&AtomicU64> {
@@ -751,6 +815,32 @@ mod tests {
     }
 
     #[test]
+    fn reserves_largest_fitting_batch_with_one_metadata_update() -> Result<()> {
+        let (data_path, count_path) = test_paths("allocator-batch");
+        let _ignored_data = std::fs::remove_file(&data_path);
+        let _ignored_counts = std::fs::remove_file(&count_path);
+        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+
+        let batch = allocator.allocate_batch(16, 8, 1_000)?;
+        assert_eq!(batch.len(), 256);
+        let allocations: Vec<Allocation> = batch.allocations().collect();
+        assert_eq!(allocations[0].offset, DATA_START);
+        assert_eq!(allocations[255].offset, DATA_START + PAGE_SIZE - 16);
+        let word = allocator.block_word(0)?.load(Ordering::Acquire);
+        assert_eq!(used(word), u32::try_from(PAGE_SIZE).unwrap_or(u32::MAX));
+        assert_eq!(count(word), 256);
+
+        let next = allocator.allocate_batch(16, 8, 4)?;
+        assert_eq!(next.block, 1);
+        assert_eq!(next.len(), 4);
+
+        drop(allocator);
+        std::fs::remove_file(data_path)?;
+        std::fs::remove_file(count_path)?;
+        Ok(())
+    }
+
+    #[test]
     fn grows_only_without_free_blocks_and_reuses_lifo() -> Result<()> {
         let (data_path, count_path) = test_paths("allocator-free-list");
         let _ignored_data = std::fs::remove_file(&data_path);
@@ -825,6 +915,30 @@ mod tests {
                 });
             }
         });
+        drop(allocator);
+        std::fs::remove_file(data_path)?;
+        std::fs::remove_file(count_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reserves_concurrent_batches_with_cas() -> Result<()> {
+        let (data_path, count_path) = test_paths("allocator-concurrent-batch");
+        let _ignored_data = std::fs::remove_file(&data_path);
+        let _ignored_counts = std::fs::remove_file(&count_path);
+        let allocator = BlockAllocator::create(&data_path, &count_path, PAGE_SIZE * 2, PAGE_SIZE)?;
+        std::thread::scope(|scope| {
+            for _worker in 0..8 {
+                scope.spawn(|| {
+                    let batch = allocator.allocate_batch(16, 8, 16);
+                    assert!(matches!(batch, Ok(batch) if batch.len() == 16));
+                });
+            }
+        });
+        let word = allocator.block_word(0)?.load(Ordering::Acquire);
+        assert_eq!(used(word), 2_048);
+        assert_eq!(count(word), 128);
+
         drop(allocator);
         std::fs::remove_file(data_path)?;
         std::fs::remove_file(count_path)?;

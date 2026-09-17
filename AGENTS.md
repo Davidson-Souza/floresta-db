@@ -89,7 +89,7 @@ Use a new work directory; the loader intentionally fails if it already exists. I
 
 - Use Cargo with Rust 1.85 or newer; the crate uses edition 2024. No `rust-toolchain` file pins a compiler. Nightly is needed for Miri, formatting/Clippy parity with Floresta, and `cargo-fuzz`.
 - The crate deliberately fails compilation outside Linux x86-64 and expects 4 KiB pages plus Linux `mmap`, `madvise`, `msync`, and `fallocate` allocation behavior.
-- Database create/open pins the active persisted head bank with `mlock`. Tests and deployments must provide `RLIMIT_MEMLOCK > align_up(bucket_count * 8, 4096)` when the process locks other memory; lock failures are returned as I/O errors. An exact 8 MiB limit can be insufficient for the default loader.
+- Database create/open advises the persisted head mapping for random access but does not pin pages; deployments do not require a raised `RLIMIT_MEMLOCK`.
 - Default features are empty. `bitcoin`, `bitcoinkernel`, and `hintsfile` are optional and enabled only by `bitcoin-load`.
 - `.env` is gitignored. Loader tuning variables are `DB_LOAD_BUCKETS`, `DB_LOAD_BODY_GIB`, and `DB_LOAD_BLOCK_MIB`.
 - `target/`, fuzz artifacts/corpora, loader work directories, and root `*.data`, `*.csv`, and `*.svg` outputs are generated and ignored.

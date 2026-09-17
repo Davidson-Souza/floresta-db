@@ -2,55 +2,162 @@
 
 # floresta-db
 
-A dependency-free-by-default, Linux x86-64 CAS-only concurrent storage engine for Floresta and Bitcoin-style data.
+`floresta-db` is a fixed-width, concurrent key-value store for Bitcoin-style indexes. It is designed for one Linux x86-64 process with many threads, large sparse files, append-heavy construction, and explicit checkpoint-based recovery. The default crate has no external dependencies.
 
-## Properties
+It is a good fit when:
 
-- Fixed-width keys and separate-chaining bucket lists.
-- Optional values for map mode; set mode has no blob file.
-- In-tree XXH64 with four-key AVX2 batch hashing and a scalar fallback.
-- Acquire-only bucket and link reads.
-- Direct CAS unlinking under an explicit unique-deletion contract.
-- Stable maximum `mmap` reservations whose backing files grow block-by-block.
-- Tagged CAS LIFO free lists that reuse empty blocks before file growth.
-- The active persisted bucket-head bank is pinned with Linux `mlock`.
-- Concurrent per-bucket checkpoints during append-only writes.
-- No default Cargo dependencies; the Bitcoin Core load test is feature-gated.
+- keys have one fixed width known when the database is created;
+- the workload is dominated by parallel inserts, point reads, and ordered batch work;
+- the application can coordinate destructive operations such as replacement and deletion;
+- losing mutations made after the last checkpoint is acceptable after a crash.
 
-The database supports one process with many threads. Every shared state mutation uses `compare_exchange`; readers use acquire loads. Filesystem calls, page faults, checkpoints, and process startup are outside the lock-free progress guarantee.
+It is not a general SQL engine, a multi-process database, or a transactional store with per-write crash durability.
 
-`Database::create`, `open`, and `open_runtime` fail if `mlock` cannot pin the active head bank. Configure `RLIMIT_MEMLOCK` above `align_up(bucket_count * 8, 4096)` plus any other process locks. The default loader head bank is exactly 8 MiB, so a process limited to 8 MiB may need a higher limit or a smaller `DB_LOAD_BUCKETS`.
+## Quick start
 
-Deletion and replacement deliberately use no reader-tracking system. The caller must guarantee unique ownership of a key being removed and must prevent reads, replacements, deletions, or checkpoints from retaining an offset in the affected bucket while the removal runs. An empty block can be reused immediately after its unlink CAS succeeds.
+```rust
+use floresta_db::{Config, Database, Mode, PutResult};
 
-## Example
+let path = "utxo.db";
+let key = [0_u8; 36];
+let value = b"serialized output";
+
+let mut config = Config::new(Mode::Map, 1 << 20, key.len());
+config.body_capacity = 8 << 30;
+config.blob_capacity = 8 << 30;
+
+let database = Database::create(path, config)?;
+assert_eq!(database.put(&key, value)?, PutResult::Inserted);
+assert_eq!(database.get(&key)?.as_deref(), Some(value.as_slice()));
+
+// A checkpoint is the crash-recovery boundary.
+database.checkpoint()?;
+database.close()?;
+
+let reopened = Database::open(path)?;
+assert_eq!(reopened.get(&key)?.as_deref(), Some(value.as_slice()));
+# Ok::<(), floresta_db::Error>(())
+```
+
+Set mode stores keys without values:
 
 ```rust
 use floresta_db::{Config, Database, Mode};
 
-let outpoint = [0_u8; 36];
-let serialized_output = b"serialized output";
-let mut config = Config::new(Mode::Map, 1 << 20, outpoint.len());
-config.body_capacity = 8 << 30;
-config.blob_capacity = 8 << 30;
-
-let database = Database::create("utxo.db", config)?;
-database.put(&outpoint, serialized_output)?;
-let output = database.get(&outpoint)?;
-assert_eq!(output.as_deref(), Some(serialized_output.as_slice()));
-database.delete(&outpoint)?;
-database.checkpoint()?;
+let database = Database::create("set.db", Config::new(Mode::Set, 1 << 16, 32))?;
+let key = [7_u8; 32];
+database.add(&key)?;
+assert!(database.contains(&key)?);
 # Ok::<(), floresta_db::Error>(())
 ```
 
-`Database::open` restores the newest valid checkpoint into fresh mutable runtime files. Mutations after the checkpoint may be lost after a crash. A concurrent checkpoint contains every append completed before checkpoint invocation; overlapping appends may or may not be included. Deletions and replacements must not overlap checkpoint capture.
+The create path must not exist. Bucket count, key width, block size, capacities, and value mode become part of the persistent layout.
 
-## Locality-Optimized Batches
+## Data model and APIs
 
-`Database::add_batch` and `WriteOnlyWriter::put_batch` are optimized for append-only construction. They validate the complete batch, SIMD-hash keys four at a time, sort entries by bucket, privately chain every same-bucket group, and publish that group with one successful head CAS. Buckets are committed in ascending order. These paths do not search for duplicate keys; duplicates remain in the chain, with the last duplicate in a batch observed first.
+`Mode::Set` stores fixed-width keys. `Mode::Map` stores fixed-width keys plus either:
 
-`Database::batch_fetch` and `Database::batch_delete` use the same hash-and-sort pipeline. They visit each requested bucket once and restore results to input order. `batch_fetch` permits duplicate requests; `batch_delete` rejects them and inherits the unique-deletion and quiescence contract.
+- fixed values of up to eight bytes directly inside each node; or
+- variable-width values in a separate blob file.
 
+The main scalar operations are:
+
+- `add` / `contains` / `delete` for sets;
+- `put` / `get` / `delete` for maps;
+- `sync` to flush current mappings;
+- `checkpoint` and `open` for crash recovery;
+- `close` and `open_runtime` for a clean runtime-file reopen.
+
+Reads return owned values rather than slices into mapped storage.
+
+### Batch construction
+
+Batch APIs hash and group work by bucket so each bucket is visited or published once per group:
+
+- `add_batch` appends set keys;
+- `WriteOnlyWriter::put_batch` builds maps without duplicate lookups;
+- `batch_fetch` resolves requests and restores input order;
+- `batch_delete` removes the first matching node for each unique requested key.
+
+Append-only batch writers deliberately retain duplicate keys. `batch_fetch` accepts duplicate requests; `batch_delete` rejects them.
+
+## Concurrency contract
+
+The supported topology is one process with many threads. Append-only writes and reads use atomic publication and validation; there is no global write lock.
+
+Deletion and replacing `put` calls are different. The database intentionally has no hazard pointers, epochs, or reader-tracking layer. Before removing a key, the caller must guarantee:
+
+1. unique ownership of that logical key;
+2. no reader, competing remover/replacer, or checkpoint can retain an offset in the affected bucket;
+3. the operation's higher-level ordering makes the key eligible for removal.
+
+Per-bucket delete locks serialize internal deleters, but they do not replace this ownership and quiescence contract. Once a node is unlinked, an empty block may be reused immediately.
+
+This design keeps the append/read hot path small and fast. Applications that need arbitrary reads concurrent with arbitrary deletes need a reclamation layer above the database or a different storage engine.
+
+## Durability and recovery
+
+A checkpoint is the recovery boundary. `Database::open` validates both checkpoint generations, selects the newest valid one, and rebuilds fresh mutable runtime files. Mutations completed after that checkpoint can be lost after a crash.
+
+A checkpoint may overlap append-only writes. It contains every append completed before capture began; overlapping appends may or may not be included. Deletions and replacements must not overlap checkpoint capture.
+
+`Database::sync` flushes runtime mappings but does not create a recoverable checkpoint generation.
+
+Inline-value maps are intended for clean runtime reopen and do not support checkpoint creation. Close them cleanly and use `Database::open_runtime`.
+
+## Storage assumptions
+
+- Linux x86-64 with 4 KiB pages.
+- Sparse `mmap` files with stable maximum virtual reservations.
+- Backing files grow one allocation block at a time.
+- Bucket heads rely on the operating system page cache; no `mlock` limit is required.
+- Filesystem calls, page faults, file growth, startup, and checkpoints are outside the lock-free progress guarantee.
+- Capacities are configured maxima, not eagerly allocated disk usage.
+
+Important configuration fields:
+
+- `bucket_count`: more buckets shorten collision chains at the cost of a larger head table;
+- `body_capacity`: maximum space reserved for fixed-width nodes;
+- `blob_capacity`: maximum external value space for non-inline maps;
+- `block_size`: file-growth and block-reuse granularity;
+- `inline_value_size`: zero for blob values, or one through eight bytes inline.
+
+## Strong points
+
+- CAS publication with acquire-validated reads.
+- Locality-oriented batch hashing and bucket ordering.
+- Four-key AVX2 XXH64 with a scalar fallback.
+- One metadata reservation CAS for many fixed-width batch nodes.
+- Tagged LIFO free lists that reuse empty blocks before growing files.
+- Checksummed nodes, values, headers, manifests, and checkpoint fallback.
+- Stable sparse mappings: growth does not invalidate published offsets.
+- Dependency-free default build.
+
+The tradeoff is deliberate: the engine gets these properties by narrowing the deployment and concurrency model rather than hiding coordination behind a general-purpose transaction layer.
+
+## Examples
+
+### Stress runner
+
+```text
+cargo run --release --example stress -- 1000 100 16 stress
+```
+
+Arguments are block count, outputs per block, maximum worker count, and output prefix. It writes `stress.csv` and `stress.svg`.
+
+### Bitcoin Core load and Swift Sync hints
+
+The optional loader reads an existing active chain through `libbitcoinkernel` and builds a compact UTXO index plus `swiftsync.hints`:
+
+```text
+cargo run --release --features bitcoin-load --example bitcoin-load -- \
+  DATA_DIR BLOCKS_DIR [mainnet|testnet|testnet4|signet|regtest] \
+  [TIP|tip] [ADD_THREADS] [REMOVE_THREADS] [RANGE_SIZE] [WORK_DIR]
+```
+
+The work directory must not exist. Building this feature requires CMake, a C++ compiler, and Boost. Stop any process that exclusively locks the selected Bitcoin Core data directory before running it.
+
+After indexing, the example closes the database and destructively uses its body file as external-sort workspace for hints generation. `WORK_DIR/index` is therefore not a reopenable database after a successful loader run. Tuning variables are `DB_LOAD_BUCKETS`, `DB_LOAD_BODY_GIB`, and `DB_LOAD_BLOCK_MIB`.
 
 ## Validation
 
@@ -63,56 +170,16 @@ cargo doc --no-deps --all-features
 cargo +nightly miri test
 ```
 
-The real `mmap`, file-growth, and `fallocate` integration tests are disabled under Miri; pure layout and hashing tests still run there. Valgrind can run the compiled unit-test executable:
+Real mapping, growth, and allocation tests do not run under Miri; pure layout and hashing tests do. For native memory checking:
 
 ```text
 cargo test --no-run
 valgrind --tool=memcheck --leak-check=full target/debug/deps/floresta_db-<hash>
 ```
 
-## Fuzzing
-
-Install [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) once, then run the `database` target:
+The model-based fuzz target checks scalar and batched operations plus checkpoint/reopen behavior against a `BTreeMap` model:
 
 ```text
 cargo install cargo-fuzz
 cargo +nightly fuzz run database
 ```
-
-The target in `fuzz/fuzz_targets/database.rs` decodes inputs into scalar and batched puts, fetches, and deletes plus checkpoint/reopen operations. Every result is checked against a stacked `BTreeMap` reference model so retained duplicates are observable.
-
-If ASan reports that its shadow range overlaps the executable on a hardened kernel, build the fuzz target as non-PIE:
-
-```text
-RUSTFLAGS="-C link-arg=-no-pie" cargo +nightly fuzz run database
-```
-
-## Stress Evaluation
-
-The stress example gives 75% of generated outputs a spend lifetime from 1 through 100 blocks. Each worker owns an independent block stream, avoiding a benchmark barrier in the database hot path.
-
-```text
-cargo run --release --example stress -- 1000 100 16 stress
-```
-
-Arguments are blocks, outputs per block, maximum workers, and output prefix. The runner tests powers of two through the requested worker count and writes `stress.csv` plus a dependency-free `stress.svg` throughput chart.
-
-## Bitcoin Core Load and Swift Sync Hints
-
-The feature-gated `bitcoin-load` example reads an existing active chain through `libbitcoinkernel`; no RPC server or flat-file ring is used. Building this feature requires Bitcoin Core's native build dependencies, including CMake, a C++ compiler, and Boost. Stop any process that exclusively locks the selected Bitcoin Core data directory before running it.
-
-```text
-cargo run --release --features bitcoin-load --example bitcoin-load -- \
-  DATA_DIR BLOCKS_DIR [mainnet|testnet|testnet4|signet|regtest] \
-  [TIP|tip] [ADD_THREADS] [REMOVE_THREADS] [RANGE_SIZE] [WORK_DIR]
-```
-
-Adder and remover pools independently claim small block ranges through CAS counters. Every adder publishes its completed height into a shared progress set and notifies a condition variable. Removers only claim ranges ending at or below the current minimum safe height; they wait on the condition variable only when no unclaimed safe block remains.
-
-Progress is emitted as line-oriented `key=value` records. Kernel initialization, every range claim/completion, each worker reaching tip, index completion, hints scanning every 10,000 blocks, and hints encoding are logged immediately with `stage` and `event` fields.
-
-Eligible outputs use a 12-byte key: the first 64 bits of the internal txid representation plus little-endian `vout`. The inline value is the eligible output's zero-based index within its block. Genesis, `OP_RETURN` outputs, and scripts larger than 10,000 bytes are not eligible. On mainnet only, the overwritten BIP30 coinbases at heights 91,722 and 91,812 are also excluded.
-
-At completion, per-block eligible counts are folded into global offsets—for example, `[1, 4]` becomes `[0, 1, 5]`. A second `libbitcoinkernel` pass resolves the surviving local indices, rejects detected 64-bit txid collisions, and writes `WORK_DIR/swiftsync.hints` with the `hintsfile` crate.
-
-The work directory must not already exist. `tip` selects the active-chain tip observed at startup; an explicit height makes runs repeatable. Tuning variables are `DB_LOAD_BUCKETS`, `DB_LOAD_BODY_GIB`, and `DB_LOAD_BLOCK_MIB`.

@@ -14,11 +14,11 @@ use crate::allocator::{Allocation, BlockAllocator, read_high_water};
 use crate::config::{Config, Mode};
 use crate::error::{Error, Result};
 use crate::hash::xxh64;
-use crate::layout::{HEADS_START, PAGE_SIZE};
+use crate::layout::PAGE_SIZE;
 use crate::mapped_file::MappedFile;
 use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
 use crate::table::{
-    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, bank_size,
+    Database, FORMAT_VERSION, HEADER_CHECKSUM_OFFSET, HEADER_MAGIC, create_delete_locks,
     create_runtime_heads, header_checksum, heads_length, snapshot_bank_start, write_header_u64,
 };
 
@@ -77,8 +77,8 @@ impl Database {
             ));
         }
         heads.advise_heads()?;
-        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, true)?;
+        let delete_locks = create_delete_locks(config.bucket_count)?;
         let body = BlockAllocator::open(
             &path.join("body"),
             &path.join("body.counts"),
@@ -100,6 +100,7 @@ impl Database {
             node_size,
             heads,
             runtime_heads,
+            delete_locks,
             body,
             blobs,
             checkpoint_state: AtomicU64::new(CHECKPOINT_IDLE),
@@ -244,7 +245,6 @@ impl Database {
         let snapshot = open_snapshot(path, config, manifest.bank)?;
         validate_snapshot(&heads, &snapshot, config, node_size, manifest)?;
         heads.advise_heads()?;
-        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         remove_runtime_files(path, config.mode)?;
         let body = BlockAllocator::create(
             &path.join("body"),
@@ -263,11 +263,13 @@ impl Database {
             None
         };
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
+        let delete_locks = create_delete_locks(config.bucket_count)?;
         let database = Self {
             config: config.clone(),
             node_size,
             heads,
             runtime_heads,
+            delete_locks,
             body,
             blobs,
             checkpoint_state: AtomicU64::new(CHECKPOINT_IDLE),

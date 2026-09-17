@@ -16,7 +16,10 @@ use crate::error::{Error, Result};
 use crate::hash::{xxh64, xxh64_batch4};
 use crate::layout::{HEADS_START, PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
-use crate::node::{Node, allocate_node, blob_checksum, read_node, set_private_next};
+use crate::node::{
+    Node, NodeView, allocate_node, blob_checksum, read_node, read_node_into, set_private_next,
+    tombstone_node, write_node,
+};
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
 pub(crate) const FORMAT_VERSION: u64 = 4;
@@ -86,6 +89,25 @@ struct PrivateGroup<'database> {
     root: u64,
 }
 
+struct BucketDeleteGuard<'database> {
+    lock: &'database AtomicU64,
+}
+
+impl Drop for BucketDeleteGuard<'_> {
+    fn drop(&mut self) {
+        let mut observed = self.lock.load(Ordering::Acquire);
+        while observed != 0 {
+            match self
+                .lock
+                .compare_exchange(observed, 0, Ordering::Release, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+}
+
 /// A concurrent handle to one memory-mapped map or set.
 ///
 /// Cloned handles are intentionally not provided; share one `Database` by
@@ -117,6 +139,7 @@ pub struct Database {
     pub(crate) node_size: u64,
     pub(crate) heads: MappedFile,
     pub(crate) runtime_heads: Box<[AtomicU64]>,
+    pub(crate) delete_locks: Box<[AtomicU64]>,
     pub(crate) body: BlockAllocator,
     pub(crate) blobs: Option<BlockAllocator>,
     pub(crate) checkpoint_state: AtomicU64,
@@ -126,10 +149,11 @@ pub struct Database {
 
 /// An optimized batch writer for building a map without lookups.
 ///
-/// The writer hashes and validates the complete batch before allocating nodes,
-/// then publishes buckets in ascending order. Entries targeting one bucket are
-/// linked privately and exposed by one successful head CAS. Duplicate keys are
-/// retained; the last duplicate in a batch is encountered first by readers.
+/// The writer hashes and validates the complete batch, reserves fixed-width body
+/// nodes in block-sized chunks, then publishes buckets in ascending order.
+/// Entries targeting one bucket are linked privately and exposed by one
+/// successful head CAS. Duplicate keys are retained; the last duplicate in a
+/// batch is encountered first by readers.
 ///
 /// # Examples
 ///
@@ -180,8 +204,8 @@ impl Database {
         let heads = MappedFile::create(&path.join("heads"), heads_length, false, false)?;
         initialize_header(&heads, &config, node_size)?;
         heads.advise_heads()?;
-        heads.lock_pages(HEADS_START, bank_size(config.bucket_count)?)?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
+        let delete_locks = create_delete_locks(config.bucket_count)?;
         let body = BlockAllocator::create(
             &path.join("body"),
             &path.join("body.counts"),
@@ -203,6 +227,7 @@ impl Database {
             node_size,
             heads,
             runtime_heads,
+            delete_locks,
             body,
             blobs,
             checkpoint_state: AtomicU64::new(0),
@@ -520,6 +545,7 @@ impl Database {
         self.validate_key(key)?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
+        let _delete_guard = self.lock_delete_bucket(bucket)?;
         loop {
             let found = self.find(bucket, hash, key)?;
             let Some(target) = found.node else {
@@ -581,6 +607,7 @@ impl Database {
             while end < prepared.len() && prepared[end].bucket == bucket {
                 end += 1;
             }
+            let _delete_guard = self.lock_delete_bucket(bucket)?;
             self.delete_bucket_batch(bucket, &prepared[start..end], &mut deleted)?;
             start = end;
         }
@@ -803,14 +830,9 @@ impl Database {
             .try_reserve_exact(count)
             .map_err(|_| Error::OutOfMemory)?;
 
-        for entry in prepared {
-            match self.allocate_private_insert(entry.key, entry.value, entry.hash, entry.bucket) {
-                Ok(insert) => private.push(insert),
-                Err(error) => {
-                    self.release_private_batch(private)?;
-                    return Err(error);
-                }
-            }
+        if let Err(error) = self.allocate_private_inserts(&prepared, &mut private) {
+            self.release_private_batch(private)?;
+            return Err(error);
         }
 
         if let Err(error) = self.link_private_batch(&private) {
@@ -954,6 +976,7 @@ impl Database {
         prepared: &[PreparedKey<'_>],
         results: &mut [Option<Vec<u8>>],
     ) -> Result<()> {
+        let mut node_bytes = Vec::new();
         'restart: loop {
             for entry in prepared {
                 let result = results
@@ -966,7 +989,13 @@ impl Database {
             let root = self.link_atomic(link)?.load(Ordering::Acquire);
             let mut current = root;
             while current != 0 {
-                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
+                let node = read_node_into(
+                    &self.body,
+                    current,
+                    self.node_size,
+                    self.config.key_size,
+                    &mut node_bytes,
+                )?;
                 let observed_next = node.next;
                 if self.link_atomic(link)?.load(Ordering::Acquire) != current
                     || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
@@ -983,7 +1012,11 @@ impl Database {
                         .get_mut(entry.order)
                         .ok_or(Error::Corrupt("batch-fetch result index is out of range"))?;
                     if result.is_none() && entry.key == node.key {
-                        *result = Some(self.read_node_value(&node)?);
+                        *result = Some(self.read_node_value_fields(
+                            node.blob_offset,
+                            node.blob_length,
+                            node.blob_checksum,
+                        )?);
                         remaining = remaining
                             .checked_sub(1)
                             .ok_or(Error::Corrupt("batch-fetch match count underflow"))?;
@@ -1010,13 +1043,27 @@ impl Database {
         prepared: &[PreparedKey<'_>],
         deleted: &mut [bool],
     ) -> Result<()> {
+        let mut node_bytes = Vec::new();
         'restart: loop {
+            let mut remaining = prepared
+                .iter()
+                .filter(|entry| !deleted.get(entry.order).copied().unwrap_or(false))
+                .count();
+            if remaining == 0 {
+                return Ok(());
+            }
             let mut link = Link::Head(bucket);
             let head = self.head(bucket)?;
             let mut expected_head = head.load(Ordering::Acquire);
             let mut current = expected_head;
             while current != 0 {
-                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
+                let node = read_node_into(
+                    &self.body,
+                    current,
+                    self.node_size,
+                    self.config.key_size,
+                    &mut node_bytes,
+                )?;
                 let observed_next = node.next;
                 if self.link_atomic(link)?.load(Ordering::Acquire) != current
                     || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
@@ -1032,12 +1079,18 @@ impl Database {
                 });
                 if let Some(entry) = matching {
                     let removes_head = matches!(link, Link::Head(_));
-                    match self.unlink_link(link, &node) {
+                    match self.unlink_view(link, &node) {
                         Ok(()) => {
                             let result = deleted.get_mut(entry.order).ok_or(Error::Corrupt(
                                 "batch-delete result index is out of range",
                             ))?;
                             *result = true;
+                            remaining = remaining
+                                .checked_sub(1)
+                                .ok_or(Error::Corrupt("batch-delete match count underflow"))?;
+                            if remaining == 0 {
+                                return Ok(());
+                            }
                             if removes_head {
                                 expected_head = observed_next;
                             }
@@ -1058,33 +1111,126 @@ impl Database {
     }
 
     fn read_node_value(&self, node: &Node) -> Result<Vec<u8>> {
+        self.read_node_value_fields(node.blob_offset, node.blob_length, node.blob_checksum)
+    }
+
+    fn read_node_value_fields(
+        &self,
+        blob_offset: u64,
+        blob_length: u64,
+        expected_checksum: u64,
+    ) -> Result<Vec<u8>> {
         if self.config.inline_value_size != 0 {
-            if node.blob_length != self.config.inline_value_size as u64 {
+            if blob_length != self.config.inline_value_size as u64 {
                 return Err(Error::Corrupt("inline map value length does not match"));
             }
-            let value = inline_value_bytes(node.blob_offset, self.config.inline_value_size)?;
-            if node.blob_checksum != blob_checksum(&value) {
+            let value = inline_value_bytes(blob_offset, self.config.inline_value_size)?;
+            if expected_checksum != blob_checksum(&value) {
                 return Err(Error::Corrupt("inline map value checksum does not match"));
             }
             return Ok(value);
         }
-        if node.blob_length == 0 {
-            if node.blob_checksum != blob_checksum(&[]) {
+        if blob_length == 0 {
+            if expected_checksum != blob_checksum(&[]) {
                 return Err(Error::Corrupt("empty map value checksum does not match"));
             }
             return Ok(Vec::new());
         }
-        let length = usize::try_from(node.blob_length)
+        let length = usize::try_from(blob_length)
             .map_err(|_| Error::Corrupt("blob length does not fit memory"))?;
         let blobs = self
             .blobs
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        let value = blobs.read(node.blob_offset, length)?;
-        if node.blob_checksum != blob_checksum(&value) {
+        let value = blobs.read(blob_offset, length)?;
+        if expected_checksum != blob_checksum(&value) {
             return Err(Error::Corrupt("map value checksum does not match"));
         }
         Ok(value)
+    }
+
+    fn allocate_private_inserts(
+        &self,
+        prepared: &[PreparedInsert<'_>],
+        private: &mut Vec<PrivateInsert>,
+    ) -> Result<()> {
+        let node_size = usize::try_from(self.node_size)
+            .map_err(|_| Error::InvalidConfig("node size does not fit memory"))?;
+        let mut node_bytes = Vec::new();
+        node_bytes
+            .try_reserve_exact(node_size)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut start = 0;
+        while start < prepared.len() {
+            let reserved = self
+                .body
+                .allocate_batch(node_size, 8, prepared.len() - start)?;
+            let reserved_count = reserved.len();
+            let mut allocations = reserved.allocations();
+            for entry in &prepared[start..start + reserved_count] {
+                let allocation = allocations
+                    .next()
+                    .ok_or(Error::Corrupt("batch allocation ended early"))?;
+                match self.initialize_reserved_insert(entry, allocation, &mut node_bytes, node_size)
+                {
+                    Ok(insert) => private.push(insert),
+                    Err(error) => {
+                        self.body.release(allocation)?;
+                        for unused in allocations {
+                            self.body.release(unused)?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            start = start
+                .checked_add(reserved_count)
+                .ok_or(Error::CapacityExhausted("batch insertion index"))?;
+        }
+        Ok(())
+    }
+
+    fn initialize_reserved_insert(
+        &self,
+        entry: &PreparedInsert<'_>,
+        node: Allocation,
+        node_bytes: &mut Vec<u8>,
+        node_size: usize,
+    ) -> Result<PrivateInsert> {
+        let blob = self.allocate_blob(entry.value)?;
+        let blob_offset = if self.config.inline_value_size == 0 {
+            blob.map_or(0, |allocation| allocation.offset)
+        } else {
+            inline_value_word(
+                entry
+                    .value
+                    .ok_or(Error::Corrupt("inline map value is missing"))?,
+            )?
+        };
+        let blob_length = u64::try_from(entry.value.map_or(0, <[u8]>::len))
+            .map_err(|_| Error::CapacityExhausted("blob length"))?;
+        let value_checksum = entry.value.map_or(0, blob_checksum);
+        if let Err(error) = write_node(
+            &self.body,
+            node,
+            node_bytes,
+            node_size,
+            entry.key,
+            entry.hash,
+            blob_offset,
+            blob_length,
+            value_checksum,
+        ) {
+            if let Some(blob) = blob {
+                self.release_blob(blob)?;
+            }
+            return Err(error);
+        }
+        Ok(PrivateInsert {
+            node,
+            blob,
+            bucket: entry.bucket,
+        })
     }
 
     fn allocate_private_insert(
@@ -1156,6 +1302,23 @@ impl Database {
         Ok(())
     }
 
+    fn lock_delete_bucket(&self, bucket: u64) -> Result<BucketDeleteGuard<'_>> {
+        let bucket =
+            usize::try_from(bucket).map_err(|_| Error::Corrupt("bucket index overflow"))?;
+        let lock = self
+            .delete_locks
+            .get(bucket)
+            .ok_or(Error::Corrupt("delete-lock bucket is out of range"))?;
+        loop {
+            if lock
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(BucketDeleteGuard { lock });
+            }
+            std::hint::spin_loop();
+        }
+    }
     fn commit_private_group(group: &PrivateGroup<'_>) {
         let mut previous_next = group.tail_next.load(Ordering::Acquire);
         loop {
@@ -1222,6 +1385,7 @@ impl Database {
             blobs.validate_release(blob)?;
             blobs.release_count(blob)?;
         }
+        tombstone_node(&self.body, node.offset)?;
         self.body.release_count(node)
     }
 
@@ -1268,36 +1432,65 @@ impl Database {
     }
 
     fn unlink_link(&self, link: Link, target: &Node) -> Result<()> {
-        let (body_allocation, blob_allocation) = self.node_allocations(target)?;
+        self.unlink_node_fields(
+            link,
+            target.offset,
+            target.next,
+            target.blob_offset,
+            target.blob_length,
+        )
+    }
+
+    fn unlink_view(&self, link: Link, target: &NodeView<'_>) -> Result<()> {
+        self.unlink_node_fields(
+            link,
+            target.offset,
+            target.next,
+            target.blob_offset,
+            target.blob_length,
+        )
+    }
+
+    fn unlink_node_fields(
+        &self,
+        link: Link,
+        offset: u64,
+        next: u64,
+        blob_offset: u64,
+        blob_length: u64,
+    ) -> Result<()> {
+        let (body_allocation, blob_allocation) =
+            self.node_allocations(offset, blob_offset, blob_length)?;
         self.link_atomic(link)?
-            .compare_exchange(
-                target.offset,
-                target.next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(offset, next, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Busy("unique deletion link changed before unlink"))?;
+        tombstone_node(&self.body, offset)?;
         if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
             blobs.release_count(allocation)?;
         }
         self.body.release_count(body_allocation)
     }
 
-    fn node_allocations(&self, node: &Node) -> Result<(Allocation, Option<Allocation>)> {
-        let blob_allocation = if self.config.inline_value_size != 0 || node.blob_length == 0 {
+    fn node_allocations(
+        &self,
+        offset: u64,
+        blob_offset: u64,
+        blob_length: u64,
+    ) -> Result<(Allocation, Option<Allocation>)> {
+        let blob_allocation = if self.config.inline_value_size != 0 || blob_length == 0 {
             None
         } else {
-            let length = u32::try_from(node.blob_length)
+            let length = u32::try_from(blob_length)
                 .map_err(|_| Error::Corrupt("deleted blob length exceeds one block"))?;
             let blob = self
                 .blobs
                 .as_ref()
                 .ok_or(Error::Corrupt("deleted map node has no blob allocator"))?;
-            Some(blob.allocation_for(node.blob_offset, length)?)
+            Some(blob.allocation_for(blob_offset, length)?)
         };
         let node_length = u32::try_from(self.node_size)
             .map_err(|_| Error::Corrupt("deleted body node length overflow"))?;
-        let body_allocation = self.body.allocation_for(node.offset, node_length)?;
+        let body_allocation = self.body.allocation_for(offset, node_length)?;
 
         self.body.validate_release(body_allocation)?;
         if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
@@ -1415,6 +1608,19 @@ pub(crate) fn create_runtime_heads(
         runtime_heads.push(AtomicU64::new(value));
     }
     Ok(runtime_heads.into_boxed_slice())
+}
+
+pub(crate) fn create_delete_locks(bucket_count: u64) -> Result<Box<[AtomicU64]>> {
+    let count = usize::try_from(bucket_count)
+        .map_err(|_| Error::InvalidConfig("bucket count does not fit memory"))?;
+    let mut locks = Vec::new();
+    locks
+        .try_reserve_exact(count)
+        .map_err(|_| Error::OutOfMemory)?;
+    for _bucket in 0..count {
+        locks.push(AtomicU64::new(0));
+    }
+    Ok(locks.into_boxed_slice())
 }
 
 fn inline_value_word(value: &[u8]) -> Result<u64> {
@@ -1588,6 +1794,35 @@ mod tests {
         for key in 0_u64..512 {
             assert!(database.contains(&key.to_le_bytes())?);
         }
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_concurrent_deleters_per_bucket() -> Result<()> {
+        let path = test_directory("delete-concurrent-bucket");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
+        let keys: Vec<[u8; 8]> = (0_u64..512).map(u64::to_le_bytes).collect();
+        assert_eq!(
+            database.add_batch(keys.iter().map(<[u8; 8]>::as_slice))?,
+            keys.len()
+        );
+
+        std::thread::scope(|scope| {
+            for chunk in keys.chunks(64) {
+                let database_ref = &database;
+                scope.spawn(move || {
+                    let result = database_ref.batch_delete(chunk.iter().map(<[u8; 8]>::as_slice));
+                    assert!(matches!(result, Ok(deleted) if deleted.iter().all(|value| *value)));
+                });
+            }
+        });
+        for key in &keys {
+            assert!(!database.contains(key)?);
+        }
+
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())
@@ -1818,6 +2053,45 @@ mod tests {
         )?;
         assert_eq!(allocation.block, 0);
         assert_eq!(std::fs::metadata(path.join("body"))?.len(), grown_length);
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_delete_stops_after_last_match() -> Result<()> {
+        let path = test_directory("batch-delete-early-exit");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
+        let older = 1_u64.to_le_bytes();
+        let newest = 2_u64.to_le_bytes();
+        database.add(&older)?;
+        database.add(&newest)?;
+
+        let older_hash = xxh64(&older, database.config.hash_seed);
+        let older_node = database
+            .find(0, older_hash, &older)?
+            .node
+            .ok_or(Error::Corrupt("older test node is missing"))?;
+        let newest_hash = xxh64(&newest, database.config.hash_seed);
+        let newest_node = database
+            .find(0, newest_hash, &newest)?
+            .node
+            .ok_or(Error::Corrupt("newest test node is missing"))?;
+        database
+            .body
+            .atomic_u64(older_node.offset)?
+            .store(1, Ordering::Release);
+
+        assert_eq!(database.batch_delete([newest.as_slice()])?, vec![true]);
+        assert_eq!(
+            database
+                .body
+                .atomic_u64(newest_node.offset + crate::layout::NODE_MAGIC_OFFSET as u64)?
+                .load(Ordering::Acquire),
+            0
+        );
 
         drop(database);
         std::fs::remove_dir_all(path)?;

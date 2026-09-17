@@ -123,15 +123,6 @@ impl MappedFile {
         sys::advise_heads(self.pointer, self.mapping_length)
     }
 
-    pub(crate) fn lock_pages(&self, offset: u64, length: u64) -> Result<()> {
-        self.checked_range(offset, length)?;
-        let offset = usize::try_from(offset).map_err(|_| Error::Corrupt("lock offset overflow"))?;
-        let length = usize::try_from(length).map_err(|_| Error::Corrupt("lock length overflow"))?;
-        // SAFETY: checked_range proves the offset starts inside this stable mapping.
-        let pointer = unsafe { NonNull::new_unchecked(self.pointer.as_ptr().add(offset)) };
-        sys::lock(pointer, length)
-    }
-
     pub(crate) fn grow(&self, new_length: u64) -> Result<bool> {
         validate_mapping_length(new_length)?;
         let maximum = u64::try_from(self.mapping_length)
@@ -207,25 +198,30 @@ impl MappedFile {
     }
 
     pub(crate) fn copy_out(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
-        let length_u64 =
-            u64::try_from(length).map_err(|_| Error::Corrupt("read length overflow"))?;
-        self.checked_range(offset, length_u64)?;
         let mut output = Vec::new();
         output
             .try_reserve_exact(length)
             .map_err(|_| Error::OutOfMemory)?;
         output.resize(length, 0);
+        self.copy_out_into(offset, &mut output)?;
+        Ok(output)
+    }
+
+    pub(crate) fn copy_out_into(&self, offset: u64, output: &mut [u8]) -> Result<()> {
+        let length =
+            u64::try_from(output.len()).map_err(|_| Error::Corrupt("read length overflow"))?;
+        self.checked_range(offset, length)?;
         let offset = usize::try_from(offset).map_err(|_| Error::Corrupt("read offset overflow"))?;
-        // SAFETY: both ranges are valid for length bytes and cannot overlap because output is a
-        // separately allocated vector.
+        // SAFETY: both ranges are valid for output.len() bytes and cannot overlap because output
+        // is caller-owned memory outside this mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.pointer.as_ptr().add(offset),
                 output.as_mut_ptr(),
-                length,
+                output.len(),
             );
         }
-        Ok(output)
+        Ok(())
     }
 
     /// Copies bytes into a range exclusively owned by an unpublished allocation.
@@ -297,8 +293,6 @@ mod tests {
         let _ignored = std::fs::remove_file(&path);
         {
             let mapping = MappedFile::create(&path, PAGE_SIZE * 2, false, true)?;
-            mapping.lock_pages(0, PAGE_SIZE * 2)?;
-            assert!(mapping.lock_pages(PAGE_SIZE * 2, PAGE_SIZE).is_err());
             let atomic = mapping.atomic_u64(0)?;
             atomic
                 .compare_exchange(0, 42, Ordering::AcqRel, Ordering::Acquire)

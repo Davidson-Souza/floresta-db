@@ -26,6 +26,23 @@ pub(crate) struct Node {
     pub(crate) key: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub(crate) struct NodeView<'node> {
+    pub(crate) offset: u64,
+
+    pub(crate) next: u64,
+
+    pub(crate) hash: u64,
+
+    pub(crate) blob_offset: u64,
+
+    pub(crate) blob_length: u64,
+
+    pub(crate) blob_checksum: u64,
+
+    pub(crate) key: &'node [u8],
+}
+
 pub(crate) fn allocate_node(
     body: &BlockAllocator,
     node_size: u64,
@@ -38,24 +55,15 @@ pub(crate) fn allocate_node(
     let node_size_usize = usize::try_from(node_size)
         .map_err(|_| Error::InvalidConfig("node size does not fit memory"))?;
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(node_size_usize)
-        .map_err(|_| Error::OutOfMemory)?;
-    bytes.resize(node_size_usize, 0);
-    write_u64(&mut bytes, NODE_HASH_OFFSET, hash)?;
-    write_u64(&mut bytes, NODE_BLOB_OFFSET, blob_offset)?;
-    write_u64(&mut bytes, NODE_BLOB_LENGTH_OFFSET, blob_length)?;
-    write_u64(&mut bytes, NODE_MAGIC_OFFSET, NODE_MAGIC)?;
-    write_u64(&mut bytes, NODE_BLOB_CHECKSUM_OFFSET, blob_checksum)?;
-    let key_end = NODE_KEY_OFFSET
-        .checked_add(key.len())
-        .ok_or(Error::InvalidConfig("node key range overflow"))?;
-    let key_destination = bytes
-        .get_mut(NODE_KEY_OFFSET..key_end)
-        .ok_or(Error::InvalidConfig("key does not fit body node"))?;
-    key_destination.copy_from_slice(key);
-    let checksum = node_checksum(hash, blob_offset, blob_length, blob_checksum, key);
-    write_u64(&mut bytes, NODE_CHECKSUM_OFFSET, checksum)?;
+    serialize_node(
+        &mut bytes,
+        node_size_usize,
+        key,
+        hash,
+        blob_offset,
+        blob_length,
+        blob_checksum,
+    )?;
     let allocation = body.allocate(node_size_usize, 8)?;
     if let Err(error) = body.write(allocation, &bytes) {
         let _released = body.release(allocation);
@@ -64,12 +72,91 @@ pub(crate) fn allocate_node(
     Ok(allocation)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_node(
+    body: &BlockAllocator,
+    allocation: Allocation,
+    bytes: &mut Vec<u8>,
+    node_size: usize,
+    key: &[u8],
+    hash: u64,
+    blob_offset: u64,
+    blob_length: u64,
+    blob_checksum: u64,
+) -> Result<()> {
+    serialize_node(
+        bytes,
+        node_size,
+        key,
+        hash,
+        blob_offset,
+        blob_length,
+        blob_checksum,
+    )?;
+    body.write(allocation, bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_node(
+    bytes: &mut Vec<u8>,
+    node_size: usize,
+    key: &[u8],
+    hash: u64,
+    blob_offset: u64,
+    blob_length: u64,
+    blob_checksum: u64,
+) -> Result<()> {
+    bytes.clear();
+    bytes
+        .try_reserve(node_size.saturating_sub(bytes.capacity()))
+        .map_err(|_| Error::OutOfMemory)?;
+    bytes.resize(node_size, 0);
+    write_u64(bytes, NODE_HASH_OFFSET, hash)?;
+    write_u64(bytes, NODE_BLOB_OFFSET, blob_offset)?;
+    write_u64(bytes, NODE_BLOB_LENGTH_OFFSET, blob_length)?;
+    write_u64(bytes, NODE_MAGIC_OFFSET, NODE_MAGIC)?;
+    write_u64(bytes, NODE_BLOB_CHECKSUM_OFFSET, blob_checksum)?;
+    let key_end = NODE_KEY_OFFSET
+        .checked_add(key.len())
+        .ok_or(Error::InvalidConfig("node key range overflow"))?;
+    let key_destination = bytes
+        .get_mut(NODE_KEY_OFFSET..key_end)
+        .ok_or(Error::InvalidConfig("key does not fit body node"))?;
+    key_destination.copy_from_slice(key);
+    let checksum = node_checksum(hash, blob_offset, blob_length, blob_checksum, key);
+    write_u64(bytes, NODE_CHECKSUM_OFFSET, checksum)
+}
+
 pub(crate) fn read_node(
     body: &BlockAllocator,
     offset: u64,
     node_size: u64,
     key_size: usize,
 ) -> Result<Node> {
+    let mut bytes = Vec::new();
+    let node = read_node_into(body, offset, node_size, key_size, &mut bytes)?;
+    let mut key = Vec::new();
+    key.try_reserve_exact(key_size)
+        .map_err(|_| Error::OutOfMemory)?;
+    key.extend_from_slice(node.key);
+    Ok(Node {
+        offset: node.offset,
+        next: node.next,
+        hash: node.hash,
+        blob_offset: node.blob_offset,
+        blob_length: node.blob_length,
+        blob_checksum: node.blob_checksum,
+        key,
+    })
+}
+
+pub(crate) fn read_node_into<'node>(
+    body: &BlockAllocator,
+    offset: u64,
+    node_size: u64,
+    key_size: usize,
+    bytes: &'node mut Vec<u8>,
+) -> Result<NodeView<'node>> {
     if offset == 0 {
         return Err(Error::Corrupt("body node offset is null"));
     }
@@ -84,32 +171,33 @@ pub(crate) fn read_node(
         .ok_or(Error::Corrupt("body node is too small"))?;
     let static_length = usize::try_from(static_length)
         .map_err(|_| Error::Corrupt("body node size does not fit memory"))?;
-    let bytes = body.read(static_offset, static_length)?;
-    let hash = read_static_u64(&bytes, NODE_HASH_OFFSET)?;
-    let blob_offset = read_static_u64(&bytes, NODE_BLOB_OFFSET)?;
-    let blob_length = read_static_u64(&bytes, NODE_BLOB_LENGTH_OFFSET)?;
-    let blob_checksum = read_static_u64(&bytes, NODE_BLOB_CHECKSUM_OFFSET)?;
-    if read_static_u64(&bytes, NODE_MAGIC_OFFSET)? != NODE_MAGIC {
+    bytes.clear();
+    bytes
+        .try_reserve(static_length.saturating_sub(bytes.capacity()))
+        .map_err(|_| Error::OutOfMemory)?;
+    bytes.resize(static_length, 0);
+    body.read_into(static_offset, bytes)?;
+    let hash = read_static_u64(bytes, NODE_HASH_OFFSET)?;
+    let blob_offset = read_static_u64(bytes, NODE_BLOB_OFFSET)?;
+    let blob_length = read_static_u64(bytes, NODE_BLOB_LENGTH_OFFSET)?;
+    let blob_checksum = read_static_u64(bytes, NODE_BLOB_CHECKSUM_OFFSET)?;
+    if read_static_u64(bytes, NODE_MAGIC_OFFSET)? != NODE_MAGIC {
         return Err(Error::Corrupt("body node magic does not match"));
     }
-    let checksum = read_static_u64(&bytes, NODE_CHECKSUM_OFFSET)?;
+    let checksum = read_static_u64(bytes, NODE_CHECKSUM_OFFSET)?;
     let key_start = NODE_KEY_OFFSET
         .checked_sub(size_of::<u64>())
         .ok_or(Error::Corrupt("node key offset underflow"))?;
     let key_end = key_start
         .checked_add(key_size)
         .ok_or(Error::Corrupt("node key range overflow"))?;
-    let key_source = bytes
+    let key = bytes
         .get(key_start..key_end)
         .ok_or(Error::Corrupt("node key is out of bounds"))?;
-    let mut key = Vec::new();
-    key.try_reserve_exact(key_size)
-        .map_err(|_| Error::OutOfMemory)?;
-    key.extend_from_slice(key_source);
-    if checksum != node_checksum(hash, blob_offset, blob_length, blob_checksum, &key) {
+    if checksum != node_checksum(hash, blob_offset, blob_length, blob_checksum, key) {
         return Err(Error::Corrupt("body node checksum does not match"));
     }
-    Ok(Node {
+    Ok(NodeView {
         offset,
         next,
         hash,
@@ -118,6 +206,12 @@ pub(crate) fn read_node(
         blob_checksum,
         key,
     })
+}
+
+pub(crate) fn tombstone_node(body: &BlockAllocator, offset: u64) -> Result<()> {
+    body.atomic_u64(offset + NODE_MAGIC_OFFSET as u64)?
+        .store(0, Ordering::Release);
+    Ok(())
 }
 
 pub(crate) fn set_private_next(body: &BlockAllocator, node: u64, old: u64, new: u64) -> Result<()> {

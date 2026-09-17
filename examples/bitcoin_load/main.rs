@@ -6,9 +6,11 @@
 //! block ranges independently; remover ranges wait on a condition variable until
 //! every adder has published progress beyond the block being spent.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::error::Error as StdError;
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -22,17 +24,32 @@ use bitcoin::{Block, OutPoint, TxOut};
 use bitcoinkernel::{ChainType, ChainstateManager, ContextBuilder};
 use floresta_db::{Config, Database, Error, Mode};
 use hintsfile::{EliasFano, HintsfileBuilder};
+use memmap2::MmapOptions;
 
 const OUTPOINT_KEY_SIZE: usize = 12;
-const OUTPUT_INDEX_SIZE: usize = 4;
+const OUTPUT_INDEX_SIZE: usize = size_of::<u64>();
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const DEFAULT_BUCKETS: u64 = 1 << 20;
 const DEFAULT_CAPACITY_GIB: u64 = 64;
 const DEFAULT_BLOCK_MIB: u64 = 1;
 const DEFAULT_RANGE_SIZE: u64 = 32;
 const HINTS_PROGRESS_INTERVAL: u64 = 10_000;
+const MAX_ADDER_LEAD_BLOCKS: u64 = 4096;
 const UNPROCESSED_COUNT: u32 = u32::MAX;
 const BIP30_UNSPENDABLE_HEIGHTS: [u64; 2] = [91_722, 91_812];
+const BODY_DATA_START: usize = 4_096;
+const BODY_NODE_FIXED_SIZE: usize = 56;
+const BODY_NODE_ALIGNMENT: usize = 8;
+const BODY_BLOB_OFFSET: usize = 16;
+const BODY_BLOB_LENGTH_OFFSET: usize = 24;
+const BODY_MAGIC_OFFSET: usize = 32;
+const BODY_BLOB_CHECKSUM_OFFSET: usize = 48;
+const BODY_NODE_MAGIC: u64 = 0x4341_534e_4f44_4531;
+#[cfg(not(test))]
+const SORT_RUN_VALUE_CAPACITY: usize = 1 << 20;
+#[cfg(test)]
+const SORT_RUN_VALUE_CAPACITY: usize = 4;
+const SORT_PROGRESS_INTERVAL: u64 = 10_000_000;
 
 // Kernel and hintsfile errors are both Send + Sync, so worker failures can cross scoped threads.
 type AnyError = Box<dyn StdError + Send + Sync>;
@@ -83,11 +100,13 @@ fn run() -> AnyResult<()> {
     let block_slots = block_count_slots(end_height)?;
 
     let index_path = arguments.work_dir.join("index");
-    let database = Database::create(&index_path, database_config(&arguments, tip_height)?)?;
+    let index_config = database_config(&arguments, tip_height)?;
+    let database = Database::create(&index_path, index_config.clone())?;
     let live_outputs = AtomicU64::new(0);
     let add_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
     let remove_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
-    let progress = AdderProgress::new(arguments.add_threads, end_height)?;
+    let progress =
+        WorkerProgress::new(arguments.add_threads, arguments.remove_threads, end_height)?;
 
     log_progress(format_args!(
         "stage=index event=start tip={} add_threads={} remove_threads={} range_size={} network={:?} work_dir={}",
@@ -186,20 +205,25 @@ fn run() -> AnyResult<()> {
 
     let counts = collect_output_counts(&block_slots)?;
     let offsets = fold_output_counts(&counts)?;
+    let live = live_outputs.load(Ordering::Acquire);
+    database.close()?;
+
+    let sort_workers = arguments
+        .add_threads
+        .checked_add(arguments.remove_threads)
+        .ok_or_else(|| invalid_input("offline sort worker count overflow"))?;
     let hints_path = arguments.work_dir.join("swiftsync.hints");
     let hints_started = Instant::now();
     let hints = write_hintsfile(
-        &chainman,
-        &database,
+        &index_path,
+        &index_config,
+        sort_workers,
         tip_height,
-        arguments.network,
         &counts,
         &offsets,
         &hints_path,
     )?;
     let hints_elapsed = hints_started.elapsed();
-
-    let live = live_outputs.load(Ordering::Acquire);
     if live != hints.unspent_outputs {
         return Err(io::Error::other(format!(
             "live output count mismatch: database={live}, hints={}",
@@ -208,7 +232,6 @@ fn run() -> AnyResult<()> {
         .into());
     }
 
-    database.close()?;
     let elapsed = started.elapsed();
     let storage = storage_stats(&arguments.work_dir)?;
     print_report(
@@ -229,7 +252,7 @@ fn add_worker(
     chainman: &ChainstateManager,
     database: &Database,
     ranges: &RangeAllocator,
-    progress: &AdderProgress,
+    progress: &WorkerProgress,
     block_counts: &[AtomicU32],
     live_outputs: &AtomicU64,
 ) -> AnyResult<WorkerStats> {
@@ -238,11 +261,19 @@ fn add_worker(
         progress.check_abort()?;
         let range_start = range.start;
         let range_end = range.end;
+        progress.publish_adder(worker, range_start)?;
         log_progress(format_args!(
             "stage=add event=range_claim worker={worker} start={range_start} end={}",
             range_end.saturating_sub(1)
         ));
         for height in range {
+            if !progress.adder_can_process(height, MAX_ADDER_LEAD_BLOCKS) {
+                log_progress(format_args!(
+                    "stage=add event=wait worker={worker} next_height={height} remover_frontier={}",
+                    progress.minimum_remover()
+                ));
+            }
+            progress.wait_for_remover_window(height, MAX_ADDER_LEAD_BLOCKS)?;
             progress.check_abort()?;
             let read_started = Instant::now();
             let (block, bytes) = read_block(chainman, height)?;
@@ -284,7 +315,7 @@ fn add_worker(
             let completed = height
                 .checked_add(1)
                 .ok_or_else(|| invalid_input("adder progress overflow"))?;
-            progress.publish(worker, completed)?;
+            progress.publish_adder(worker, completed)?;
         }
         log_progress(format_args!(
             "stage=add event=range_complete worker={worker} start={range_start} end={} completed_blocks={}",
@@ -292,7 +323,7 @@ fn add_worker(
             stats.blocks
         ));
     }
-    progress.finish(worker)?;
+    progress.finish_adder(worker)?;
     log_progress(format_args!(
         "stage=add event=tip worker={worker} completed_blocks={}",
         stats.blocks
@@ -305,43 +336,63 @@ fn remove_worker(
     chainman: &ChainstateManager,
     database: &Database,
     ranges: &RangeAllocator,
-    progress: &AdderProgress,
+    progress: &WorkerProgress,
     live_outputs: &AtomicU64,
 ) -> AnyResult<WorkerStats> {
     let mut stats = WorkerStats::default();
+    let mut keys = Vec::new();
+    let mut input_ranges = Vec::new();
     loop {
         progress.check_abort()?;
-        let safe_height = progress.minimum();
+        let safe_height = progress.minimum_adder();
         if let Some(range) = ranges.claim_up_to(safe_height) {
             let range_start = range.start;
             let range_end = range.end;
+            progress.publish_remover(worker, range_start)?;
             log_progress(format_args!(
                 "stage=remove event=range_claim worker={worker} start={range_start} end={} safe_height={safe_height}",
                 range_end.saturating_sub(1)
             ));
+
+            keys.clear();
+            input_ranges.clear();
             for height in range {
                 let read_started = Instant::now();
                 let (block, bytes) = read_block(chainman, height)?;
                 stats.block_read += read_started.elapsed();
                 stats.bytes = stats.bytes.saturating_add(bytes);
 
-                let delete_started = Instant::now();
-                let keys = spent_outpoint_keys(&block)?;
-                let deleted =
-                    database.batch_delete(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
-                if let Some(missing) = deleted.iter().position(|deleted| !deleted) {
-                    return Err(io::Error::other(format!(
-                        "missing spent outpoint at height {height}, input {missing}"
-                    ))
-                    .into());
-                }
-                let count = u64::try_from(deleted.len())
-                    .map_err(|_| invalid_input("deleted input count does not fit u64"))?;
-                cas_sub(live_outputs, count)?;
-                stats.database += delete_started.elapsed();
+                let prepare_started = Instant::now();
+                let input_start = keys.len();
+                append_spent_outpoint_keys(&block, &mut keys)?;
+                input_ranges.push((height, input_start, keys.len()));
+                stats.database += prepare_started.elapsed();
                 stats.blocks = stats.blocks.saturating_add(1);
-                stats.inputs = stats.inputs.saturating_add(count);
             }
+
+            let delete_started = Instant::now();
+            let deleted =
+                database.batch_delete(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
+            if let Some(missing) = deleted.iter().position(|deleted| !deleted) {
+                let Some((height, input_start, _input_end)) =
+                    input_ranges.iter().find(|(_, input_start, input_end)| {
+                        (*input_start..*input_end).contains(&missing)
+                    })
+                else {
+                    return Err(Error::Corrupt("missing input index is outside its range").into());
+                };
+                return Err(io::Error::other(format!(
+                    "missing spent outpoint at height {height}, input {}",
+                    missing - input_start
+                ))
+                .into());
+            }
+            let count = u64::try_from(deleted.len())
+                .map_err(|_| invalid_input("deleted input count does not fit u64"))?;
+            cas_sub(live_outputs, count)?;
+            stats.database += delete_started.elapsed();
+            stats.inputs = stats.inputs.saturating_add(count);
+            progress.publish_remover(worker, range_end)?;
             log_progress(format_args!(
                 "stage=remove event=range_complete worker={worker} start={range_start} end={} completed_blocks={}",
                 range_end.saturating_sub(1),
@@ -354,19 +405,19 @@ fn remove_worker(
         }
 
         let next = ranges.next_height();
-        let required = next
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("remover progress overflow"))?;
-        if progress.minimum() < required {
+        progress.publish_remover(worker, next)?;
+        let required = ranges.next_range_end();
+        if progress.minimum_adder() < required {
             log_progress(format_args!(
                 "stage=remove event=wait worker={worker} next_height={next} safe_height={}",
-                progress.minimum()
+                progress.minimum_adder()
             ));
-            progress.wait_until(required)?;
+            progress.wait_for_additions(required)?;
         } else {
             std::hint::spin_loop();
         }
     }
+    progress.finish_remover(worker)?;
     log_progress(format_args!(
         "stage=remove event=tip worker={worker} completed_blocks={}",
         stats.blocks
@@ -429,6 +480,8 @@ fn append_eligible_outputs(
     eligible_index: &mut u32,
     indexed: &mut Vec<IndexedOutput>,
 ) -> AnyResult<()> {
+    let block_height =
+        u32::try_from(height).map_err(|_| invalid_input("block height exceeds u32"))?;
     for (vout, output) in outputs.iter().enumerate() {
         if !should_index_output(network, height, transaction_index, output) {
             continue;
@@ -439,7 +492,7 @@ fn append_eligible_outputs(
         indexed.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         indexed.push(IndexedOutput {
             key: outpoint_key(outpoint),
-            value: eligible_index.to_le_bytes(),
+            value: pack_output_position(block_height, *eligible_index).to_le_bytes(),
         });
         *eligible_index = eligible_index
             .checked_add(1)
@@ -448,8 +501,11 @@ fn append_eligible_outputs(
     Ok(())
 }
 
-fn spent_outpoint_keys(block: &Block) -> AnyResult<Vec<[u8; OUTPOINT_KEY_SIZE]>> {
-    let input_capacity = block
+fn append_spent_outpoint_keys(
+    block: &Block,
+    keys: &mut Vec<[u8; OUTPOINT_KEY_SIZE]>,
+) -> AnyResult<()> {
+    let input_count = block
         .txdata
         .iter()
         .try_fold(0_usize, |total, transaction| {
@@ -461,8 +517,7 @@ fn spent_outpoint_keys(block: &Block) -> AnyResult<Vec<[u8; OUTPOINT_KEY_SIZE]>>
                     .ok_or_else(|| invalid_input("block input count overflow"))
             }
         })?;
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(input_capacity)
+    keys.try_reserve(input_count)
         .map_err(|_| Error::OutOfMemory)?;
     for transaction in &block.txdata {
         if transaction.is_coinbase() {
@@ -472,7 +527,7 @@ fn spent_outpoint_keys(block: &Block) -> AnyResult<Vec<[u8; OUTPOINT_KEY_SIZE]>>
             keys.push(outpoint_key(input.previous_output));
         }
     }
-    Ok(keys)
+    Ok(())
 }
 
 fn should_index_output(
@@ -495,6 +550,27 @@ fn outpoint_key(outpoint: OutPoint) -> [u8; OUTPOINT_KEY_SIZE] {
     key[..8].copy_from_slice(&txid[..8]);
     key[8..].copy_from_slice(&outpoint.vout.to_le_bytes());
     key
+}
+
+fn pack_output_position(block_height: u32, block_index: u32) -> u64 {
+    u64::from(block_height) << 32 | u64::from(block_index)
+}
+
+fn unpack_output_position(position: u64) -> (u32, u32) {
+    let [
+        index_0,
+        index_1,
+        index_2,
+        index_3,
+        height_0,
+        height_1,
+        height_2,
+        height_3,
+    ] = position.to_le_bytes();
+    (
+        u32::from_le_bytes([height_0, height_1, height_2, height_3]),
+        u32::from_le_bytes([index_0, index_1, index_2, index_3]),
+    )
 }
 
 fn collect_output_counts(slots: &[AtomicU32]) -> AnyResult<Vec<u32>> {
@@ -536,10 +612,10 @@ fn fold_output_counts(counts: &[u32]) -> AnyResult<Vec<u64>> {
 }
 
 fn write_hintsfile(
-    chainman: &ChainstateManager,
-    database: &Database,
+    index_path: &Path,
+    config: &Config,
+    sort_workers: usize,
     tip_height: u64,
-    network: ChainType,
     counts: &[u32],
     offsets: &[u64],
     path: &Path,
@@ -548,90 +624,29 @@ fn write_hintsfile(
         .last()
         .copied()
         .ok_or_else(|| invalid_input("block offsets are empty"))?;
-    let total_usize = usize::try_from(total)
-        .map_err(|_| invalid_input("global output count does not fit memory"))?;
-    let mut live = Vec::<bool>::new();
-    live.try_reserve_exact(total_usize)
-        .map_err(|_| Error::OutOfMemory)?;
-    live.resize(total_usize, false);
-    let mut unspent_outputs = 0_u64;
+    let body_path = index_path.join("body");
     log_progress(format_args!(
-        "stage=hints event=scan_start tip={tip_height} eligible_outputs={total}"
+        "stage=hints event=sort_start workers={sort_workers} eligible_outputs={total} body={}",
+        body_path.display()
     ));
-
-    for height in 0..=tip_height {
-        if height == 0 || height == tip_height || height % HINTS_PROGRESS_INTERVAL == 0 {
-            log_progress(format_args!(
-                "stage=hints event=scan_progress height={height} tip={tip_height}"
-            ));
-        }
-        let (block, _bytes) = read_block(chainman, height)?;
-        let outputs = indexed_outputs(&block, height, network)?;
-        let height_index =
-            usize::try_from(height).map_err(|_| invalid_input("height does not fit memory"))?;
-        let expected = counts
-            .get(height_index)
-            .copied()
-            .ok_or_else(|| invalid_input("eligible output count is unavailable"))?;
-        if outputs.len()
-            != usize::try_from(expected)
-                .map_err(|_| invalid_input("eligible output count does not fit usize"))?
-        {
-            return Err(io::Error::other(format!(
-                "eligible output recount mismatch at height {height}"
-            ))
-            .into());
-        }
-        let values = database.batch_fetch(outputs.iter().map(|output| output.key.as_slice()))?;
-        let block_offset = offsets
-            .get(height_index)
-            .copied()
-            .ok_or_else(|| invalid_input("block offset is unavailable"))?;
-        let block_end = offsets
-            .get(height_index + 1)
-            .copied()
-            .ok_or_else(|| invalid_input("next block offset is unavailable"))?;
-        for (output, value) in outputs.iter().zip(values) {
-            let Some(value) = value else {
-                continue;
-            };
-            let index = decode_output_index(&value)?;
-            if index.to_le_bytes() != output.value {
-                return Err(io::Error::other(format!(
-                    "truncated outpoint collision at height {height}"
-                ))
-                .into());
-            }
-            let global = block_offset
-                .checked_add(u64::from(index))
-                .ok_or_else(|| invalid_input("global output index overflow"))?;
-            if global >= block_end {
-                return Err(io::Error::other("output index exceeds its block range").into());
-            }
-            let bit = live
-                .get_mut(
-                    usize::try_from(global)
-                        .map_err(|_| invalid_input("global output index does not fit usize"))?,
-                )
-                .ok_or_else(|| invalid_input("global output index is out of range"))?;
-            if *bit {
-                return Err(io::Error::other("duplicate global output hint").into());
-            }
-            *bit = true;
-            unspent_outputs = unspent_outputs
-                .checked_add(1)
-                .ok_or_else(|| invalid_input("unspent output count overflow"))?;
-        }
-    }
+    let unspent_outputs =
+        destructive_sort_body_values(&body_path, config.block_size, sort_workers)?;
     log_progress(format_args!(
-        "stage=hints event=scan_complete unspent_outputs={unspent_outputs}"
+        "stage=hints event=sort_complete unspent_outputs={unspent_outputs} body_bytes={}",
+        std::fs::metadata(&body_path)?.len()
     ));
 
     log_progress(format_args!(
         "stage=hints event=encode_start path={}",
         path.display()
     ));
-    encode_hintsfile(path, tip_height, offsets, &live)?;
+    let encoded_outputs = encode_sorted_hintsfile(path, &body_path, tip_height, counts, offsets)?;
+    if encoded_outputs != unspent_outputs {
+        return Err(io::Error::other(format!(
+            "sorted output count mismatch: sort={unspent_outputs}, encoded={encoded_outputs}"
+        ))
+        .into());
+    }
     log_progress(format_args!(
         "stage=hints event=complete path={} bytes={}",
         path.display(),
@@ -645,12 +660,300 @@ fn write_hintsfile(
     })
 }
 
-fn encode_hintsfile(path: &Path, tip_height: u64, offsets: &[u64], live: &[bool]) -> AnyResult<()> {
+fn destructive_sort_body_values(
+    body_path: &Path,
+    block_size: u64,
+    workers: usize,
+) -> AnyResult<u64> {
+    if workers == 0 {
+        return Err(invalid_input("offline sort requires at least one worker").into());
+    }
+    let block_size = usize::try_from(block_size)
+        .map_err(|_| invalid_input("database block size does not fit memory"))?;
+    let node_size = align_usize(
+        BODY_NODE_FIXED_SIZE
+            .checked_add(OUTPOINT_KEY_SIZE)
+            .ok_or_else(|| invalid_input("body node size overflow"))?,
+        BODY_NODE_ALIGNMENT,
+    )
+    .ok_or_else(|| invalid_input("body node alignment overflow"))?;
+    let body_file = File::open(body_path)?;
+    // SAFETY: indexing is complete, Database::close has unmapped the file, and this mapping is
+    // read-only. Scoped scan workers cannot outlive `mapping`.
+    let mapping = unsafe { MmapOptions::new().map(&body_file)? };
+    let data_length = mapping
+        .len()
+        .checked_sub(BODY_DATA_START)
+        .ok_or_else(|| io::Error::other("body file is shorter than its header"))?;
+    if data_length % block_size != 0 {
+        return Err(io::Error::other("body file has a partial allocation block").into());
+    }
+    let block_count = data_length / block_size;
+    let active_workers = workers.min(block_count.max(1));
+    let blocks_per_worker = block_count.div_ceil(active_workers);
+    let run_directory = body_path
+        .parent()
+        .ok_or_else(|| invalid_input("body file has no parent directory"))?;
+
+    let runs = std::thread::scope(|scope| -> AnyResult<Vec<SortRun>> {
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(active_workers)
+            .map_err(|_| Error::OutOfMemory)?;
+        for worker in 0..active_workers {
+            let start_block = worker.saturating_mul(blocks_per_worker);
+            let end_block = start_block
+                .saturating_add(blocks_per_worker)
+                .min(block_count);
+            let mapping_ref = &mapping;
+            handles.push(scope.spawn(move || {
+                scan_body_runs(
+                    mapping_ref,
+                    run_directory,
+                    block_size,
+                    node_size,
+                    worker,
+                    start_block,
+                    end_block,
+                )
+            }));
+        }
+
+        let mut runs = Vec::new();
+        for handle in handles {
+            let worker_runs = handle
+                .join()
+                .map_err(|_| io::Error::other("offline sort worker panicked"))??;
+            runs.try_reserve(worker_runs.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            runs.extend(worker_runs);
+        }
+        Ok(runs)
+    })?;
+    drop(mapping);
+    drop(body_file);
+
+    let mut live_values = 0_u64;
+    for run in &runs {
+        live_values = live_values
+            .checked_add(run.values)
+            .ok_or_else(|| invalid_input("live output count overflow"))?;
+    }
+    merge_sort_runs(body_path, &runs, live_values)?;
+    Ok(live_values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_body_runs(
+    mapping: &[u8],
+    run_directory: &Path,
+    block_size: usize,
+    node_size: usize,
+    worker: usize,
+    start_block: usize,
+    end_block: usize,
+) -> AnyResult<Vec<SortRun>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(SORT_RUN_VALUE_CAPACITY)
+        .map_err(|_| Error::OutOfMemory)?;
+    let mut runs = Vec::new();
+    let mut run_index = 0_usize;
+
+    for block in start_block..end_block {
+        let block_start = BODY_DATA_START
+            .checked_add(
+                block
+                    .checked_mul(block_size)
+                    .ok_or_else(|| io::Error::other("body block offset overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("body block offset overflow"))?;
+        let mut relative = 0_usize;
+        while relative
+            .checked_add(node_size)
+            .is_some_and(|end| end <= block_size)
+        {
+            let offset = block_start
+                .checked_add(relative)
+                .ok_or_else(|| io::Error::other("body node offset overflow"))?;
+            let end = offset
+                .checked_add(node_size)
+                .ok_or_else(|| io::Error::other("body node range overflow"))?;
+            let slot = mapping
+                .get(offset..end)
+                .ok_or_else(|| io::Error::other("body node is outside its mapping"))?;
+            let magic = read_body_u64(slot, BODY_MAGIC_OFFSET)?;
+            if magic == 0 {
+                relative = relative
+                    .checked_add(node_size)
+                    .ok_or_else(|| io::Error::other("body node stride overflow"))?;
+                continue;
+            }
+            if magic != BODY_NODE_MAGIC {
+                return Err(io::Error::other(format!(
+                    "invalid body node magic at offset {offset}"
+                ))
+                .into());
+            }
+            let value_length = read_body_u64(slot, BODY_BLOB_LENGTH_OFFSET)?;
+            if value_length != OUTPUT_INDEX_SIZE as u64 {
+                return Err(io::Error::other(format!(
+                    "invalid inline value length at body offset {offset}"
+                ))
+                .into());
+            }
+            let value = read_body_u64(slot, BODY_BLOB_OFFSET)?;
+            let expected_checksum = read_body_u64(slot, BODY_BLOB_CHECKSUM_OFFSET)?;
+            if floresta_db::xxh64(&value.to_le_bytes(), BODY_NODE_MAGIC) != expected_checksum {
+                return Err(io::Error::other(format!(
+                    "inline value checksum mismatch at body offset {offset}"
+                ))
+                .into());
+            }
+            values.push(value);
+            if values.len() == SORT_RUN_VALUE_CAPACITY {
+                runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                runs.push(write_sort_run(
+                    run_directory,
+                    worker,
+                    run_index,
+                    &mut values,
+                )?);
+                run_index = run_index
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_input("sort run index overflow"))?;
+            }
+            relative = relative
+                .checked_add(node_size)
+                .ok_or_else(|| io::Error::other("body node stride overflow"))?;
+        }
+    }
+    if !values.is_empty() {
+        runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        runs.push(write_sort_run(
+            run_directory,
+            worker,
+            run_index,
+            &mut values,
+        )?);
+    }
+    Ok(runs)
+}
+
+fn write_sort_run(
+    directory: &Path,
+    worker: usize,
+    run_index: usize,
+    values: &mut Vec<u64>,
+) -> AnyResult<SortRun> {
+    values.sort_unstable();
+    let path = directory.join(format!(".hints-sort-{worker:04}-{run_index:06}.run"));
+    let result = (|| -> AnyResult<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let mut writer = BufWriter::new(file);
+        for value in values.iter().copied() {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _removed = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    let count = u64::try_from(values.len())
+        .map_err(|_| invalid_input("sort run value count does not fit u64"))?;
+    values.clear();
+    log_progress(format_args!(
+        "stage=hints event=sort_run worker={worker} run={run_index} values={count}"
+    ));
+    Ok(SortRun {
+        path,
+        values: count,
+    })
+}
+
+fn merge_sort_runs(body_path: &Path, runs: &[SortRun], expected_values: u64) -> AnyResult<()> {
+    let output_path = body_path.with_extension("sorted");
+    let mut output = TemporarySortOutput::create(output_path)?;
+    let mut readers = Vec::new();
+    readers
+        .try_reserve_exact(runs.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    for run in runs {
+        readers.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        readers.push(ValueReader::open_run(run)?);
+    }
+
+    let mut heap = BinaryHeap::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(value) = reader.next_value()? {
+            heap.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+            heap.push(Reverse((value, index)));
+        }
+    }
+
+    let file = output
+        .file
+        .take()
+        .ok_or_else(|| io::Error::other("sorted body output file is unavailable"))?;
+    let mut writer = BufWriter::new(file);
+    let mut written = 0_u64;
+    let mut next_progress = SORT_PROGRESS_INTERVAL;
+    while let Some(Reverse((value, reader_index))) = heap.pop() {
+        writer.write_all(&value.to_le_bytes())?;
+        written = written
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("merged output count overflow"))?;
+        if written >= next_progress {
+            log_progress(format_args!(
+                "stage=hints event=sort_merge values={written} total={expected_values}"
+            ));
+            next_progress = next_progress.saturating_add(SORT_PROGRESS_INTERVAL);
+        }
+        if let Some(next) = readers
+            .get_mut(reader_index)
+            .ok_or_else(|| io::Error::other("sort run reader index is out of range"))?
+            .next_value()?
+        {
+            heap.push(Reverse((next, reader_index)));
+        }
+    }
+    if written != expected_values {
+        return Err(io::Error::other(format!(
+            "external sort lost values: expected={expected_values}, written={written}"
+        ))
+        .into());
+    }
+    writer.flush()?;
+    writer.get_ref().sync_data()?;
+    drop(writer);
+    std::fs::rename(&output.path, body_path)?;
+    output.committed = true;
+    Ok(())
+}
+
+fn encode_sorted_hintsfile(
+    path: &Path,
+    sorted_body_path: &Path,
+    tip_height: u64,
+    counts: &[u32],
+    offsets: &[u64],
+) -> AnyResult<u64> {
     let stop_height =
         u32::try_from(tip_height).map_err(|_| invalid_input("hintsfile height exceeds u32"))?;
+    let mut values = ValueReader::open_flat(sorted_body_path)?;
+    let mut next = values.next_value()?;
     let writer = BufWriter::new(File::create(path)?);
     let builder = HintsfileBuilder::new(writer);
     let mut builder = builder.initialize(stop_height)?;
+    let mut indices = Vec::new();
+    let mut encoded_outputs = 0_u64;
+
     // hintsfile 0.1 encodes heights 1..=stop_height; genesis has no eligible outputs.
     for height in 1..=stop_height {
         if height == 1 || height == stop_height || u64::from(height) % HINTS_PROGRESS_INTERVAL == 0
@@ -659,35 +962,166 @@ fn encode_hintsfile(path: &Path, tip_height: u64, offsets: &[u64], live: &[bool]
                 "stage=hints event=encode_progress height={height} tip={stop_height}"
             ));
         }
+        indices.clear();
         let height_index = usize::try_from(height)
             .map_err(|_| invalid_input("hintsfile height does not fit usize"))?;
-        let start = usize::try_from(offsets[height_index])
-            .map_err(|_| invalid_input("block offset does not fit usize"))?;
-        let end = usize::try_from(offsets[height_index + 1])
-            .map_err(|_| invalid_input("next block offset does not fit usize"))?;
-        let mut indices = Vec::new();
-        indices
-            .try_reserve_exact(end.saturating_sub(start))
-            .map_err(|_| Error::OutOfMemory)?;
-        for (index, present) in live[start..end].iter().enumerate() {
-            if *present {
-                indices.push(
-                    u32::try_from(index)
-                        .map_err(|_| invalid_input("block output index exceeds u32"))?,
-                );
+        let count = counts
+            .get(height_index)
+            .copied()
+            .ok_or_else(|| invalid_input("eligible output count is unavailable"))?;
+        let block_offset = offsets
+            .get(height_index)
+            .copied()
+            .ok_or_else(|| invalid_input("block offset is unavailable"))?;
+        let block_end = offsets
+            .get(height_index + 1)
+            .copied()
+            .ok_or_else(|| invalid_input("next block offset is unavailable"))?;
+
+        while let Some(position) = next {
+            let (position_height, block_index) = unpack_output_position(position);
+            if position_height < height {
+                return Err(io::Error::other("sorted output positions moved backwards").into());
             }
+            if position_height != height {
+                break;
+            }
+            if block_index >= count {
+                return Err(io::Error::other(format!(
+                    "output index {block_index} exceeds block {height} count {count}"
+                ))
+                .into());
+            }
+            if indices
+                .last()
+                .is_some_and(|previous| *previous >= block_index)
+            {
+                return Err(io::Error::other("duplicate sorted output position").into());
+            }
+            let global = block_offset
+                .checked_add(u64::from(block_index))
+                .ok_or_else(|| invalid_input("global output index overflow"))?;
+            if global >= block_end {
+                return Err(io::Error::other("output index exceeds its block range").into());
+            }
+            indices.push(block_index);
+            encoded_outputs = encoded_outputs
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("encoded output count overflow"))?;
+            next = values.next_value()?;
         }
         builder.append(EliasFano::compress(&indices))?;
     }
+    if next.is_some() {
+        return Err(io::Error::other("sorted body contains output above the requested tip").into());
+    }
     builder.finish()?;
-    Ok(())
+    Ok(encoded_outputs)
 }
 
-fn decode_output_index(bytes: &[u8]) -> AnyResult<u32> {
-    let bytes: [u8; OUTPUT_INDEX_SIZE] = bytes
+fn read_body_u64(slot: &[u8], offset: usize) -> AnyResult<u64> {
+    let end = offset
+        .checked_add(size_of::<u64>())
+        .ok_or_else(|| io::Error::other("body field range overflow"))?;
+    let bytes: [u8; size_of::<u64>()] = slot
+        .get(offset..end)
+        .ok_or_else(|| io::Error::other("body field is outside its node"))?
         .try_into()
-        .map_err(|_| io::Error::other("stored output index has the wrong width"))?;
-    Ok(u32::from_le_bytes(bytes))
+        .map_err(|_| io::Error::other("body field has the wrong width"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn align_usize(value: usize, alignment: usize) -> Option<usize> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|sum| sum & !(alignment - 1))
+}
+
+struct SortRun {
+    path: PathBuf,
+    values: u64,
+}
+
+impl Drop for SortRun {
+    fn drop(&mut self) {
+        let _removed = std::fs::remove_file(&self.path);
+    }
+}
+
+struct ValueReader {
+    reader: BufReader<File>,
+    remaining: u64,
+}
+
+impl ValueReader {
+    fn open_run(run: &SortRun) -> AnyResult<Self> {
+        let expected_length = run
+            .values
+            .checked_mul(size_of::<u64>() as u64)
+            .ok_or_else(|| io::Error::other("sort run length overflow"))?;
+        let file = File::open(&run.path)?;
+        if file.metadata()?.len() != expected_length {
+            return Err(io::Error::other("sort run has an unexpected length").into());
+        }
+        Ok(Self::new(file, run.values))
+    }
+
+    fn open_flat(path: &Path) -> AnyResult<Self> {
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        if length % size_of::<u64>() as u64 != 0 {
+            return Err(io::Error::other("sorted body has a partial value").into());
+        }
+        Ok(Self::new(file, length / size_of::<u64>() as u64))
+    }
+
+    fn new(file: File, values: u64) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            remaining: values,
+        }
+    }
+
+    fn next_value(&mut self) -> AnyResult<Option<u64>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut bytes = [0_u8; size_of::<u64>()];
+        self.reader.read_exact(&mut bytes)?;
+        self.remaining -= 1;
+        Ok(Some(u64::from_le_bytes(bytes)))
+    }
+}
+
+struct TemporarySortOutput {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl TemporarySortOutput {
+    fn create(path: PathBuf) -> AnyResult<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            committed: false,
+        })
+    }
+}
+
+impl Drop for TemporarySortOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _removed = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn block_count_slots(end_height: u64) -> AnyResult<Box<[AtomicU32]>> {
@@ -748,7 +1182,10 @@ impl RangeAllocator {
             if start >= limit {
                 return None;
             }
-            let end = start.saturating_add(self.size).min(limit);
+            let end = start.saturating_add(self.size).min(self.end);
+            if end > limit {
+                return None;
+            }
             if self
                 .next
                 .compare_exchange(start, end, Ordering::AcqRel, Ordering::Acquire)
@@ -763,33 +1200,32 @@ impl RangeAllocator {
         self.next.load(Ordering::Acquire)
     }
 
+    fn next_range_end(&self) -> u64 {
+        self.next_height().saturating_add(self.size).min(self.end)
+    }
+
     fn is_finished(&self) -> bool {
         self.next_height() >= self.end
     }
 }
 
-struct AdderProgress {
-    heights: Box<[AtomicU64]>,
+struct WorkerProgress {
+    adders: Box<[AtomicU64]>,
+    removers: Box<[AtomicU64]>,
     mutex: Mutex<()>,
     changed: Condvar,
     aborted: AtomicU64,
     end: u64,
 }
 
-impl AdderProgress {
-    fn new(workers: usize, end: u64) -> AnyResult<Self> {
-        if workers == 0 {
-            return Err(invalid_input("adder thread count must be nonzero").into());
-        }
-        let mut heights = Vec::new();
-        heights
-            .try_reserve_exact(workers)
-            .map_err(|_| Error::OutOfMemory)?;
-        for _worker in 0..workers {
-            heights.push(AtomicU64::new(0));
+impl WorkerProgress {
+    fn new(adders: usize, removers: usize, end: u64) -> AnyResult<Self> {
+        if adders == 0 || removers == 0 {
+            return Err(invalid_input("worker progress sets must be nonempty").into());
         }
         Ok(Self {
-            heights: heights.into_boxed_slice(),
+            adders: progress_slots(adders)?,
+            removers: progress_slots(removers)?,
             mutex: Mutex::new(()),
             changed: Condvar::new(),
             aborted: AtomicU64::new(0),
@@ -797,19 +1233,34 @@ impl AdderProgress {
         })
     }
 
-    fn publish(&self, worker: usize, completed: u64) -> io::Result<()> {
+    fn publish_adder(&self, worker: usize, completed: u64) -> io::Result<()> {
+        self.publish(&self.adders, worker, completed, "adder")
+    }
+
+    fn publish_remover(&self, worker: usize, completed: u64) -> io::Result<()> {
+        self.publish(&self.removers, worker, completed, "remover")
+    }
+
+    fn publish(
+        &self,
+        slots: &[AtomicU64],
+        worker: usize,
+        completed: u64,
+        kind: &str,
+    ) -> io::Result<()> {
         let _guard = self
             .mutex
             .lock()
-            .map_err(|_| io::Error::other("adder progress mutex is poisoned"))?;
-        let height = self
-            .heights
+            .map_err(|_| io::Error::other("worker progress mutex is poisoned"))?;
+        let height = slots
             .get(worker)
-            .ok_or_else(|| io::Error::other("adder progress index is out of range"))?;
+            .ok_or_else(|| io::Error::other(format!("{kind} progress index is out of range")))?;
         let mut old = height.load(Ordering::Acquire);
         loop {
             if completed < old || completed > self.end {
-                return Err(io::Error::other("adder progress is not monotonic"));
+                return Err(io::Error::other(format!(
+                    "{kind} progress is not monotonic"
+                )));
             }
             match height.compare_exchange(old, completed, Ordering::Release, Ordering::Acquire) {
                 Ok(_) => break,
@@ -820,32 +1271,51 @@ impl AdderProgress {
         Ok(())
     }
 
-    fn finish(&self, worker: usize) -> io::Result<()> {
-        self.publish(worker, self.end)
+    fn finish_adder(&self, worker: usize) -> io::Result<()> {
+        self.publish_adder(worker, self.end)
     }
 
-    fn minimum(&self) -> u64 {
-        let mut minimum = self.end;
-        for height in &self.heights {
-            minimum = minimum.min(height.load(Ordering::Acquire));
-        }
-        minimum
+    fn finish_remover(&self, worker: usize) -> io::Result<()> {
+        self.publish_remover(worker, self.end)
     }
 
-    fn wait_until(&self, required: u64) -> io::Result<()> {
+    fn minimum_adder(&self) -> u64 {
+        minimum_progress(&self.adders, self.end)
+    }
+
+    fn minimum_remover(&self) -> u64 {
+        minimum_progress(&self.removers, self.end)
+    }
+
+    fn adder_can_process(&self, height: u64, maximum_lead: u64) -> bool {
+        height < self.minimum_remover().saturating_add(maximum_lead)
+    }
+
+    fn wait_for_additions(&self, required: u64) -> io::Result<()> {
+        self.wait_until(|| self.minimum_adder() >= required)
+    }
+
+    fn wait_for_remover_window(&self, height: u64, maximum_lead: u64) -> io::Result<()> {
+        self.wait_until(|| self.adder_can_process(height, maximum_lead))
+    }
+
+    fn wait_until<F>(&self, ready: F) -> io::Result<()>
+    where
+        F: Fn() -> bool,
+    {
         let mut guard = self
             .mutex
             .lock()
-            .map_err(|_| io::Error::other("adder progress mutex is poisoned"))?;
+            .map_err(|_| io::Error::other("worker progress mutex is poisoned"))?;
         loop {
             self.check_abort()?;
-            if self.minimum() >= required {
+            if ready() {
                 return Ok(());
             }
             guard = self
                 .changed
                 .wait(guard)
-                .map_err(|_| io::Error::other("adder progress mutex is poisoned"))?;
+                .map_err(|_| io::Error::other("worker progress mutex is poisoned"))?;
         }
     }
 
@@ -867,6 +1337,25 @@ impl AdderProgress {
             .compare_exchange(0, 1, Ordering::Release, Ordering::Acquire);
         self.changed.notify_all();
     }
+}
+
+fn progress_slots(workers: usize) -> AnyResult<Box<[AtomicU64]>> {
+    let mut heights = Vec::new();
+    heights
+        .try_reserve_exact(workers)
+        .map_err(|_| Error::OutOfMemory)?;
+    for _worker in 0..workers {
+        heights.push(AtomicU64::new(0));
+    }
+    Ok(heights.into_boxed_slice())
+}
+
+fn minimum_progress(heights: &[AtomicU64], end: u64) -> u64 {
+    let mut minimum = end;
+    for height in heights {
+        minimum = minimum.min(height.load(Ordering::Acquire));
+    }
+    minimum
 }
 
 #[derive(Clone, Copy)]
@@ -1214,8 +1703,8 @@ mod tests {
             &mut indexed,
         )?;
         assert_eq!(index, 2);
-        assert_eq!(indexed[0].value, 0_u32.to_le_bytes());
-        assert_eq!(indexed[1].value, 1_u32.to_le_bytes());
+        assert_eq!(indexed[0].value, pack_output_position(1, 0).to_le_bytes());
+        assert_eq!(indexed[1].value, pack_output_position(1, 1).to_le_bytes());
 
         assert!(!should_index_output(
             ChainType::Mainnet,
@@ -1258,19 +1747,97 @@ mod tests {
     }
 
     #[test]
-    fn encodes_folded_block_hints_with_hintsfile_crate() -> AnyResult<()> {
-        let mut encoded = Vec::new();
-        {
-            let builder = HintsfileBuilder::new(&mut encoded);
-            let mut builder = builder.initialize(2)?;
-            builder.append(EliasFano::compress(&[0, 3]))?;
-            builder.append(EliasFano::compress(&[1]))?;
-            builder.finish()?;
+    fn encodes_sorted_body_positions_with_hintsfile_crate() -> AnyResult<()> {
+        let directory =
+            std::env::temp_dir().join(format!("floresta-db-hints-encode-{}", std::process::id()));
+        let _ignored = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory)?;
+        let body = directory.join("body");
+        let hints_path = directory.join("swiftsync.hints");
+        let mut sorted = BufWriter::new(File::create(&body)?);
+        for position in [
+            pack_output_position(1, 0),
+            pack_output_position(1, 3),
+            pack_output_position(2, 1),
+        ] {
+            sorted.write_all(&position.to_le_bytes())?;
         }
+        sorted.flush()?;
+        drop(sorted);
+
+        let counts = [0, 4, 2];
+        let offsets = fold_output_counts(&counts)?;
+        assert_eq!(
+            encode_sorted_hintsfile(&hints_path, &body, 2, &counts, &offsets)?,
+            3
+        );
+        let encoded = std::fs::read(&hints_path)?;
         let hints = hintsfile::Hintsfile::from_reader(&mut encoded.as_slice())?;
         assert_eq!(hints.stop_height(), 2);
         assert_eq!(hints.indices_at_height(1), Some(vec![0, 3]));
         assert_eq!(hints.indices_at_height(2), Some(vec![1]));
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn destructively_sorts_only_live_inline_values() -> AnyResult<()> {
+        let directory =
+            std::env::temp_dir().join(format!("floresta-db-hints-sort-{}", std::process::id()));
+        let _ignored = std::fs::remove_dir_all(&directory);
+        let mut config = Config::new(Mode::Map, 8, OUTPOINT_KEY_SIZE);
+        config.inline_value_size = OUTPUT_INDEX_SIZE;
+        config.block_size = 64 * 1_024;
+        config.body_capacity = config.block_size * 2;
+        config.blob_capacity = 0;
+        let database = Database::create(&directory, config.clone())?;
+        let mut keys = Vec::new();
+        let positions = [
+            pack_output_position(3, 4),
+            pack_output_position(1, 3),
+            pack_output_position(2, 8),
+            pack_output_position(1, 1),
+            pack_output_position(4, 0),
+            pack_output_position(2, 2),
+            pack_output_position(3, 1),
+            pack_output_position(1, 7),
+            pack_output_position(2, 5),
+            pack_output_position(3, 0),
+        ];
+        for (number, position) in positions.iter().copied().enumerate() {
+            let mut key = [0_u8; OUTPOINT_KEY_SIZE];
+            key[..8].copy_from_slice(
+                &u64::try_from(number)
+                    .map_err(|_| invalid_input("test key index does not fit u64"))?
+                    .to_le_bytes(),
+            );
+            database.put(&key, &position.to_le_bytes())?;
+            keys.push(key);
+        }
+        assert!(database.delete(&keys[1])?);
+        assert!(database.delete(&keys[7])?);
+        database.close()?;
+
+        let body = directory.join("body");
+        assert_eq!(
+            destructive_sort_body_values(&body, config.block_size, 2)?,
+            8
+        );
+        let bytes = std::fs::read(&body)?;
+        let mut actual = Vec::new();
+        for value in bytes.chunks_exact(size_of::<u64>()) {
+            let value: [u8; size_of::<u64>()] = value
+                .try_into()
+                .map_err(|_| io::Error::other("sorted test value has the wrong width"))?;
+            actual.push(u64::from_le_bytes(value));
+        }
+        let mut expected = positions.to_vec();
+        expected.retain(|position| *position != positions[1] && *position != positions[7]);
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 
@@ -1286,38 +1853,40 @@ mod tests {
     }
 
     #[test]
-    fn remover_claims_every_currently_safe_block_before_waiting() -> AnyResult<()> {
+    fn remover_waits_for_complete_ranges() -> AnyResult<()> {
         let ranges = RangeAllocator::new(10, 4)?;
         assert_eq!(ranges.claim_up_to(0), None);
-        assert_eq!(ranges.claim_up_to(2), Some(0..2));
         assert_eq!(ranges.claim_up_to(2), None);
-        assert_eq!(ranges.claim_up_to(7), Some(2..6));
-        assert_eq!(ranges.claim_up_to(7), Some(6..7));
+        assert_eq!(ranges.next_range_end(), 4);
+        assert_eq!(ranges.claim_up_to(4), Some(0..4));
         assert_eq!(ranges.claim_up_to(7), None);
-        assert_eq!(ranges.claim_up_to(10), Some(7..10));
+        assert_eq!(ranges.next_range_end(), 8);
+        assert_eq!(ranges.claim_up_to(8), Some(4..8));
+        assert_eq!(ranges.claim_up_to(9), None);
+        assert_eq!(ranges.claim_up_to(10), Some(8..10));
         assert!(ranges.is_finished());
         Ok(())
     }
 
     #[test]
     fn remover_waits_for_minimum_adder_height() -> AnyResult<()> {
-        let progress = AdderProgress::new(2, 10)?;
+        let progress = WorkerProgress::new(2, 1, 10)?;
         std::thread::scope(|scope| -> AnyResult<()> {
             let (sender, receiver) = mpsc::channel();
             let progress_ref = &progress;
             let waiter = scope.spawn(move || -> io::Result<()> {
-                progress_ref.wait_until(3)?;
+                progress_ref.wait_for_additions(3)?;
                 sender
                     .send(())
                     .map_err(|_| io::Error::other("progress test receiver dropped"))
             });
 
-            progress.publish(0, 3)?;
+            progress.publish_adder(0, 3)?;
             assert!(matches!(
                 receiver.try_recv(),
                 Err(mpsc::TryRecvError::Empty)
             ));
-            progress.publish(1, 3)?;
+            progress.publish_adder(1, 3)?;
             receiver
                 .recv_timeout(Duration::from_secs(1))
                 .map_err(|_| io::Error::other("remover did not observe safe height"))?;
@@ -1326,6 +1895,36 @@ mod tests {
                 .map_err(|_| io::Error::other("progress waiter panicked"))??;
             Ok(())
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn adders_wait_when_they_exceed_the_remover_window() -> AnyResult<()> {
+        let progress = WorkerProgress::new(1, 1, 20)?;
+        assert!(progress.adder_can_process(3, 4));
+        assert!(!progress.adder_can_process(4, 4));
+        progress.publish_remover(0, 1)?;
+        assert!(progress.adder_can_process(4, 4));
+        assert!(!progress.adder_can_process(5, 4));
+        progress.finish_remover(0)?;
+        assert!(progress.adder_can_process(19, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn claiming_a_later_range_releases_the_old_worker_frontier() -> AnyResult<()> {
+        let progress = WorkerProgress::new(2, 2, 20)?;
+        progress.publish_adder(0, 2)?;
+        progress.publish_adder(1, 4)?;
+        assert_eq!(progress.minimum_adder(), 2);
+        progress.publish_adder(0, 4)?;
+        assert_eq!(progress.minimum_adder(), 4);
+
+        progress.publish_remover(0, 3)?;
+        progress.publish_remover(1, 5)?;
+        assert_eq!(progress.minimum_remover(), 3);
+        progress.publish_remover(0, 5)?;
+        assert_eq!(progress.minimum_remover(), 5);
         Ok(())
     }
 

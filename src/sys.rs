@@ -2,8 +2,8 @@
 
 //! Minimal Linux syscall boundary for mapped storage.
 //!
-//! The wrappers centralize `mmap`, `mlock`, advice, synchronous writeback, and
-//! physical allocation while translating operating-system failures into [`Error`].
+//! The wrappers centralize mapping, advice, synchronous writeback, and physical
+//! allocation while translating operating-system failures into [`Error`].
 
 #![allow(dead_code)]
 
@@ -35,7 +35,6 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> c_int;
-    fn mlock(address: *const c_void, length: usize) -> c_int;
     fn madvise(address: *mut c_void, length: usize, advice: c_int) -> c_int;
     fn msync(address: *mut c_void, length: usize, flags: c_int) -> c_int;
     fn fallocate(file_descriptor: c_int, mode: c_int, offset: i64, length: i64) -> c_int;
@@ -80,12 +79,6 @@ pub(crate) fn map_shared(
 pub(crate) fn unmap(pointer: NonNull<u8>, length: usize) -> Result<()> {
     // SAFETY: pointer and length identify one active mapping owned by MappedFile.
     let result = unsafe { munmap(pointer.as_ptr().cast::<c_void>(), length) };
-    errno_result(result)
-}
-
-pub(crate) fn lock(pointer: NonNull<u8>, length: usize) -> Result<()> {
-    // SAFETY: pointer and length identify an active mapped range.
-    let result = unsafe { mlock(pointer.as_ptr().cast::<c_void>(), length) };
     errno_result(result)
 }
 
