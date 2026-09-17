@@ -162,12 +162,12 @@ After indexing, the example closes the database and destructively uses its body 
 ## Validation
 
 ```text
-cargo +nightly fmt --check
-cargo +nightly clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo test --doc
-cargo doc --no-deps --all-features
-cargo +nightly miri test
+cargo +nightly fmt --all --check
+cargo +nightly clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo test --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo +nightly doc --no-deps --all-features --document-private-items --locked
+cargo +nightly miri test --locked
 ```
 
 Real mapping, growth, and allocation tests do not run under Miri; pure layout and hashing tests do. For native memory checking:
@@ -181,5 +181,39 @@ The model-based fuzz target checks scalar and batched operations plus checkpoint
 
 ```text
 cargo install cargo-fuzz
-cargo +nightly fuzz run database
+RUSTFLAGS="-C link-arg=-no-pie" cargo +nightly fuzz run database
 ```
+
+The non-PIE build keeps AddressSanitizer's shadow range clear on hardened kernels and is also used in CI.
+
+## Continuous integration
+
+GitHub Actions enforces:
+
+- formatting, spelling, Clippy, rustdoc warnings, and documentation tests;
+- default-feature tests on Rust 1.85, all-feature tests on stable Rust, and release builds;
+- Miri checks for the dependency-free core;
+- `cargo-audit` for both lockfiles and `cargo-deny` for advisories, sources, bans, and licenses;
+- workflow security analysis with Zizmor and shell validation with ShellCheck;
+- a short database state-machine fuzz run on pushes and pull requests, plus a longer weekly run;
+- signed commits, Conventional Commit subjects, a 72-character subject limit, and clean patch whitespace.
+
+Pull-request commits must use one of `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `perf`, `ci`, `chore`, `fuzz`, or `bench`. The signature check verifies that a PGP or SSH signature is present; repository trust policy determines accepted signers.
+
+Useful local supply-chain checks:
+
+```text
+cargo audit --deny warnings
+cargo audit --file fuzz/Cargo.lock --deny warnings
+cargo deny check
+cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check
+shellcheck contrib/*.sh
+```
+
+The default crate remains dependency-free and dual-licensed. The all-feature policy explicitly permits CC0-1.0 and MITNFA only for the optional rust-bitcoin loader stack. The separate fuzz policy permits NCSA only for LLVM libFuzzer.
+
+Dependabot groups Cargo and GitHub Actions updates monthly for the root crate and independent fuzz package.
+
+## License
+
+Licensed under either the [Apache License 2.0](LICENSE-APACHE) or the [MIT license](LICENSE-MIT), at your option. See [LICENSE.md](LICENSE.md).

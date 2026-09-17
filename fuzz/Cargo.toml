@@ -16,6 +16,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.floresta-db]
 path = ".."
+version = "0.1.0"
 
 [[bin]]
 name = "database"

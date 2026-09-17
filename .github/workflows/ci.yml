@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Rust CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format, Lint, and Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential clang cmake libboost-all-dev
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check spelling
+        uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
+        with:
+          config: ./_typos.toml
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all --check
+
+      - name: Run Clippy
+        run: cargo +nightly clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +nightly doc --no-deps --all-features --document-private-items --locked
+
+      - name: Test documentation
+        run: cargo +nightly test --doc --all-features --locked
+
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MSRV 1.85
+            toolchain: 1.85.0
+            feature-args: --no-default-features
+          - name: Stable All Features
+            toolchain: stable
+            feature-args: --all-features
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential clang cmake libboost-all-dev
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --no-self-update
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.toolchain }}-${{ matrix.feature-args }}
+
+      - name: Run tests
+        run: cargo +${{ matrix.toolchain }} test --all-targets ${{ matrix.feature-args }} --locked
+
+      - name: Build release artifacts
+        run: cargo +${{ matrix.toolchain }} build --release ${{ matrix.feature-args }} --locked
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Rust with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri --no-self-update
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Prepare Miri
+        run: cargo +nightly miri setup
+
+      - name: Run Miri tests
+        run: cargo +nightly miri test --locked

@@ -21,10 +21,10 @@ The block-count file tracks each block's allocation cursor, live-object count, a
 Adding elements requires:
  - Allocate space inside the blobs file if it's a map — we should also support a set where the blobs file isn't used
  - Copy everything needed to the blobs file
- - Create a body node for it by allocating a node inside the body file, hash the key, find a bucket by modulu-ing with the map size. Make it point to what the map's head is currently pointing to. It should also point to the blobs entry associate with that data, if any.
+ - Create a body node by allocating space in the body file, hashing the key, and selecting a bucket by taking the hash modulo the map size. Point it to the current map head and, for maps, to the blob entry associated with the data.
  - CAS the head to make this node visible
 
-This database is **eventually consistent**, this means you might see an **older state when reading it**, but you should **never** see an **invalid state**. We accieve this by:
+This database is **eventually consistent**: readers might see an **older state**, but they should **never** see an **invalid state**. We achieve this by:
  - Making incomplete or invalid states invisible to others — this is why we fill everything up before making it visible inside the map
  - Whenever something becomes visible, we use an atomic CAS for that.
 
