@@ -150,6 +150,18 @@ Important configuration fields:
 
 The tradeoff is deliberate: the engine gets these properties by narrowing the deployment and concurrency model rather than hiding coordination behind a general-purpose transaction layer.
 
+## Benchmarks
+
+The dependency-free benchmark harness measures the public API with deterministic fixed-width records:
+
+```text
+cargo bench --bench database -- 100000
+```
+
+The optional argument is the number of records. The suite reports integer operations per second for scalar XXH64, write-only batch insertion, scalar reads, batch reads, batch deletion, concurrent set insertion, and checkpoint creation. Database setup is outside each timed region, and every temporary database is removed after its case.
+
+GitHub Actions runs a 25,000-record smoke benchmark on pull requests, a 250,000-record weekly benchmark, and configurable manual runs on Linux x86-64/AArch64 and macOS x86-64/AArch64. Results are uploaded as per-platform artifacts. Windows is excluded because storage is unsupported; RISC-V is excluded because emulation does not produce useful performance numbers.
+
 ## Examples
 
 ### Stress runner
@@ -217,6 +229,7 @@ GitHub Actions enforces:
 - default-feature tests on Rust 1.85, all-feature tests on stable Rust, and release builds;
 - native Linux AArch64, macOS x86-64/AArch64, and Windows x86-64/AArch64 compile-guard jobs;
 - full Linux RISC-V 64 tests under QEMU;
+- native cross-platform benchmark smoke runs and weekly benchmark artifacts;
 - Miri checks for the dependency-free core;
 - `cargo-audit` for both lockfiles and `cargo-deny` for advisories, sources, bans, and licenses;
 - workflow security analysis with Zizmor and shell validation with ShellCheck;

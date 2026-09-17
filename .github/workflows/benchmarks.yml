@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Benchmarks
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      items:
+        description: Number of records per benchmark
+        required: false
+        default: "100000"
+        type: string
+  schedule:
+    - cron: "0 4 * * 6"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  database:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            id: linux-x86_64
+            os: ubuntu-latest
+          - name: Linux AArch64
+            id: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macOS AArch64
+            id: macos-aarch64
+            os: macos-15
+          - name: macOS x86-64
+            id: macos-x86_64
+            os: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: benchmark-${{ matrix.id }}
+
+      - name: Select benchmark size
+        shell: bash
+        env:
+          REQUESTED_ITEMS: ${{ inputs.items }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ -n "$REQUESTED_ITEMS" ]]; then
+            BENCH_ITEMS=$REQUESTED_ITEMS
+          elif [[ "$EVENT_NAME" == "schedule" ]]; then
+            BENCH_ITEMS=250000
+          else
+            BENCH_ITEMS=25000
+          fi
+          if [[ ! "$BENCH_ITEMS" =~ ^[1-9][0-9]*$ ]] || (( BENCH_ITEMS > 1000000 )); then
+            echo "items must be an integer from 1 through 1000000" >&2
+            exit 2
+          fi
+          echo "BENCH_ITEMS=$BENCH_ITEMS" >> "$GITHUB_ENV"
+
+      - name: Run database benchmarks
+        shell: bash
+        run: |
+          cargo +stable bench --bench database --locked -- "$BENCH_ITEMS" \
+            | tee "benchmark-${{ matrix.id }}.txt"
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-${{ matrix.id }}
+          path: benchmark-${{ matrix.id }}.txt
+          if-no-files-found: error
+          retention-days: 30

@@ -23,6 +23,10 @@ name = "bitcoin-load"
 path = "examples/bitcoin_load/main.rs"
 required-features = ["bitcoin-load"]
 
+[[bench]]
+name = "database"
+harness = false
+
 [lints.rust]
 missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"

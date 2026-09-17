@@ -25,6 +25,7 @@ Concurrency invariants are architectural: shared state changes use `compare_exch
 
 - `src/`: library implementation; tests live inline beside each module.
 - `examples/`: runnable stress and feature-gated Bitcoin Core load examples.
+- `benches/`: dependency-free public-API throughput benchmark harness.
 - `fuzz/`: independent `cargo-fuzz` package and the `database` fuzz target.
 
 There is no separate `tests/` tree and no generated source directory.
@@ -46,10 +47,11 @@ cross test --target riscv64gc-unknown-linux-gnu --no-default-features --locked
 cargo check --tests --target aarch64-apple-darwin --no-default-features
 cargo check --tests --target aarch64-pc-windows-msvc --no-default-features
 cargo +nightly fuzz run database
+cargo bench --bench database -- 100000
 cargo run --release --example stress -- 1000 100 16 stress
 ```
 
-The stress example writes `stress.csv` and `stress.svg`. For the optional loader:
+The benchmark prints deterministic operation throughput and removes its temporary databases. The stress example writes `stress.csv` and `stress.svg`. For the optional loader:
 
 ```text
 cargo run --release --features bitcoin-load --example bitcoin-load -- \
