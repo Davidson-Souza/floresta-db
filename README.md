@@ -6,7 +6,7 @@
 
 It is a good fit when:
 
-- keys have one fixed width known when the database is created;
+- keys are exactly 16 bytes;
 - the workload is dominated by parallel inserts, point reads, and ordered batch work;
 - the application can coordinate destructive operations such as replacement and deletion;
 - losing mutations made after the last checkpoint is acceptable after a crash.
@@ -19,10 +19,10 @@ It is not a general SQL engine, a multi-process database, or a transactional sto
 use floresta_db::{Config, Database, Mode, PutResult};
 
 let path = "utxo.db";
-let key = [0_u8; 36];
+let key = [0_u8; 16];
 let value = b"serialized output";
 
-let mut config = Config::new(Mode::Map, 1 << 20, key.len());
+let mut config = Config::new(Mode::Map, 1 << 20);
 config.body_capacity = 8 << 30;
 config.blob_capacity = 8 << 30;
 
@@ -44,21 +44,21 @@ Set mode stores keys without values:
 ```rust
 use floresta_db::{Config, Database, Mode};
 
-let database = Database::create("set.db", Config::new(Mode::Set, 1 << 16, 32))?;
-let key = [7_u8; 32];
+let database = Database::create("set.db", Config::new(Mode::Set, 1 << 16))?;
+let key = [7_u8; 16];
 database.add(&key)?;
 assert!(database.contains(&key)?);
 # Ok::<(), floresta_db::Error>(())
 ```
 
-The create path must not exist. Bucket count, key width, block size, capacities, and value mode become part of the persistent layout.
+The create path must not exist. Bucket count, block size, capacities, and value mode become part of the persistent layout; keys are always 16 bytes.
 
 ## Data model and APIs
 
-`Mode::Set` stores fixed-width keys. `Mode::Map` stores fixed-width keys plus either:
+`Mode::Set` stores 16-byte keys. `Mode::Map` stores 16-byte keys plus either:
 
-- fixed values of up to eight bytes directly inside each node; or
-- variable-width values in a separate blob file.
+- eight-byte values directly inside nodes when their reserved high bit is clear; or
+- every other value in the blob file.
 
 The main scalar operations are:
 
@@ -76,14 +76,15 @@ Batch APIs hash and group work by bucket so each bucket is visited or published 
 
 - `add_batch` appends set keys;
 - `WriteOnlyWriter::put_batch` builds maps without duplicate lookups;
-- `batch_fetch` resolves requests and restores input order;
-- `batch_delete` removes the first matching node for each unique requested key.
+- `batch_fetch` resolves body requests by bucket, reads blobs by ascending offset, and restores input order;
+- `batch_delete` removes the first matching node for each unique requested key;
+- `batch_pop` removes map entries and returns their values after offset-ordered blob reads.
 
-Append-only batch writers deliberately retain duplicate keys. `batch_fetch` accepts duplicate requests; `batch_delete` rejects them.
+Append-only batch writers deliberately retain duplicate keys. `batch_fetch` accepts duplicate requests; destructive batch APIs reject them.
 
 ## Concurrency contract
 
-The supported topology is one process with many threads. Append-only writes and reads use atomic publication and validation; there is no global write lock.
+The supported topology is one process with many threads. Append-only writes publish by CAS; aligned reads are ordinary loads whose observations are revalidated before mutation.
 
 Deletion and replacing `put` calls are different. The database intentionally has no hazard pointers, epochs, or reader-tracking layer. Before removing a key, the caller must guarantee:
 
@@ -91,7 +92,7 @@ Deletion and replacing `put` calls are different. The database intentionally has
 2. no reader, competing remover/replacer, or checkpoint can retain an offset in the affected bucket;
 3. the operation's higher-level ordering makes the key eligible for removal.
 
-Per-bucket delete locks serialize internal deleters, but they do not replace this ownership and quiescence contract. Once a node is unlinked, an empty block may be reused immediately.
+Per-bucket delete locks serialize internal deleters, but they do not replace this ownership and quiescence contract. Once a node is unlinked, an empty page may be reused immediately.
 
 This design keeps the append/read hot path small and fast. Applications that need arbitrary reads concurrent with arbitrary deletes need a reclamation layer above the database or a different storage engine.
 
@@ -102,8 +103,7 @@ A checkpoint is the recovery boundary. `Database::open` validates both checkpoin
 A checkpoint may overlap append-only writes. It contains every append completed before capture began; overlapping appends may or may not be included. Deletions and replacements must not overlap checkpoint capture.
 
 `Database::sync` flushes runtime mappings but does not create a recoverable checkpoint generation.
-
-Inline-value maps are intended for clean runtime reopen and do not support checkpoint creation. Close them cleanly and use `Database::open_runtime`.
+Checkpoints support maps containing any mixture of inline and blob-backed values.
 
 ## Platform support
 
@@ -122,29 +122,28 @@ The optional `bitcoin-load` integration remains validated only on Linux x86-64 b
 - A 64-bit, little-endian target with native 64-bit atomics.
 - A fixed 64 KiB **format page**, divisible by Linux and macOS VM-page sizes and by Windows mapping granularity.
 - Stable shared mappings on Linux (`mmap`/`fallocate`) or macOS (`mmap`/`F_PREALLOCATE`).
-- Backing files grow one allocation block at a time.
+- Backing files grow by allocation-page multiples sized to the pending request.
 - Bucket heads rely on the operating system page cache; no `mlock` limit is required.
 - Filesystem calls, page faults, file growth, startup, and checkpoints are outside the lock-free progress guarantee.
 - Capacities are configured maxima, not eagerly allocated disk usage.
 
-This port advances the on-disk format to version 5 because the format page grew from 4 KiB to 64 KiB. Version 4 databases are rejected and must be rebuilt; there is no silent reinterpretation or platform-dependent layout.
+This release uses on-disk format version 7 for automatic per-value inline selection. Older databases are rejected and must be rebuilt.
 
 Important configuration fields:
 
 - `bucket_count`: more buckets shorten collision chains at the cost of a larger head table;
 - `body_capacity`: maximum space reserved for fixed-width nodes;
-- `blob_capacity`: maximum external value space for non-inline maps;
-- `block_size`: file-growth and block-reuse granularity;
-- `inline_value_size`: zero for blob values, or one through eight bytes inline.
+- `blob_capacity`: fallback space for map values that cannot be inlined;
+- `block_size`: allocation-page growth and reuse granularity.
 
 ## Strong points
 
-- CAS publication with acquire-validated reads.
-- Locality-oriented batch hashing and bucket ordering.
+- CAS publication with ordinary reads and CAS revalidation.
+- Locality-oriented batch hashing, bucket ordering, and sorted blob reads.
 - Four-key AVX2 XXH64 with a scalar fallback.
-- One metadata reservation CAS for many fixed-width batch nodes.
-- Tagged LIFO free lists that reuse empty blocks before growing files.
-- Checksummed nodes, values, headers, manifests, and checkpoint fallback.
+- Two cache-line-aligned 32-byte nodes per 64-byte cache line.
+- SIMD zero-run scans over 16-bit page counts before request-sized growth.
+- Packed 16-bit node checksums, checksummed blob records, headers, manifests, and checkpoint fallback.
 - Stable sparse mappings: growth does not invalidate published offsets.
 - Dependency-free default build.
 

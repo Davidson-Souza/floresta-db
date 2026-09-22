@@ -22,7 +22,7 @@ use std::io;
 ///     config.validate()
 /// }
 ///
-/// validate(&Config::new(Mode::Set, 64, 32))?;
+/// validate(&Config::new(Mode::Set, 64))?;
 /// # Ok::<(), floresta_db::Error>(())
 /// ```
 pub type Result<T, E = Error> = std::result::Result<T, E>;

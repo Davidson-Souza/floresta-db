@@ -1,71 +1,54 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Lock-free allocation within growable memory-mapped files.
+//! Lock-free page allocation within growable memory-mapped files.
 //!
-//! Each block stores its allocation cursor, live-object count, and lifecycle
-//! state in one atomic word. Fixed-width batches reserve all fitting objects with
-//! one metadata CAS. Empty sealed blocks enter a tagged LIFO free list and are
-//! reused before the backing files grow.
+//! The count file stores one 16-bit live-allocation count per data page. Zero
+//! pages are reusable, `u16::MAX` marks the first page of an unfinished run, and
+//! sealed pages carry their exact live count. A SIMD scan finds the longest zero
+//! run whose predecessor is not claimed, then CASes its first page.
+//! The owner consumes the following contiguous zero pages without another CAS.
 
 #![allow(dead_code)]
 
 use std::io::Read;
-
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::layout::{DATA_START, FORMAT_PAGE_SIZE, align_up};
 use crate::mapped_file::MappedFile;
 
-const CURRENT_BLOCK_OFFSET: u64 = 0;
-const NEXT_BLOCK_OFFSET: u64 = 8;
-const FREE_HEAD_OFFSET: u64 = 16;
+const HIGH_WATER_OFFSET: u64 = 0;
 const COUNTS_START: u64 = FORMAT_PAGE_SIZE;
+const GROWING_BIT: u64 = 1 << 63;
 const CURRENT_INSTALLING: u64 = u64::MAX;
-const NEXT_GROWING_BIT: u64 = 1 << 63;
-const FREE_INDEX_MASK: u64 = u32::MAX as u64;
 const USED_MASK: u64 = u32::MAX as u64;
-const COUNT_SHIFT: u32 = 32;
-const COUNT_MASK: u64 = 0x00ff_ffff << COUNT_SHIFT;
+const LIVE_SHIFT: u32 = 32;
+const LIVE_MASK: u64 = (u16::MAX as u64) << LIVE_SHIFT;
 const STATE_SHIFT: u32 = 56;
-const MAX_COUNT: u32 = 0x00ff_ffff;
+const MAX_LIVE: u16 = u16::MAX - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
-enum BlockState {
-    Unused = 0,
-
-    Preparing = 1,
-
-    Open = 2,
-
-    Sealed = 3,
-
-    Freeing = 4,
-
-    Free = 5,
+enum CurrentState {
+    Empty = 0,
+    Open = 1,
+    Sealing = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Allocation {
     pub(crate) offset: u64,
-
     pub(crate) length: u32,
-
     pub(crate) block: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AllocationBatch {
     offset: u64,
-
     length: u32,
-
     stride: u32,
-
     count: u32,
-
     block: u64,
 }
 
@@ -85,14 +68,12 @@ impl AllocationBatch {
 
 pub(crate) struct BlockAllocator {
     data: MappedFile,
-
     counts: MappedFile,
-
     capacity: u64,
-
     block_size: u64,
-
     block_count: u64,
+    current_block: AtomicU64,
+    current_word: AtomicU64,
 }
 
 impl BlockAllocator {
@@ -106,7 +87,6 @@ impl BlockAllocator {
         let (data_length, count_bytes, block_count) = file_lengths(capacity, block_size)?;
         let data = MappedFile::create_growable(data_path, data_length, DATA_START, false)?;
         let counts = MappedFile::create_growable(counts_path, count_bytes, COUNTS_START, false)?;
-        data.advise_random()?;
         counts.advise_heads()?;
         Ok(Self {
             data,
@@ -114,6 +94,8 @@ impl BlockAllocator {
             capacity,
             block_size,
             block_count,
+            current_block: AtomicU64::new(0),
+            current_word: AtomicU64::new(0),
         })
     }
 
@@ -125,19 +107,17 @@ impl BlockAllocator {
     ) -> Result<Self> {
         validate_layout(capacity, block_size)?;
         let (data_length, count_bytes, block_count) = file_lengths(capacity, block_size)?;
-        let data = MappedFile::open_growable(data_path, data_length, false)?;
-        let counts = MappedFile::open_growable(counts_path, count_bytes, false)?;
-        data.advise_random()?;
-        counts.advise_heads()?;
         let allocator = Self {
-            data,
-            counts,
+            data: MappedFile::open_growable(data_path, data_length, false)?,
+            counts: MappedFile::open_growable(counts_path, count_bytes, false)?,
             capacity,
             block_size,
             block_count,
+            current_block: AtomicU64::new(0),
+            current_word: AtomicU64::new(0),
         };
+        allocator.counts.advise_heads()?;
         allocator.validate_header()?;
-        allocator.recycle_empty_blocks()?;
         Ok(allocator)
     }
 
@@ -156,94 +136,85 @@ impl BlockAllocator {
     ) -> Result<AllocationBatch> {
         let length = u64::try_from(length).map_err(|_| Error::CapacityExhausted("allocation"))?;
         if length == 0 || length > self.block_size || maximum_count == 0 {
-            return Err(Error::CapacityExhausted("single-block allocation"));
+            return Err(Error::CapacityExhausted("single-page allocation"));
         }
         if alignment == 0 || !alignment.is_power_of_two() || alignment > self.block_size {
             return Err(Error::InvalidConfig("allocation alignment is invalid"));
         }
         let stride =
             align_up(length, alignment).ok_or(Error::CapacityExhausted("allocation stride"))?;
-        let requested = match u32::try_from(maximum_count) {
-            Ok(count) => count.min(MAX_COUNT),
-            Err(_) => MAX_COUNT,
-        };
+        let requested = u32::try_from(maximum_count)
+            .unwrap_or(u32::MAX)
+            .min(u32::from(MAX_LIVE));
+        let growth_bytes = stride
+            .checked_mul(u64::from(requested))
+            .ok_or(Error::CapacityExhausted("batch allocation size"))?;
 
-        let current = self.current_block()?;
         loop {
-            let encoded = current.load(Ordering::Acquire);
+            let encoded = read_shared_u64(&self.current_block);
             if encoded == CURRENT_INSTALLING {
                 std::hint::spin_loop();
                 continue;
             }
             if encoded == 0 {
-                self.install_current(current)?;
+                self.install_current(growth_bytes)?;
                 continue;
             }
-            let block =
-                decode_block(encoded)?.ok_or(Error::Corrupt("current block cannot be null"))?;
-            let word = self.block_word(block)?;
-            let old = word.load(Ordering::Acquire);
-            if state(old)? != BlockState::Open {
-                let _cleared =
-                    current.compare_exchange(encoded, 0, Ordering::AcqRel, Ordering::Acquire);
-                self.recycle_sealed_if_empty(block)?;
+            let block = decode_block(encoded)?;
+            let old = read_shared_u64(&self.current_word);
+            if current_state(old)? != CurrentState::Open {
+                std::hint::spin_loop();
                 continue;
             }
-
-            let start = align_up(u64::from(used(old)), alignment)
-                .ok_or(Error::CapacityExhausted("block offset"))?;
-            let old_count = count(old);
-            let available_count = MAX_COUNT.saturating_sub(old_count);
+            let start = align_up(current_used(old), alignment)
+                .ok_or(Error::CapacityExhausted("page offset"))?;
+            let old_live = current_live(old);
             let first_end = start
                 .checked_add(length)
-                .ok_or(Error::CapacityExhausted("block offset"))?;
-            if first_end > self.block_size || available_count == 0 {
-                let sealed = pack(BlockState::Sealed, used(old), old_count);
-                if word
-                    .compare_exchange(old, sealed, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let _cleared =
-                        current.compare_exchange(encoded, 0, Ordering::AcqRel, Ordering::Acquire);
-                    self.recycle_sealed_if_empty(block)?;
-                }
+                .ok_or(Error::CapacityExhausted("page offset"))?;
+            if first_end > self.block_size || old_live == MAX_LIVE {
+                self.seal_current_block(encoded, true)?;
                 continue;
             }
-
-            let available_bytes = self.block_size - first_end;
             let fitting = 1_u64
-                .checked_add(available_bytes / stride)
+                .checked_add((self.block_size - first_end) / stride)
                 .ok_or(Error::CapacityExhausted("batch allocation count"))?;
             let fitting = u32::try_from(fitting).unwrap_or(u32::MAX);
-            let reserved = requested.min(available_count).min(fitting);
+            let reserved = requested.min(fitting).min(u32::from(MAX_LIVE - old_live));
             let end = start
                 .checked_add(u64::from(reserved - 1).saturating_mul(stride))
                 .and_then(|offset| offset.checked_add(length))
-                .ok_or(Error::CapacityExhausted("block offset"))?;
-            let new_count = old_count
-                .checked_add(reserved)
-                .ok_or(Error::CapacityExhausted("block object count"))?;
-            let end_u32 =
-                u32::try_from(end).map_err(|_| Error::CapacityExhausted("block offset"))?;
-            let new = pack(BlockState::Open, end_u32, new_count);
-            if word
+                .ok_or(Error::CapacityExhausted("page offset"))?;
+            let new = pack_current(
+                CurrentState::Open,
+                end,
+                old_live
+                    .checked_add(
+                        u16::try_from(reserved)
+                            .map_err(|_| Error::CapacityExhausted("page live-allocation count"))?,
+                    )
+                    .ok_or(Error::CapacityExhausted("page live-allocation count"))?,
+            )?;
+            if self
+                .current_word
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .is_err()
             {
-                let offset = self
-                    .data_offset(block)?
-                    .checked_add(start)
-                    .ok_or(Error::CapacityExhausted("allocation offset"))?;
-                return Ok(AllocationBatch {
-                    offset,
-                    length: u32::try_from(length)
-                        .map_err(|_| Error::CapacityExhausted("allocation length"))?,
-                    stride: u32::try_from(stride)
-                        .map_err(|_| Error::CapacityExhausted("allocation stride"))?,
-                    count: reserved,
-                    block,
-                });
+                continue;
             }
+            let offset = self
+                .data_offset(block)?
+                .checked_add(start)
+                .ok_or(Error::CapacityExhausted("allocation offset"))?;
+            return Ok(AllocationBatch {
+                offset,
+                length: u32::try_from(length)
+                    .map_err(|_| Error::CapacityExhausted("allocation length"))?,
+                stride: u32::try_from(stride)
+                    .map_err(|_| Error::CapacityExhausted("allocation stride"))?,
+                count: reserved,
+                block,
+            });
         }
     }
 
@@ -252,109 +223,125 @@ impl BlockAllocator {
     }
 
     pub(crate) fn validate_release(&self, allocation: Allocation) -> Result<()> {
-        let old = self.block_word(allocation.block)?.load(Ordering::Acquire);
-        if !matches!(state(old)?, BlockState::Open | BlockState::Sealed) {
-            return Err(Error::Corrupt(
-                "released allocation belongs to an inactive block",
-            ));
+        self.validate_allocation(allocation)?;
+        loop {
+            let current = read_shared_u64(&self.current_block);
+            if current == CURRENT_INSTALLING {
+                std::hint::spin_loop();
+                continue;
+            }
+            if current != 0 && decode_block(current)? == allocation.block {
+                let word = read_shared_u64(&self.current_word);
+                if current_state(word)? == CurrentState::Open && current_live(word) != 0 {
+                    return Ok(());
+                }
+                std::hint::spin_loop();
+                continue;
+            }
+            let count = self.read_count(allocation.block)?;
+            return if count == 0 || count == u16::MAX {
+                Err(Error::Corrupt(
+                    "released allocation belongs to an inactive page",
+                ))
+            } else {
+                Ok(())
+            };
         }
-        if count(old) == 0 {
-            return Err(Error::Corrupt("block object count underflow"));
-        }
-        Ok(())
     }
 
     pub(crate) fn release_count(&self, allocation: Allocation) -> Result<()> {
-        let word = self.block_word(allocation.block)?;
+        self.validate_allocation(allocation)?;
         loop {
-            let old = word.load(Ordering::Acquire);
-            let block_state = state(old)?;
-            if !matches!(block_state, BlockState::Open | BlockState::Sealed) {
-                return Err(Error::Corrupt(
-                    "released allocation belongs to an inactive block",
-                ));
+            let current = read_shared_u64(&self.current_block);
+            if current == CURRENT_INSTALLING {
+                std::hint::spin_loop();
+                continue;
             }
-            let new_count = count(old)
-                .checked_sub(1)
-                .ok_or(Error::Corrupt("block object count underflow"))?;
-            let new_state = if block_state == BlockState::Sealed && new_count == 0 {
-                BlockState::Freeing
-            } else {
-                block_state
-            };
-            let new = pack(new_state, used(old), new_count);
-            if word
-                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                if new_state == BlockState::Freeing {
-                    self.enqueue_free(allocation.block)?;
+            if current != 0 && decode_block(current)? == allocation.block {
+                let old = read_shared_u64(&self.current_word);
+                if current_state(old)? != CurrentState::Open {
+                    std::hint::spin_loop();
+                    continue;
                 }
-                return Ok(());
+                let live = current_live(old)
+                    .checked_sub(1)
+                    .ok_or(Error::Corrupt("page allocation count underflow"))?;
+                let new = pack_current(CurrentState::Open, current_used(old), live)?;
+                if self
+                    .current_word
+                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            let count = self.count_word(allocation.block)?;
+            let mut old = self.read_count(allocation.block)?;
+            loop {
+                if old == 0 || old == u16::MAX {
+                    return Err(Error::Corrupt(
+                        "released allocation belongs to an inactive page",
+                    ));
+                }
+                match count.compare_exchange_weak(old, old - 1, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => return Ok(()),
+                    Err(actual) => old = actual,
+                }
             }
         }
     }
 
     pub(crate) fn recycle_empty_blocks(&self) -> Result<usize> {
-        let next = self.next_block_value()?;
-        let mut recycled = 0_usize;
-        for block in 0..next {
-            if self.recycle_sealed_if_empty(block)? {
-                recycled = recycled
-                    .checked_add(1)
-                    .ok_or(Error::CapacityExhausted("recycled block count"))?;
-            }
-        }
-        Ok(recycled)
+        let high_water = self.next_block_value()?;
+        let snapshot = self.count_snapshot(high_water)?;
+        Ok(snapshot
+            .chunks_exact(size_of::<u16>())
+            .filter(|bytes| *bytes == [0, 0])
+            .count())
     }
 
     pub(crate) fn seal_current(&self) -> Result<()> {
-        let current = self.current_block()?;
         loop {
-            let encoded = current.load(Ordering::Acquire);
+            let encoded = read_shared_u64(&self.current_block);
             if encoded == CURRENT_INSTALLING {
                 std::hint::spin_loop();
                 continue;
             }
-            let Some(block) = decode_block(encoded)? else {
+            if encoded == 0 {
                 return Ok(());
-            };
-            let word = self.block_word(block)?;
-            let old = word.load(Ordering::Acquire);
-            match state(old)? {
-                BlockState::Open => {
-                    let sealed = pack(BlockState::Sealed, used(old), count(old));
-                    if word
-                        .compare_exchange(old, sealed, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        let _cleared = current.compare_exchange(
-                            encoded,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        self.recycle_sealed_if_empty(block)?;
-                        return Ok(());
-                    }
-                }
-                BlockState::Preparing => std::hint::spin_loop(),
-                _ => {
-                    let _cleared =
-                        current.compare_exchange(encoded, 0, Ordering::AcqRel, Ordering::Acquire);
-                    self.recycle_sealed_if_empty(block)?;
-                    return Ok(());
-                }
             }
+            return self.seal_current_block(encoded, false);
         }
     }
 
     pub(crate) fn write(&self, allocation: Allocation, input: &[u8]) -> Result<()> {
-        if input.len() > allocation.length as usize {
+        self.write_at(allocation, 0, input)
+    }
+
+    pub(crate) fn write_at(
+        &self,
+        allocation: Allocation,
+        relative_offset: usize,
+        input: &[u8],
+    ) -> Result<()> {
+        let end = relative_offset
+            .checked_add(input.len())
+            .ok_or(Error::Corrupt("write range overflow"))?;
+        if end > allocation.length as usize {
             return Err(Error::Corrupt("write exceeds allocation"));
         }
+        let offset = allocation
+            .offset
+            .checked_add(
+                u64::try_from(relative_offset)
+                    .map_err(|_| Error::Corrupt("write offset overflow"))?,
+            )
+            .ok_or(Error::Corrupt("write offset overflow"))?;
         // SAFETY: a fresh Allocation is exclusively owned until its body node is published.
-        unsafe { self.data.copy_in(allocation.offset, input) }
+        unsafe { self.data.copy_in(offset, input) }
     }
 
     pub(crate) fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
@@ -382,7 +369,7 @@ impl BlockAllocator {
             .checked_add(u64::from(length))
             .ok_or(Error::Corrupt("allocation range overflow"))?;
         if end_relative.saturating_sub(1) / self.block_size != block {
-            return Err(Error::Corrupt("allocation crosses a block boundary"));
+            return Err(Error::Corrupt("allocation crosses a page boundary"));
         }
         Ok(Allocation {
             offset,
@@ -392,270 +379,309 @@ impl BlockAllocator {
     }
 
     pub(crate) fn sync_all(&self) -> Result<()> {
+        self.seal_current()?;
         self.data.sync_all()?;
         self.counts.sync_all()
     }
 
-    fn install_current(&self, current: &AtomicU64) -> Result<()> {
-        if current
+    fn install_current(&self, requested_bytes: u64) -> Result<()> {
+        if self
+            .current_block
             .compare_exchange(0, CURRENT_INSTALLING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Ok(());
         }
-        let block = match self.take_block() {
-            Ok(block) => block,
-            Err(error) => {
-                current
-                    .compare_exchange(CURRENT_INSTALLING, 0, Ordering::Release, Ordering::Acquire)
-                    .map_err(|_| Error::Corrupt("current-block install state changed"))?;
-                return Err(error);
+        let result = self.claim_page(requested_bytes);
+        match result {
+            Ok(block) => {
+                self.current_word
+                    .store(pack_current(CurrentState::Open, 0, 0)?, Ordering::Release);
+                self.current_block
+                    .store(encode_block(block)?, Ordering::Release);
+                Ok(())
             }
+            Err(error) => {
+                self.current_block.store(0, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn claim_page(&self, requested_bytes: u64) -> Result<u64> {
+        loop {
+            let high_water = self.next_block_value()?;
+            if let Some(block) = self.longest_zero_run(high_water)? {
+                if self
+                    .count_word(block)?
+                    .compare_exchange(0, u16::MAX, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Ok(block);
+                }
+                continue;
+            }
+            self.grow(requested_bytes)?;
+        }
+    }
+
+    fn seal_current_block(&self, encoded: u64, continue_run: bool) -> Result<()> {
+        let block = decode_block(encoded)?;
+        let next = if continue_run {
+            let next = block
+                .checked_add(1)
+                .ok_or(Error::CapacityExhausted("page index"))?;
+            if next < self.next_block_value()? && self.read_count(next)? == 0 {
+                Some(next)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        let encoded = encode_block(block)?;
-        current
+        if self
+            .current_block
             .compare_exchange(
-                CURRENT_INSTALLING,
                 encoded,
-                Ordering::Release,
+                CURRENT_INSTALLING,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|_| Error::Corrupt("current-block install state changed"))?;
-        Ok(())
-    }
-
-    fn take_block(&self) -> Result<u64> {
-        if let Some(block) = self.pop_free()? {
-            return Ok(block);
+            .is_err()
+        {
+            return Ok(());
         }
-        self.grow_block()
-    }
-
-    fn pop_free(&self) -> Result<Option<u64>> {
-        let head = self.free_head()?;
         loop {
-            let old = head.load(Ordering::Acquire);
-            let Some(block) = decode_free_head(old)? else {
-                return Ok(None);
-            };
-            let next = self.next_block()?.load(Ordering::Acquire) & !NEXT_GROWING_BIT;
-            if block >= next {
-                return Err(Error::Corrupt(
-                    "free-list block is beyond the high-water mark",
-                ));
+            let old = read_shared_u64(&self.current_word);
+            if current_state(old)? != CurrentState::Open {
+                self.current_block.store(encoded, Ordering::Release);
+                return Err(Error::Corrupt("unfinished page state is not open"));
             }
-            let link = self.free_link(block)?;
-            let next = link.load(Ordering::Acquire);
-            if next & !FREE_INDEX_MASK != 0 {
-                return Err(Error::Corrupt("free-list link has invalid tag bits"));
-            }
-            let new = advance_free_head(old, next);
-            if head
-                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+            let sealing =
+                pack_current(CurrentState::Sealing, current_used(old), current_live(old))?;
+            if self
+                .current_word
+                .compare_exchange(old, sealing, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 continue;
             }
-
-            let word = self.block_word(block)?;
-            let free = pack(BlockState::Free, 0, 0);
-            let preparing = pack(BlockState::Preparing, 0, 0);
-            word.compare_exchange(free, preparing, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| Error::Corrupt("free-list block is not free"))?;
-            cas_replace(link, 0);
-            word.compare_exchange(
-                preparing,
-                pack(BlockState::Open, 0, 0),
-                Ordering::Release,
-                Ordering::Acquire,
-            )
-            .map_err(|_| Error::Corrupt("reused block preparation state changed"))?;
-            return Ok(Some(block));
+            let count = self.count_word(block)?;
+            if count
+                .compare_exchange(
+                    u16::MAX,
+                    current_live(old),
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                self.current_block.store(encoded, Ordering::Release);
+                return Err(Error::Corrupt("unfinished page count marker changed"));
+            }
+            if let Some(next) = next {
+                self.count_word(next)?.store(u16::MAX, Ordering::Release);
+                self.current_word
+                    .store(pack_current(CurrentState::Open, 0, 0)?, Ordering::Release);
+                self.current_block
+                    .store(encode_block(next)?, Ordering::Release);
+            } else {
+                self.current_word.store(0, Ordering::Release);
+                self.current_block.store(0, Ordering::Release);
+            }
+            return Ok(());
         }
     }
 
-    fn grow_block(&self) -> Result<u64> {
-        let next = self.next_block()?;
+    fn grow(&self, requested_bytes: u64) -> Result<()> {
+        let high_water = self.high_water()?;
         loop {
-            let old = next.load(Ordering::Acquire);
-            if old & NEXT_GROWING_BIT != 0 {
+            let old = read_shared_u64(high_water);
+            if old & GROWING_BIT != 0 {
                 std::hint::spin_loop();
                 continue;
             }
             if old >= self.block_count {
                 return Err(Error::CapacityExhausted("mapped file"));
             }
-            let growing = old | NEXT_GROWING_BIT;
-            if next
-                .compare_exchange(old, growing, Ordering::AcqRel, Ordering::Acquire)
+            let requested_pages = requested_bytes
+                .checked_add(self.block_size - 1)
+                .ok_or(Error::CapacityExhausted("allocation growth"))?
+                / self.block_size;
+            let pages = requested_pages.max(1).min(self.block_count - old);
+            let new = old
+                .checked_add(pages)
+                .ok_or(Error::CapacityExhausted("page count"))?;
+            if high_water
+                .compare_exchange(old, old | GROWING_BIT, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 continue;
             }
 
-            let result = self.prepare_fresh_block(old);
-            let published = if result.is_ok() { old + 1 } else { old };
-            next.compare_exchange(growing, published, Ordering::Release, Ordering::Acquire)
+            let result = (|| -> Result<()> {
+                self.counts.grow(count_file_length(new)?)?;
+                self.data.grow(data_file_length(new, self.block_size)?)?;
+                self.data
+                    .reserve(self.data_offset(old)?, pages * self.block_size)
+            })();
+            let published = if result.is_ok() { new } else { old };
+            high_water
+                .compare_exchange(
+                    old | GROWING_BIT,
+                    published,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
                 .map_err(|_| Error::Corrupt("allocator growth state changed"))?;
-            result?;
-            return Ok(old);
+            return result;
         }
     }
 
-    fn prepare_fresh_block(&self, block: u64) -> Result<()> {
-        let blocks = block
-            .checked_add(1)
-            .ok_or(Error::CapacityExhausted("block count"))?;
-        self.counts.grow(count_file_length(blocks)?)?;
-        self.data.grow(data_file_length(blocks, self.block_size)?)?;
-
-        let word = self.block_word(block)?;
-        let unused = pack(BlockState::Unused, 0, 0);
-        let preparing = pack(BlockState::Preparing, 0, 0);
-        word.compare_exchange(unused, preparing, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::Corrupt("fresh block metadata is not unused"))?;
-        let offset = self.data_offset(block)?;
-        if let Err(error) = self.data.reserve(offset, self.block_size) {
-            let _reset =
-                word.compare_exchange(preparing, unused, Ordering::AcqRel, Ordering::Acquire);
-            return Err(error);
+    fn longest_zero_run(&self, high_water: u64) -> Result<Option<u64>> {
+        if high_water == 0 {
+            return Ok(None);
         }
-        word.compare_exchange(
-            preparing,
-            pack(BlockState::Open, 0, 0),
-            Ordering::Release,
-            Ordering::Acquire,
-        )
-        .map_err(|_| Error::Corrupt("fresh block preparation state changed"))?;
-        Ok(())
-    }
+        let snapshot = self.count_snapshot(high_water)?;
+        let entries = usize::try_from(high_water)
+            .map_err(|_| Error::Corrupt("page count does not fit memory"))?;
+        let mut best_start = 0_usize;
+        let mut best_length = 0_usize;
+        let mut run_start = 0_usize;
+        let mut run_length = 0_usize;
+        let mut run_claimable = true;
+        let mut index = 0_usize;
 
-    fn recycle_sealed_if_empty(&self, block: u64) -> Result<bool> {
-        let word = self.block_word(block)?;
-        loop {
-            let old = word.load(Ordering::Acquire);
-            match state(old)? {
-                BlockState::Sealed if count(old) == 0 => {
-                    let freeing = pack(BlockState::Freeing, used(old), 0);
-                    if word
-                        .compare_exchange(old, freeing, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        self.enqueue_free(block)?;
-                        return Ok(true);
+        while index + 16 <= entries {
+            let offset = index
+                .checked_mul(size_of::<u16>())
+                .ok_or(Error::Corrupt("count snapshot offset overflow"))?;
+            let values = snapshot
+                .get(offset..offset + 32)
+                .ok_or(Error::Corrupt("count snapshot is truncated"))?;
+            let zeroes = zero_mask_16(values);
+            for lane in 0..16 {
+                if zeroes & (1 << lane) != 0 {
+                    if run_length == 0 {
+                        run_start = index + lane;
+                        run_claimable =
+                            run_start == 0 || snapshot_count(&snapshot, run_start - 1)? != u16::MAX;
                     }
+                    run_length += 1;
+                    if run_claimable && run_length > best_length {
+                        best_start = run_start;
+                        best_length = run_length;
+                    }
+                } else {
+                    run_length = 0;
                 }
-                BlockState::Freeing => {
-                    std::hint::spin_loop();
-                }
-                _ => return Ok(false),
             }
+            index += 16;
+        }
+        while index < entries {
+            let offset = index
+                .checked_mul(size_of::<u16>())
+                .ok_or(Error::Corrupt("count snapshot offset overflow"))?;
+            let bytes = snapshot
+                .get(offset..offset + 2)
+                .ok_or(Error::Corrupt("count snapshot is truncated"))?;
+            if bytes == [0, 0] {
+                if run_length == 0 {
+                    run_start = index;
+                    run_claimable =
+                        run_start == 0 || snapshot_count(&snapshot, run_start - 1)? != u16::MAX;
+                }
+                run_length += 1;
+                if run_claimable && run_length > best_length {
+                    best_start = run_start;
+                    best_length = run_length;
+                }
+            } else {
+                run_length = 0;
+            }
+            index += 1;
+        }
+        if best_length == 0 {
+            Ok(None)
+        } else {
+            u64::try_from(best_start)
+                .map(Some)
+                .map_err(|_| Error::Corrupt("free-page index overflow"))
         }
     }
 
-    fn enqueue_free(&self, block: u64) -> Result<()> {
-        let word = self.block_word(block)?;
-        let old = word.load(Ordering::Acquire);
-        if state(old)? != BlockState::Freeing || count(old) != 0 {
-            return Err(Error::Corrupt("block is not ready for the free list"));
-        }
-        word.compare_exchange(
-            old,
-            pack(BlockState::Free, 0, 0),
-            Ordering::Release,
-            Ordering::Acquire,
-        )
-        .map_err(|_| Error::Corrupt("freeing block state changed"))?;
-
-        let head = self.free_head()?;
-        let link = self.free_link(block)?;
-        let encoded = encode_block(block)?;
-        loop {
-            let old_head = head.load(Ordering::Acquire);
-            cas_replace(link, old_head & FREE_INDEX_MASK);
-            let new_head = advance_free_head(old_head, encoded);
-            if head
-                .compare_exchange(old_head, new_head, Ordering::Release, Ordering::Acquire)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+    fn count_snapshot(&self, high_water: u64) -> Result<Vec<u8>> {
+        let bytes = high_water
+            .checked_mul(size_of::<u16>() as u64)
+            .ok_or(Error::Corrupt("count snapshot length overflow"))?;
+        let length = usize::try_from(bytes)
+            .map_err(|_| Error::Corrupt("count snapshot length does not fit memory"))?;
+        // This intentionally uses ordinary mapped reads so the zero comparison can be
+        // vectorized. The winning zero is always revalidated by compare-exchange.
+        self.counts.copy_out(COUNTS_START, length)
     }
 
     fn validate_header(&self) -> Result<()> {
-        let next = self.next_block_value()?;
-        if next > self.block_count {
+        let high_water = self.closed_block_value()?;
+        if high_water > self.block_count {
             return Err(Error::Corrupt("allocator high-water mark is out of range"));
         }
-        if self.counts.file_length() < count_file_length(next)? {
+        if self.counts.file_length() < count_file_length(high_water)? {
             return Err(Error::Corrupt(
-                "block-count file is shorter than its high-water mark",
+                "page-count file is shorter than its high-water mark",
             ));
         }
-        if self.data.file_length() < data_file_length(next, self.block_size)? {
+        if self.data.file_length() < data_file_length(high_water, self.block_size)? {
             return Err(Error::Corrupt(
                 "data file is shorter than its high-water mark",
             ));
         }
-
-        let current = self.current_block()?.load(Ordering::Acquire);
-        if current == CURRENT_INSTALLING {
+        let snapshot = self.count_snapshot(high_water)?;
+        if snapshot
+            .chunks_exact(size_of::<u16>())
+            .any(|bytes| bytes == u16::MAX.to_le_bytes())
+        {
             return Err(Error::Corrupt(
-                "allocator was closed while installing a current block",
+                "allocator was closed with an unfinished page",
             ));
-        }
-        if let Some(block) = decode_block(current)? {
-            if block >= next {
-                return Err(Error::Corrupt(
-                    "current block is beyond the high-water mark",
-                ));
-            }
-        }
-        let free = self.free_head()?.load(Ordering::Acquire);
-        if let Some(block) = decode_free_head(free)? {
-            if block >= next {
-                return Err(Error::Corrupt(
-                    "free-list head is beyond the high-water mark",
-                ));
-            }
         }
         Ok(())
     }
 
+    /// Reads the live high-water mark, waiting for the thread growing the mapped files to publish.
     fn next_block_value(&self) -> Result<u64> {
-        let next = self.next_block()?.load(Ordering::Acquire);
-        if next & NEXT_GROWING_BIT != 0 {
+        let high_water = self.high_water()?;
+        loop {
+            let value = read_shared_u64(high_water);
+            if value & GROWING_BIT == 0 {
+                return Ok(value);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Reads a persisted high-water mark when no growth operation may still be active.
+    fn closed_block_value(&self) -> Result<u64> {
+        let value = read_shared_u64(self.high_water()?);
+        if value & GROWING_BIT != 0 {
             return Err(Error::Corrupt("allocator was closed while growing"));
         }
-        Ok(next)
+        Ok(value)
     }
 
-    fn current_block(&self) -> Result<&AtomicU64> {
-        self.counts.atomic_u64(CURRENT_BLOCK_OFFSET)
+    fn high_water(&self) -> Result<&AtomicU64> {
+        self.counts.atomic_u64(HIGH_WATER_OFFSET)
     }
 
-    fn next_block(&self) -> Result<&AtomicU64> {
-        self.counts.atomic_u64(NEXT_BLOCK_OFFSET)
-    }
-
-    fn free_head(&self) -> Result<&AtomicU64> {
-        self.counts.atomic_u64(FREE_HEAD_OFFSET)
-    }
-
-    fn block_word(&self, block: u64) -> Result<&AtomicU64> {
+    fn count_word(&self, block: u64) -> Result<&AtomicU16> {
         if block >= self.block_count {
-            return Err(Error::Corrupt("block index is out of range"));
+            return Err(Error::Corrupt("page index is out of range"));
         }
         let offset = block
-            .checked_mul(size_of::<u64>() as u64)
+            .checked_mul(size_of::<u16>() as u64)
             .and_then(|value| value.checked_add(COUNTS_START))
-            .ok_or(Error::Corrupt("block-count offset overflow"))?;
-        self.counts.atomic_u64(offset)
-    }
-
-    fn free_link(&self, block: u64) -> Result<&AtomicU64> {
-        self.data.atomic_u64(self.data_offset(block)?)
+            .ok_or(Error::Corrupt("page-count offset overflow"))?;
+        self.counts.atomic_u16(offset)
     }
 
     fn data_offset(&self, block: u64) -> Result<u64> {
@@ -663,9 +689,31 @@ impl BlockAllocator {
             .checked_add(
                 block
                     .checked_mul(self.block_size)
-                    .ok_or(Error::CapacityExhausted("block offset"))?,
+                    .ok_or(Error::CapacityExhausted("page offset"))?,
             )
-            .ok_or(Error::CapacityExhausted("block offset"))
+            .ok_or(Error::CapacityExhausted("page offset"))
+    }
+
+    fn read_count(&self, block: u64) -> Result<u16> {
+        if block >= self.block_count {
+            return Err(Error::Corrupt("page index is out of range"));
+        }
+        let offset = block
+            .checked_mul(size_of::<u16>() as u64)
+            .and_then(|value| value.checked_add(COUNTS_START))
+            .ok_or(Error::Corrupt("page-count offset overflow"))?;
+        let bytes = self.counts.copy_out(offset, size_of::<u16>())?;
+        let array = <[u8; 2]>::try_from(bytes.as_slice())
+            .map_err(|_| Error::Corrupt("page-count entry is truncated"))?;
+        Ok(u16::from_le_bytes(array))
+    }
+
+    fn validate_allocation(&self, allocation: Allocation) -> Result<()> {
+        let expected = self.allocation_for(allocation.offset, allocation.length)?;
+        if expected.block != allocation.block {
+            return Err(Error::Corrupt("allocation page does not match its offset"));
+        }
+        Ok(())
     }
 
     fn validate_data_range(&self, offset: u64, length: usize) -> Result<()> {
@@ -685,17 +733,17 @@ impl BlockAllocator {
 
 fn validate_layout(capacity: u64, block_size: u64) -> Result<()> {
     if capacity == 0 || block_size < FORMAT_PAGE_SIZE || !block_size.is_power_of_two() {
-        return Err(Error::InvalidConfig("invalid block allocator layout"));
+        return Err(Error::InvalidConfig("invalid page allocator layout"));
     }
     if capacity % block_size != 0 || block_size > u64::from(u32::MAX) {
         return Err(Error::InvalidConfig(
-            "allocator capacity or block size is not representable",
+            "allocator capacity or page size is not representable",
         ));
     }
     let block_count = capacity / block_size;
     if block_count == 0 || block_count > u64::from(u32::MAX) {
         return Err(Error::InvalidConfig(
-            "allocator block count exceeds the tagged free-list format",
+            "allocator page count is not representable",
         ));
     }
     Ok(())
@@ -712,23 +760,21 @@ pub(crate) fn file_lengths(capacity: u64, block_size: u64) -> Result<(u64, u64, 
 
 pub(crate) fn read_high_water(counts_path: &Path) -> Result<u64> {
     let mut counts = std::fs::File::open(counts_path)?;
-    let mut allocator_header = [0_u8; 16];
-    counts.read_exact(&mut allocator_header)?;
-    let mut next_bytes = [0_u8; 8];
-    next_bytes.copy_from_slice(&allocator_header[8..16]);
-    let next = u64::from_le_bytes(next_bytes);
-    if next & NEXT_GROWING_BIT != 0 {
+    let mut bytes = [0_u8; 8];
+    counts.read_exact(&mut bytes)?;
+    let high_water = u64::from_le_bytes(bytes);
+    if high_water & GROWING_BIT != 0 {
         return Err(Error::Corrupt("allocator was closed while growing"));
     }
-    Ok(next)
+    Ok(high_water)
 }
 
 pub(crate) fn count_file_length(blocks: u64) -> Result<u64> {
     blocks
-        .checked_mul(size_of::<u64>() as u64)
+        .checked_mul(size_of::<u16>() as u64)
         .and_then(|bytes| bytes.checked_add(COUNTS_START))
         .and_then(|bytes| align_up(bytes, FORMAT_PAGE_SIZE))
-        .ok_or(Error::InvalidConfig("block-count file size overflow"))
+        .ok_or(Error::InvalidConfig("page-count file size overflow"))
 }
 
 fn data_file_length(blocks: u64, block_size: u64) -> Result<u64> {
@@ -738,71 +784,128 @@ fn data_file_length(blocks: u64, block_size: u64) -> Result<u64> {
         .ok_or(Error::InvalidConfig("data file size overflow"))
 }
 
-const fn pack(block_state: BlockState, used: u32, count: u32) -> u64 {
-    (block_state as u64) << STATE_SHIFT | (count as u64) << COUNT_SHIFT | used as u64
+fn pack_current(state: CurrentState, used: u64, live: u16) -> Result<u64> {
+    let used = u32::try_from(used).map_err(|_| Error::CapacityExhausted("page offset"))?;
+    Ok((state as u64) << STATE_SHIFT | u64::from(live) << LIVE_SHIFT | u64::from(used))
 }
 
-const fn used(word: u64) -> u32 {
-    (word & USED_MASK) as u32
+const fn current_used(word: u64) -> u64 {
+    word & USED_MASK
 }
 
-const fn count(word: u64) -> u32 {
-    ((word & COUNT_MASK) >> COUNT_SHIFT) as u32
+const fn current_live(word: u64) -> u16 {
+    ((word & LIVE_MASK) >> LIVE_SHIFT) as u16
 }
 
-fn state(word: u64) -> Result<BlockState> {
+fn current_state(word: u64) -> Result<CurrentState> {
     match (word >> STATE_SHIFT) as u8 {
-        0 => Ok(BlockState::Unused),
-        1 => Ok(BlockState::Preparing),
-        2 => Ok(BlockState::Open),
-        3 => Ok(BlockState::Sealed),
-        4 => Ok(BlockState::Freeing),
-        5 => Ok(BlockState::Free),
-        _ => Err(Error::Corrupt("unknown block state")),
+        0 => Ok(CurrentState::Empty),
+        1 => Ok(CurrentState::Open),
+        2 => Ok(CurrentState::Sealing),
+        _ => Err(Error::Corrupt("unknown unfinished-page state")),
     }
 }
 
 fn encode_block(block: u64) -> Result<u64> {
-    let encoded = block
+    block
         .checked_add(1)
-        .ok_or(Error::CapacityExhausted("block index"))?;
-    u32::try_from(encoded)
-        .map(u64::from)
-        .map_err(|_| Error::CapacityExhausted("block index"))
+        .ok_or(Error::CapacityExhausted("page index"))
 }
 
-fn decode_block(encoded: u64) -> Result<Option<u64>> {
-    if encoded & !FREE_INDEX_MASK != 0 {
-        return Err(Error::Corrupt("encoded block index has tag bits"));
-    }
-    if encoded == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(encoded - 1))
-    }
+fn read_shared_u64(atomic: &AtomicU64) -> u64 {
+    // SAFETY: supported targets provide aligned single-copy 64-bit reads. A following acquire
+    // fence orders data published before the CAS that installed the observed state.
+    let value = unsafe { std::ptr::read_volatile(atomic.as_ptr()) };
+    std::sync::atomic::fence(Ordering::Acquire);
+    value
+}
+fn decode_block(encoded: u64) -> Result<u64> {
+    encoded
+        .checked_sub(1)
+        .ok_or(Error::Corrupt("encoded page index is null"))
 }
 
-fn decode_free_head(head: u64) -> Result<Option<u64>> {
-    decode_block(head & FREE_INDEX_MASK)
+fn snapshot_count(snapshot: &[u8], index: usize) -> Result<u16> {
+    let offset = index
+        .checked_mul(size_of::<u16>())
+        .ok_or(Error::Corrupt("count snapshot offset overflow"))?;
+    let bytes = snapshot
+        .get(offset..offset + size_of::<u16>())
+        .ok_or(Error::Corrupt("count snapshot is truncated"))?;
+    let array =
+        <[u8; 2]>::try_from(bytes).map_err(|_| Error::Corrupt("page-count entry is truncated"))?;
+    Ok(u16::from_le_bytes(array))
 }
 
-fn advance_free_head(old: u64, encoded_block: u64) -> u64 {
-    let tag = (old >> 32).wrapping_add(1) & FREE_INDEX_MASK;
-    tag << 32 | encoded_block
-}
-
-fn cas_replace(atomic: &AtomicU64, replacement: u64) {
-    let mut old = atomic.load(Ordering::Acquire);
-    loop {
-        match atomic.compare_exchange(old, replacement, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(actual) => old = actual,
+fn zero_mask_16(bytes: &[u8]) -> u32 {
+    debug_assert_eq!(bytes.len(), 32);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected and the caller supplies 32 readable bytes.
+            return unsafe { zero_mask_16_avx2(bytes.as_ptr()) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: AArch64 guarantees NEON and the caller supplies 32 readable bytes.
+        return unsafe { zero_mask_16_neon(bytes.as_ptr()) };
+    }
+    let mut mask = 0_u32;
+    for (lane, value) in bytes.chunks_exact(2).enumerate() {
+        if value == [0, 0] {
+            mask |= 1 << lane;
+        }
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::cast_ptr_alignment)]
+unsafe fn zero_mask_16_avx2(pointer: *const u8) -> u32 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi16, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_setzero_si256,
+    };
+
+    // SAFETY: guaranteed by the caller; the unaligned load reads exactly 32 bytes.
+    let values = unsafe { _mm256_loadu_si256(pointer.cast::<__m256i>()) };
+    let compared = _mm256_cmpeq_epi16(values, _mm256_setzero_si256());
+    let byte_mask = u32::from_ne_bytes(_mm256_movemask_epi8(compared).to_ne_bytes());
+    let mut lane_mask = 0_u32;
+    for lane in 0..16 {
+        if byte_mask & (3 << (lane * 2)) == 3 << (lane * 2) {
+            lane_mask |= 1 << lane;
+        }
+    }
+    lane_mask
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn zero_mask_16_neon(pointer: *const u8) -> u32 {
+    use std::arch::aarch64::{vceqq_u16, vdupq_n_u16, vld1q_u16, vst1q_u16};
+
+    let mut compared = [0_u16; 8];
+    let mut mask = 0_u32;
+    for half in 0..2 {
+        // SAFETY: guaranteed by the caller; each load reads one 16-byte half.
+        let values = unsafe { vld1q_u16(pointer.add(half * 16).cast::<u16>()) };
+        let zeroes = vceqq_u16(values, vdupq_n_u16(0));
+        // SAFETY: `compared` has space for all eight lanes.
+        unsafe { vst1q_u16(compared.as_mut_ptr(), zeroes) };
+        for (lane, value) in compared.iter().enumerate() {
+            if *value == u16::MAX {
+                mask |= 1 << (half * 8 + lane);
+            }
+        }
+    }
+    mask
 }
 
 #[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn test_paths(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -814,248 +917,191 @@ mod tests {
         )
     }
 
-    #[test]
-    fn reserves_largest_fitting_batch_with_one_metadata_update() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-batch");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * 2,
-            FORMAT_PAGE_SIZE,
-        )?;
-
-        let expected = usize::try_from(FORMAT_PAGE_SIZE / 16)
-            .map_err(|_| Error::InvalidConfig("test batch size does not fit memory"))?;
-        let batch = allocator.allocate_batch(16, 8, expected + 1)?;
-        assert_eq!(batch.len(), expected);
-        let allocations: Vec<Allocation> = batch.allocations().collect();
-        assert_eq!(allocations[0].offset, DATA_START);
-        assert_eq!(
-            allocations[expected - 1].offset,
-            DATA_START + FORMAT_PAGE_SIZE - 16
-        );
-        let word = allocator.block_word(0)?.load(Ordering::Acquire);
-        assert_eq!(
-            used(word),
-            u32::try_from(FORMAT_PAGE_SIZE).unwrap_or(u32::MAX)
-        );
-        assert_eq!(count(word), u32::try_from(expected).unwrap_or(u32::MAX));
-
-        let next = allocator.allocate_batch(16, 8, 4)?;
-        assert_eq!(next.block, 1);
-        assert_eq!(next.len(), 4);
-
-        drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
-        Ok(())
+    fn cleanup(paths: &(std::path::PathBuf, std::path::PathBuf)) {
+        let _ignored_data = std::fs::remove_file(&paths.0);
+        let _ignored_counts = std::fs::remove_file(&paths.1);
     }
 
     #[test]
-    fn grows_only_without_free_blocks_and_reuses_lifo() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-free-list");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * 3,
-            FORMAT_PAGE_SIZE,
-        )?;
-        let page_size = usize::try_from(FORMAT_PAGE_SIZE)
-            .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
-
-        assert_eq!(std::fs::metadata(&data_path)?.len(), DATA_START);
-        let first = allocator.allocate(page_size - 8, 8)?;
-        let second = allocator.allocate(page_size - 8, 8)?;
-        let third = allocator.allocate(16, 8)?;
-        assert_eq!((first.block, second.block, third.block), (0, 1, 2));
-        let grown_length = std::fs::metadata(&data_path)?.len();
-        assert_eq!(grown_length, DATA_START + FORMAT_PAGE_SIZE * 3);
-
-        allocator.release(first)?;
-        allocator.release(second)?;
+    fn reserves_largest_fitting_batch_and_reuses_zero_page() -> Result<()> {
+        let paths = test_paths("allocator-batch");
+        cleanup(&paths);
+        let allocator = BlockAllocator::create(&paths.0, &paths.1, 64 * 1_024 * 2, 64 * 1_024)?;
+        let batch = allocator.allocate_batch(32, 32, 3_000)?;
+        assert_eq!(batch.len(), 2_048);
+        let allocations = batch.allocations().collect::<Vec<_>>();
+        for allocation in allocations {
+            allocator.release(allocation)?;
+        }
         allocator.seal_current()?;
-        let reused = allocator.allocate(16, 8)?;
-        assert_eq!(reused.block, 1);
-        assert_eq!(std::fs::metadata(&data_path)?.len(), grown_length);
-
+        let reused = allocator.allocate(32, 32)?;
+        assert_eq!(reused.block, 0);
+        allocator.release(reused)?;
+        allocator.sync_all()?;
         drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
+        cleanup(&paths);
         Ok(())
     }
 
     #[test]
-    fn persists_free_list_across_clean_reopen() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-reopen");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let capacity = FORMAT_PAGE_SIZE * 2;
+    fn live_high_water_reader_waits_for_growth_publication() -> Result<()> {
+        let paths = test_paths("allocator-live-growth");
+        cleanup(&paths);
+        let allocator = Arc::new(BlockAllocator::create(
+            &paths.0,
+            &paths.1,
+            64 * 1_024 * 2,
+            64 * 1_024,
+        )?);
+        allocator
+            .high_water()?
+            .store(GROWING_BIT, Ordering::Release);
+
+        let publisher = Arc::clone(&allocator);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            publisher.high_water().unwrap().store(0, Ordering::Release);
+        });
+        assert_eq!(allocator.next_block_value()?, 0);
+        thread.join().unwrap();
+
+        allocator.sync_all()?;
+        drop(allocator);
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[test]
+    fn grows_by_requested_batch_extent() -> Result<()> {
+        let paths = test_paths("allocator-growth");
+        cleanup(&paths);
+        let allocator = BlockAllocator::create(&paths.0, &paths.1, 64 * 1_024 * 4, 64 * 1_024)?;
+        let allocation = allocator.allocate_batch(32, 32, 4_096)?;
+        assert_eq!(allocation.len(), 2_048);
+        assert_eq!(read_high_water(&paths.1)?, 2);
+        allocator.sync_all()?;
+        drop(allocator);
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[test]
+    fn consumes_contiguous_zero_run_after_first_cas() -> Result<()> {
+        let paths = test_paths("allocator-contiguous-run");
+        cleanup(&paths);
+        let allocator = BlockAllocator::create(&paths.0, &paths.1, 64 * 1_024 * 4, 64 * 1_024)?;
+
+        let first = allocator.allocate_batch(32, 32, 6_144)?;
+        assert_eq!(first.block, 0);
+        assert_eq!(allocator.read_count(0)?, u16::MAX);
+        assert_eq!(allocator.read_count(1)?, 0);
+        assert_eq!(allocator.read_count(2)?, 0);
+
+        let second = allocator.allocate_batch(32, 32, 6_144)?;
+        assert_eq!(second.block, 1);
+        assert_eq!(allocator.read_count(0)?, 2_048);
+        assert_eq!(allocator.read_count(1)?, u16::MAX);
+        assert_eq!(allocator.read_count(2)?, 0);
+
+        let third = allocator.allocate_batch(32, 32, 6_144)?;
+        assert_eq!(third.block, 2);
+        assert_eq!(allocator.read_count(1)?, 2_048);
+        assert_eq!(allocator.read_count(2)?, u16::MAX);
+        assert_eq!(read_high_water(&paths.1)?, 3);
+
+        allocator.sync_all()?;
+        drop(allocator);
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_zero_tail_after_claimed_page() -> Result<()> {
+        let paths = test_paths("allocator-claimed-predecessor");
+        cleanup(&paths);
+        let allocator = BlockAllocator::create(&paths.0, &paths.1, 64 * 1_024 * 6, 64 * 1_024)?;
+
+        let first = allocator.allocate_batch(32, 32, 12_288)?;
+        assert_eq!(first.block, 0);
+        assert_eq!(read_high_water(&paths.1)?, 6);
+        allocator.count_word(3)?.store(1, Ordering::Release);
+        assert_eq!(allocator.longest_zero_run(6)?, Some(4));
+
+        drop(allocator);
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_reopen_preserves_sixteen_bit_counts() -> Result<()> {
+        let paths = test_paths("allocator-reopen");
+        cleanup(&paths);
+        let allocation;
         {
-            let allocator =
-                BlockAllocator::create(&data_path, &count_path, capacity, FORMAT_PAGE_SIZE)?;
-            let page_size = usize::try_from(FORMAT_PAGE_SIZE)
-                .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
-            let first = allocator.allocate(page_size - 8, 8)?;
-            let _second = allocator.allocate(16, 8)?;
-            allocator.release(first)?;
-            allocator.seal_current()?;
+            let allocator = BlockAllocator::create(&paths.0, &paths.1, 64 * 1_024 * 2, 64 * 1_024)?;
+            allocation = allocator.allocate(64, 8)?;
             allocator.sync_all()?;
         }
-
-        let length = std::fs::metadata(&data_path)?.len();
-        let reopened = BlockAllocator::open(&data_path, &count_path, capacity, FORMAT_PAGE_SIZE)?;
-        let reused = reopened.allocate(16, 8)?;
-        assert_eq!(reused.block, 0);
-        assert_eq!(std::fs::metadata(&data_path)?.len(), length);
-
-        drop(reopened);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
+        {
+            let allocator = BlockAllocator::open(&paths.0, &paths.1, 64 * 1_024 * 2, 64 * 1_024)?;
+            allocator.release(allocation)?;
+            let reused = allocator.allocate(64, 8)?;
+            assert_eq!(reused.block, allocation.block);
+            allocator.release(reused)?;
+            allocator.sync_all()?;
+        }
+        cleanup(&paths);
         Ok(())
     }
 
     #[test]
-    fn reserves_and_counts_concurrent_allocations_with_cas() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-concurrent");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * 4,
-            FORMAT_PAGE_SIZE,
-        )?;
-        std::thread::scope(|scope| {
-            for _index in 0..8 {
-                scope.spawn(|| {
-                    for _iteration in 0..16 {
-                        let allocation = allocator.allocate(16, 8);
-                        assert!(allocation.is_ok());
+    fn concurrent_reservations_do_not_overlap() -> Result<()> {
+        let paths = test_paths("allocator-concurrent");
+        cleanup(&paths);
+        let allocator = Arc::new(BlockAllocator::create(
+            &paths.0,
+            &paths.1,
+            64 * 1_024 * 8,
+            64 * 1_024,
+        )?);
+        let mut offsets = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _thread in 0..8 {
+                let allocator = Arc::clone(&allocator);
+                handles.push(scope.spawn(move || -> Result<Vec<u64>> {
+                    let mut offsets = Vec::new();
+                    for _allocation in 0..256 {
+                        offsets.push(allocator.allocate(32, 32)?.offset);
                     }
-                });
+                    Ok(offsets)
+                }));
             }
-        });
+            let mut offsets = Vec::new();
+            for handle in handles {
+                offsets.extend(
+                    handle
+                        .join()
+                        .map_err(|_| Error::Corrupt("allocator test thread panicked"))??,
+                );
+            }
+            Ok::<Vec<u64>, Error>(offsets)
+        })?;
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 8 * 256);
+        allocator.sync_all()?;
         drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
+        cleanup(&paths);
         Ok(())
     }
 
     #[test]
-    fn reserves_concurrent_batches_with_cas() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-concurrent-batch");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * 2,
-            FORMAT_PAGE_SIZE,
-        )?;
-        std::thread::scope(|scope| {
-            for _worker in 0..8 {
-                scope.spawn(|| {
-                    let batch = allocator.allocate_batch(16, 8, 16);
-                    assert!(matches!(batch, Ok(batch) if batch.len() == 16));
-                });
-            }
-        });
-        let word = allocator.block_word(0)?.load(Ordering::Acquire);
-        assert_eq!(used(word), 2_048);
-        assert_eq!(count(word), 128);
-
-        drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn concurrently_freed_blocks_are_reused_without_growth() -> Result<()> {
-        const BLOCKS: usize = 8;
-
-        let (data_path, count_path) = test_paths("allocator-concurrent-free");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * BLOCKS as u64,
-            FORMAT_PAGE_SIZE,
-        )?;
-        let page_size = usize::try_from(FORMAT_PAGE_SIZE)
-            .map_err(|_| Error::InvalidConfig("test page size does not fit usize"))?;
-        let mut allocations = Vec::new();
-        allocations
-            .try_reserve_exact(BLOCKS)
-            .map_err(|_| Error::OutOfMemory)?;
-        for _block in 0..BLOCKS {
-            allocations.push(allocator.allocate(page_size - 8, 8)?);
-        }
-        allocator.seal_current()?;
-        let grown_length = std::fs::metadata(&data_path)?.len();
-
-        std::thread::scope(|scope| {
-            for allocation in &allocations {
-                let allocator_ref = &allocator;
-                let allocation = *allocation;
-                scope.spawn(move || {
-                    assert!(allocator_ref.release(allocation).is_ok());
-                });
-            }
-        });
-
-        let mut seen = [false; BLOCKS];
-        for _block in 0..BLOCKS {
-            let allocation = allocator.allocate(page_size - 8, 8)?;
-            let block = usize::try_from(allocation.block)
-                .map_err(|_| Error::Corrupt("reused block index does not fit usize"))?;
-            let present = seen
-                .get_mut(block)
-                .ok_or(Error::Corrupt("reused block index is out of range"))?;
-            assert!(!*present);
-            *present = true;
-        }
-        assert!(seen.into_iter().all(|present| present));
-        assert_eq!(std::fs::metadata(&data_path)?.len(), grown_length);
-
-        drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn advances_when_a_block_object_count_is_saturated() -> Result<()> {
-        let (data_path, count_path) = test_paths("allocator-count-saturation");
-        let _ignored_data = std::fs::remove_file(&data_path);
-        let _ignored_counts = std::fs::remove_file(&count_path);
-        let allocator = BlockAllocator::create(
-            &data_path,
-            &count_path,
-            FORMAT_PAGE_SIZE * 2,
-            FORMAT_PAGE_SIZE,
-        )?;
-        let first = allocator.allocate(8, 8)?;
-        let word = allocator.block_word(first.block)?;
-        loop {
-            let old = word.load(Ordering::Acquire);
-            let saturated = pack(BlockState::Open, used(old), MAX_COUNT);
-            if word
-                .compare_exchange(old, saturated, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-        }
-        assert_eq!(allocator.allocate(8, 8)?.block, 1);
-        drop(allocator);
-        std::fs::remove_file(data_path)?;
-        std::fs::remove_file(count_path)?;
-        Ok(())
+    fn simd_zero_mask_finds_zero_lanes() {
+        let mut values = [1_u16; 16];
+        values[0] = 0;
+        values[7] = 0;
+        values[15] = 0;
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), 32) };
+        assert_eq!(zero_mask_16(bytes), 1 | 1 << 7 | 1 << 15);
     }
 }

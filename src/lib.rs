@@ -2,11 +2,11 @@
 
 //! A CAS-only concurrent, memory-mapped database for Floresta.
 //!
-//! The crate stores fixed-width keys in a separately chained hash table. Writers
-//! publish fully initialized nodes with compare-and-swap operations. Batch APIs
-//! SIMD-hash keys and process buckets in ascending order. Unique deletions unlink
-//! nodes directly, and empty blocks enter a tagged CAS free list for reuse before
-//! mapped backing files grow.
+//! The crate stores 16-byte keys in a separately chained hash table. Writers
+//! publish fully initialized 32-byte nodes with compare-and-swap operations.
+//! Batch APIs SIMD-hash keys, process buckets in ascending order, and read blobs
+//! by ascending offset. Empty allocation pages are found by SIMD zero scans over
+//! persistent 16-bit counts before mapped files grow.
 //!
 //! Storage is supported on 64-bit little-endian Linux and macOS targets.
 //! Windows targets compile for API portability but storage operations return
@@ -18,12 +18,12 @@
 //! use floresta_db::{Config, Database, Mode};
 //!
 //! let path = "/var/lib/floresta/utxo";
-//! let mut config = Config::new(Mode::Map, 1 << 20, 36);
+//! let mut config = Config::new(Mode::Map, 1 << 20);
 //! config.body_capacity = 8 << 30;
 //! config.blob_capacity = 8 << 30;
 //!
 //! let database = Database::create(path, config)?;
-//! database.put(&[0; 36], b"serialized output")?;
+//! database.put(b"utxo-key-0000000", b"serialized output")?;
 //! database.checkpoint()?;
 //! # Ok::<(), floresta_db::Error>(())
 //! ```
@@ -42,7 +42,7 @@ mod node;
 mod platform;
 mod table;
 
-pub use config::{Config, DEFAULT_HASH_SEED, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE, Mode};
+pub use config::{Config, DEFAULT_HASH_SEED, KEY_SIZE, MAX_INLINE_VALUE_SIZE, Mode};
 pub use error::{Error, Result};
 pub use hash::xxh64;
 pub use table::{Database, PutResult, WriteOnlyWriter};

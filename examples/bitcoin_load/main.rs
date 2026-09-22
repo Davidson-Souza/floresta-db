@@ -26,7 +26,7 @@ use floresta_db::{Config, Database, Error, Mode};
 use hintsfile::{EliasFano, HintsfileBuilder};
 use memmap2::MmapOptions;
 
-const OUTPOINT_KEY_SIZE: usize = 12;
+const OUTPOINT_KEY_SIZE: usize = 16;
 const OUTPUT_INDEX_SIZE: usize = size_of::<u64>();
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const DEFAULT_BUCKETS: u64 = 1 << 20;
@@ -38,13 +38,12 @@ const MAX_ADDER_LEAD_BLOCKS: u64 = 4096;
 const UNPROCESSED_COUNT: u32 = u32::MAX;
 const BIP30_UNSPENDABLE_HEIGHTS: [u64; 2] = [91_722, 91_812];
 const BODY_DATA_START: usize = 65_536;
-const BODY_NODE_FIXED_SIZE: usize = 56;
-const BODY_NODE_ALIGNMENT: usize = 8;
-const BODY_BLOB_OFFSET: usize = 16;
-const BODY_BLOB_LENGTH_OFFSET: usize = 24;
-const BODY_MAGIC_OFFSET: usize = 32;
-const BODY_BLOB_CHECKSUM_OFFSET: usize = 48;
-const BODY_NODE_MAGIC: u64 = 0x4341_534e_4f44_4531;
+const BODY_NODE_SIZE: usize = 32;
+const BODY_VALUE_OFFSET: usize = 16;
+const BODY_POINTER_OFFSET: usize = 24;
+const BODY_POINTER_CHECKSUM_SHIFT: u32 = 48;
+const BODY_VALUE_BLOB_TAG: u64 = 1 << 63;
+const BODY_NODE_CHECKSUM_SEED: u64 = 0x4341_534e_4f44_4532;
 #[cfg(not(test))]
 const SORT_RUN_VALUE_CAPACITY: usize = 1 << 20;
 #[cfg(test)]
@@ -547,8 +546,8 @@ fn should_index_output(
 fn outpoint_key(outpoint: OutPoint) -> [u8; OUTPOINT_KEY_SIZE] {
     let txid = outpoint.txid.to_byte_array();
     let mut key = [0_u8; OUTPOINT_KEY_SIZE];
-    key[..8].copy_from_slice(&txid[..8]);
-    key[8..].copy_from_slice(&outpoint.vout.to_le_bytes());
+    key[..12].copy_from_slice(&txid[..12]);
+    key[12..].copy_from_slice(&outpoint.vout.to_le_bytes());
     key
 }
 
@@ -670,13 +669,7 @@ fn destructive_sort_body_values(
     }
     let block_size = usize::try_from(block_size)
         .map_err(|_| invalid_input("database block size does not fit memory"))?;
-    let node_size = align_usize(
-        BODY_NODE_FIXED_SIZE
-            .checked_add(OUTPOINT_KEY_SIZE)
-            .ok_or_else(|| invalid_input("body node size overflow"))?,
-        BODY_NODE_ALIGNMENT,
-    )
-    .ok_or_else(|| invalid_input("body node alignment overflow"))?;
+    let node_size = BODY_NODE_SIZE;
     let body_file = File::open(body_path)?;
     // SAFETY: indexing is complete, Database::close has unmapped the file, and this mapping is
     // read-only. Scoped scan workers cannot outlive `mapping`.
@@ -782,31 +775,28 @@ fn scan_body_runs(
             let slot = mapping
                 .get(offset..end)
                 .ok_or_else(|| io::Error::other("body node is outside its mapping"))?;
-            let magic = read_body_u64(slot, BODY_MAGIC_OFFSET)?;
-            if magic == 0 {
+            let pointer = read_body_u64(slot, BODY_POINTER_OFFSET)?;
+            if pointer == 0 {
                 relative = relative
                     .checked_add(node_size)
                     .ok_or_else(|| io::Error::other("body node stride overflow"))?;
                 continue;
             }
-            if magic != BODY_NODE_MAGIC {
+            let value = read_body_u64(slot, BODY_VALUE_OFFSET)?;
+            if value & BODY_VALUE_BLOB_TAG != 0 {
                 return Err(io::Error::other(format!(
-                    "invalid body node magic at offset {offset}"
+                    "offline hint sort found a blob value at body offset {offset}"
                 ))
                 .into());
             }
-            let value_length = read_body_u64(slot, BODY_BLOB_LENGTH_OFFSET)?;
-            if value_length != OUTPUT_INDEX_SIZE as u64 {
+            let key: &[u8; OUTPOINT_KEY_SIZE] = slot[..OUTPOINT_KEY_SIZE]
+                .try_into()
+                .map_err(|_| io::Error::other("body key has the wrong width"))?;
+            let expected_checksum = u16::try_from(pointer >> BODY_POINTER_CHECKSUM_SHIFT)
+                .map_err(|_| io::Error::other("body checksum does not fit u16"))?;
+            if body_node_checksum(key, value) != expected_checksum {
                 return Err(io::Error::other(format!(
-                    "invalid inline value length at body offset {offset}"
-                ))
-                .into());
-            }
-            let value = read_body_u64(slot, BODY_BLOB_OFFSET)?;
-            let expected_checksum = read_body_u64(slot, BODY_BLOB_CHECKSUM_OFFSET)?;
-            if floresta_db::xxh64(&value.to_le_bytes(), BODY_NODE_MAGIC) != expected_checksum {
-                return Err(io::Error::other(format!(
-                    "inline value checksum mismatch at body offset {offset}"
+                    "body node checksum mismatch at offset {offset}"
                 ))
                 .into());
             }
@@ -1031,13 +1021,11 @@ fn read_body_u64(slot: &[u8], offset: usize) -> AnyResult<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn align_usize(value: usize, alignment: usize) -> Option<usize> {
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return None;
-    }
-    value
-        .checked_add(alignment - 1)
-        .map(|sum| sum & !(alignment - 1))
+fn body_node_checksum(key: &[u8; OUTPOINT_KEY_SIZE], value: u64) -> u16 {
+    let checksum = floresta_db::xxh64(key, BODY_NODE_CHECKSUM_SEED) ^ value.rotate_left(29);
+    let folded = checksum ^ (checksum >> 16) ^ (checksum >> 32) ^ (checksum >> 48);
+    let bytes = folded.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]]).max(1)
 }
 
 struct SortRun {
@@ -1138,11 +1126,9 @@ fn block_count_slots(end_height: u64) -> AnyResult<Box<[AtomicU32]>> {
 }
 
 fn database_config(arguments: &Arguments, tip_height: u64) -> AnyResult<Config> {
-    let mut config = Config::new(Mode::Map, arguments.buckets, OUTPOINT_KEY_SIZE);
-    config.inline_value_size = OUTPUT_INDEX_SIZE;
+    let mut config = Config::new(Mode::Map, arguments.buckets);
     config.block_size = arguments.database_block_bytes;
     config.body_capacity = arguments.body_capacity;
-    config.blob_capacity = 0;
     let minimum_body = tip_height
         .checked_add(1)
         .and_then(|blocks| blocks.checked_mul(96))
@@ -1673,8 +1659,8 @@ mod tests {
             txid: Txid::from_byte_array(txid),
             vout: 0x0102_0304,
         });
-        assert_eq!(&key[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(&key[8..], &[4, 3, 2, 1]);
+        assert_eq!(&key[..12], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(&key[12..], &[4, 3, 2, 1]);
     }
 
     #[test]
@@ -1786,11 +1772,9 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("floresta-db-hints-sort-{}", std::process::id()));
         let _ignored = std::fs::remove_dir_all(&directory);
-        let mut config = Config::new(Mode::Map, 8, OUTPOINT_KEY_SIZE);
-        config.inline_value_size = OUTPUT_INDEX_SIZE;
+        let mut config = Config::new(Mode::Map, 8);
         config.block_size = 64 * 1_024;
         config.body_capacity = config.block_size * 2;
-        config.blob_capacity = 0;
         let database = Database::create(&directory, config.clone())?;
         let mut keys = Vec::new();
         let positions = [

@@ -35,10 +35,6 @@ impl Mapping {
         self.pointer
     }
 
-    pub(crate) fn advise_random(&self, _file: &File) -> Result<()> {
-        Err(Error::Unsupported(UNSUPPORTED))
-    }
-
     pub(crate) fn advise_heads(&self) -> Result<()> {
         Err(Error::Unsupported(UNSUPPORTED))
     }

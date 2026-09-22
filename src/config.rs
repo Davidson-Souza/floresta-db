@@ -6,7 +6,7 @@
 //! that cannot be represented safely by the on-disk format.
 
 use crate::error::{Error, Result};
-use crate::layout::{FORMAT_PAGE_SIZE, align_up};
+use crate::layout::{DATA_START, FORMAT_PAGE_SIZE, NODE_POINTER_MASK, NODE_SIZE_U64};
 
 /// The default seed used for key hashing.
 ///
@@ -17,17 +17,18 @@ use crate::layout::{FORMAT_PAGE_SIZE, align_up};
 /// ```
 pub const DEFAULT_HASH_SEED: u64 = 0;
 
-/// The largest fixed key width accepted by [`Config`].
+/// Required key width for every database operation.
 ///
 /// # Examples
 ///
 /// ```
-/// assert_eq!(floresta_db::MAX_KEY_SIZE, 4_096);
+/// assert_eq!(floresta_db::KEY_SIZE, 16);
 /// ```
-pub const MAX_KEY_SIZE: usize = 4_096;
+pub const KEY_SIZE: usize = 16;
 
-/// The largest value width that can be stored directly inside a node.
+/// Width of a value that can be stored directly in a node.
 ///
+/// Eight-byte map values whose high bit is clear are inlined automatically.
 /// # Examples
 ///
 /// ```
@@ -44,8 +45,8 @@ pub const MAX_INLINE_VALUE_SIZE: usize = size_of::<u64>();
 /// ```
 /// use floresta_db::{Config, Mode};
 ///
-/// let set = Config::new(Mode::Set, 1_024, 32);
-/// let map = Config::new(Mode::Map, 1_024, 32);
+/// let set = Config::new(Mode::Set, 1_024);
+/// let map = Config::new(Mode::Map, 1_024);
 /// assert_ne!(set.mode, map.mode);
 /// ```
 pub enum Mode {
@@ -60,14 +61,14 @@ pub enum Mode {
 /// Defines the persistent layout of a database.
 ///
 /// Capacities are maximum virtual mappings and must be multiples of
-/// [`Config::block_size`]. Backing files grow one block at a time as needed.
+/// [`Config::block_size`]. Backing files grow by request-sized page extents.
 ///
 /// # Examples
 ///
 /// ```
 /// use floresta_db::{Config, Mode};
 ///
-/// let mut config = Config::new(Mode::Map, 1 << 20, 36);
+/// let mut config = Config::new(Mode::Map, 1 << 20);
 /// config.body_capacity = 8 << 30;
 /// config.blob_capacity = 8 << 30;
 /// config.validate()?;
@@ -79,12 +80,6 @@ pub struct Config {
 
     /// Number of hash buckets fixed at database creation.
     pub bucket_count: u64,
-
-    /// Required key width in bytes.
-    pub key_size: usize,
-
-    /// Fixed value width stored inside each node, or zero to use the blob file.
-    pub inline_value_size: usize,
 
     /// Maximum logical bytes reserved for body nodes.
     pub body_capacity: u64,
@@ -101,7 +96,7 @@ pub struct Config {
 
 impl Config {
     #[must_use]
-    /// Creates a configuration with one-GiB sparse capacities and one-MiB blocks.
+    /// Creates a configuration with one-GiB sparse capacities and one-MiB pages.
     ///
     /// Set mode starts with zero blob capacity. Map mode starts with one GiB of
     /// blob capacity and stores variable-width values there.
@@ -109,19 +104,17 @@ impl Config {
     /// # Examples
     ///
     /// ```
-    /// use floresta_db::{Config, Mode};
+    /// use floresta_db::{Config, KEY_SIZE, Mode};
     ///
-    /// let config = Config::new(Mode::Set, 4_096, 32);
+    /// let config = Config::new(Mode::Set, 4_096);
     /// assert_eq!(config.bucket_count, 4_096);
-    /// assert_eq!(config.key_size, 32);
+    /// assert_eq!(KEY_SIZE, 16);
     /// assert_eq!(config.blob_capacity, 0);
     /// ```
-    pub fn new(mode: Mode, bucket_count: u64, key_size: usize) -> Self {
+    pub fn new(mode: Mode, bucket_count: u64) -> Self {
         Self {
             mode,
             bucket_count,
-            key_size,
-            inline_value_size: 0,
             body_capacity: 1 << 30,
             blob_capacity: if mode == Mode::Map { 1 << 30 } else { 0 },
             block_size: 1 << 20,
@@ -141,7 +134,7 @@ impl Config {
     /// ```
     /// use floresta_db::{Config, Mode};
     ///
-    /// let config = Config::new(Mode::Map, 1_024, 36);
+    /// let config = Config::new(Mode::Map, 1_024);
     /// config.validate()?;
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
@@ -149,31 +142,21 @@ impl Config {
         if self.bucket_count == 0 {
             return Err(Error::InvalidConfig("bucket count must be nonzero"));
         }
-        if self.key_size == 0 || self.key_size > MAX_KEY_SIZE {
-            return Err(Error::InvalidConfig(
-                "key size must be between 1 and 4096 bytes",
-            ));
-        }
         if self.body_capacity == 0 {
             return Err(Error::InvalidConfig("body capacity must be nonzero"));
         }
-        if self.inline_value_size > MAX_INLINE_VALUE_SIZE {
+        if self.body_capacity > NODE_POINTER_MASK.saturating_sub(DATA_START) {
             return Err(Error::InvalidConfig(
-                "inline value size cannot exceed eight bytes",
+                "body capacity exceeds the packed node-pointer range",
             ));
         }
-        if self.mode == Mode::Map && self.inline_value_size == 0 && self.blob_capacity == 0 {
+        if self.mode == Mode::Map && self.blob_capacity == 0 {
             return Err(Error::InvalidConfig(
-                "map mode without inline values requires nonzero blob capacity",
+                "map mode requires nonzero fallback blob capacity",
             ));
         }
-        if self.mode == Mode::Map && self.inline_value_size != 0 && self.blob_capacity != 0 {
-            return Err(Error::InvalidConfig(
-                "inline map values cannot use blob capacity",
-            ));
-        }
-        if self.mode == Mode::Set && (self.blob_capacity != 0 || self.inline_value_size != 0) {
-            return Err(Error::InvalidConfig("set mode cannot have values"));
+        if self.mode == Mode::Set && self.blob_capacity != 0 {
+            return Err(Error::InvalidConfig("set mode cannot have blob capacity"));
         }
         if self.block_size < FORMAT_PAGE_SIZE || !self.block_size.is_power_of_two() {
             return Err(Error::InvalidConfig(
@@ -189,21 +172,10 @@ impl Config {
         if self.blob_capacity % self.block_size != 0 {
             return Err(Error::InvalidConfig("blob capacity must be block aligned"));
         }
-        let node_size = self.node_size()?;
-        if node_size > self.block_size {
-            return Err(Error::InvalidConfig("body block cannot hold one node"));
+        if NODE_SIZE_U64 > self.block_size {
+            return Err(Error::InvalidConfig("body page cannot hold one node"));
         }
         Ok(())
-    }
-
-    pub(crate) fn node_size(&self) -> Result<u64> {
-        let key_size = u64::try_from(self.key_size)
-            .map_err(|_| Error::InvalidConfig("key size does not fit the file format"))?;
-        let unaligned = crate::layout::NODE_FIXED_SIZE
-            .checked_add(key_size)
-            .ok_or(Error::InvalidConfig("node size overflow"))?;
-        align_up(unaligned, crate::layout::NODE_ALIGNMENT)
-            .ok_or(Error::InvalidConfig("node size overflow"))
     }
 }
 
@@ -213,20 +185,19 @@ mod tests {
 
     #[test]
     fn validates_default_map_configuration() -> Result<()> {
-        Config::new(Mode::Map, 1_024, 36).validate()
+        Config::new(Mode::Map, 1_024).validate()
     }
 
     #[test]
     fn rejects_blob_capacity_for_set() {
-        let mut config = Config::new(Mode::Set, 1, 32);
+        let mut config = Config::new(Mode::Set, 1);
         config.blob_capacity = 4_096;
         assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
     }
 
     #[test]
-    fn aligns_nodes_for_tagged_atomic_links() -> Result<()> {
-        let config = Config::new(Mode::Set, 1, 37);
-        assert_eq!(config.node_size()? % crate::layout::NODE_ALIGNMENT, 0);
-        Ok(())
+    fn uses_fixed_cache_aligned_node_size() {
+        assert_eq!(crate::layout::NODE_SIZE, 32);
+        assert_eq!(NODE_SIZE_U64, 32);
     }
 }

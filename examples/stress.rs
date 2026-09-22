@@ -59,7 +59,7 @@ fn run_case(threads: usize, blocks: usize, outputs_per_block: usize) -> Result<C
         .ok_or(Error::InvalidConfig("stress operation count overflow"))?;
     let body_capacity = capacity_for(creations, 80)?;
     let blob_capacity = capacity_for(creations, 16)?;
-    let mut config = Config::new(Mode::Map, next_power_of_two(creations / 2 + 1)?, 8);
+    let mut config = Config::new(Mode::Map, next_power_of_two(creations / 2 + 1)?);
     config.block_size = BLOCK_SIZE;
     config.body_capacity = body_capacity;
     config.blob_capacity = blob_capacity;
@@ -122,7 +122,7 @@ fn worker(
     blocks: usize,
     outputs_per_block: usize,
 ) -> Result<WorkerStats> {
-    let mut due = Vec::<Vec<[u8; 8]>>::new();
+    let mut due = Vec::<Vec<[u8; 16]>>::new();
     due.try_reserve_exact(SPEND_WINDOW + 1)
         .map_err(|_| Error::OutOfMemory)?;
     for _index in 0..=SPEND_WINDOW {
@@ -149,7 +149,10 @@ fn worker(
             let thread_bits = u64::try_from(thread)
                 .map_err(|_| Error::InvalidConfig("thread index overflow"))?
                 << 56;
-            let key = (thread_bits | sequence).to_le_bytes();
+            let encoded = (thread_bits | sequence).to_le_bytes();
+            let mut key = [0_u8; 16];
+            key[..8].copy_from_slice(&encoded);
+            key[8..].copy_from_slice(&(thread_bits | sequence).rotate_left(29).to_le_bytes());
             sequence = sequence
                 .checked_add(1)
                 .ok_or(Error::CapacityExhausted("stress key sequence"))?;

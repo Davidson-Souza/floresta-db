@@ -24,7 +24,6 @@ const MAP_PRIVATE: c_int = 0x0002;
 const MAP_FIXED: c_int = 0x0010;
 const MAP_ANON: c_int = 0x1000;
 const MS_SYNC: c_int = 0x10;
-const MADV_RANDOM: c_int = 1;
 const MADV_WILLNEED: c_int = 3;
 const F_PREALLOCATE: c_int = 42;
 const F_ALLOCATECONTIG: u32 = 0x0000_0002;
@@ -112,16 +111,13 @@ impl Mapping {
         self.pointer
     }
 
-    pub(crate) fn advise_random(&self, _file: &File) -> Result<()> {
-        self.advise_range(self.committed.load(Ordering::Acquire), MADV_RANDOM)
-    }
-
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     pub(crate) fn advise_heads(&self) -> Result<()> {
-        self.advise_range(self.committed.load(Ordering::Acquire), MADV_RANDOM)
+        Ok(())
     }
 
     pub(crate) fn sync(&self, length: usize) -> Result<()> {
-        if length > self.committed.load(Ordering::Acquire) {
+        if length > read_shared(&self.committed) {
             return Err(Error::Corrupt("sync range exceeds macOS file mapping"));
         }
         // SAFETY: the mapping base is page aligned and length lies inside mapped file segments.
@@ -129,7 +125,7 @@ impl Mapping {
     }
 
     pub(crate) fn grow(&self, file: &File, old: usize, new: usize) -> Result<()> {
-        if self.committed.load(Ordering::Acquire) != old || old >= new || new > self.length {
+        if read_shared(&self.committed) != old || old >= new || new > self.length {
             return Err(Error::Corrupt("invalid macOS mapping growth range"));
         }
         self.map_file_segment(file, old, new - old)?;
@@ -171,6 +167,14 @@ impl Mapping {
         // SAFETY: pointer and length identify contiguous committed file segments.
         errno_result(unsafe { madvise(self.pointer.as_ptr().cast::<c_void>(), length, advice) })
     }
+}
+
+fn read_shared(atomic: &AtomicUsize) -> usize {
+    // SAFETY: supported targets provide aligned single-copy pointer-width reads. The acquire
+    // fence orders mapped segments initialized before the committed length was published.
+    let value = unsafe { std::ptr::read_volatile(atomic.as_ptr()) };
+    std::sync::atomic::fence(Ordering::Acquire);
+    value
 }
 
 impl Drop for Mapping {

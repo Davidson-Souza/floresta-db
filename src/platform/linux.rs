@@ -15,9 +15,7 @@ const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
 const MAP_POPULATE: c_int = 0x08_000;
 const MS_SYNC: c_int = 0x4;
-const MADV_RANDOM: c_int = 1;
 const MADV_DONTDUMP: c_int = 16;
-const POSIX_FADV_RANDOM: c_int = 1;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 
 unsafe extern "C" {
@@ -33,7 +31,6 @@ unsafe extern "C" {
     fn madvise(address: *mut c_void, length: usize, advice: c_int) -> c_int;
     fn msync(address: *mut c_void, length: usize, flags: c_int) -> c_int;
     fn fallocate(file_descriptor: c_int, mode: c_int, offset: i64, length: i64) -> c_int;
-    fn posix_fadvise(file_descriptor: c_int, offset: i64, length: i64, advice: c_int) -> c_int;
 }
 
 pub(crate) struct Mapping {
@@ -75,25 +72,6 @@ impl Mapping {
 
     pub(crate) fn pointer(&self) -> NonNull<u8> {
         self.pointer
-    }
-
-    pub(crate) fn advise_random(&self, file: &File) -> Result<()> {
-        // SAFETY: pointer and length identify this live mapping.
-        errno_result(unsafe {
-            madvise(
-                self.pointer.as_ptr().cast::<c_void>(),
-                self.length,
-                MADV_RANDOM,
-            )
-        })?;
-        // POSIX returns an error number directly rather than setting errno.
-        // SAFETY: the descriptor remains open for Mapping's lifetime.
-        let result = unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_RANDOM) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(result).into())
-        }
     }
 
     pub(crate) fn advise_heads(&self) -> Result<()> {

@@ -10,7 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::layout::FORMAT_PAGE_SIZE;
@@ -116,10 +116,6 @@ impl MappedFile {
         })
     }
 
-    pub(crate) fn advise_random(&self) -> Result<()> {
-        self.mapping.advise_random(&self.file)
-    }
-
     pub(crate) fn advise_heads(&self) -> Result<()> {
         self.mapping.advise_heads()
     }
@@ -135,7 +131,7 @@ impl MappedFile {
             .map_err(|_| Error::Corrupt("new file length does not fit memory"))?;
 
         loop {
-            let old = self.file_length.load(Ordering::Acquire);
+            let old = read_shared(&self.file_length);
             if old & GROWING_BIT != 0 {
                 std::hint::spin_loop();
                 continue;
@@ -173,7 +169,7 @@ impl MappedFile {
 
     pub(crate) fn file_length(&self) -> u64 {
         loop {
-            let length = self.file_length.load(Ordering::Acquire);
+            let length = read_shared(&self.file_length);
             if length & GROWING_BIT == 0 {
                 return length;
             }
@@ -207,6 +203,21 @@ impl MappedFile {
         // pattern, and all shared accesses to this location use AtomicU64.
         #[allow(clippy::cast_ptr_alignment)]
         Ok(unsafe { &*pointer.cast::<AtomicU64>() })
+    }
+
+    pub(crate) fn atomic_u16(&self, offset: u64) -> Result<&AtomicU16> {
+        self.checked_range(offset, size_of::<u16>() as u64)?;
+        let offset =
+            usize::try_from(offset).map_err(|_| Error::Corrupt("atomic offset overflow"))?;
+        // SAFETY: the checked offset is in this stable mapping. Alignment is checked below.
+        let pointer = unsafe { self.mapping.pointer().as_ptr().add(offset) };
+        if pointer as usize % align_of::<AtomicU16>() != 0 {
+            return Err(Error::Corrupt("atomic offset is not aligned"));
+        }
+        // SAFETY: mapped files are zero-initialized before use, AtomicU16 accepts every bit
+        // pattern, and mutations of count entries use AtomicU16 compare-exchange operations.
+        #[allow(clippy::cast_ptr_alignment)]
+        Ok(unsafe { &*pointer.cast::<AtomicU16>() })
     }
 
     pub(crate) fn copy_out(&self, offset: u64, length: usize) -> Result<Vec<u8>> {
@@ -267,6 +278,14 @@ impl MappedFile {
         }
         Ok(())
     }
+}
+
+fn read_shared(atomic: &AtomicU64) -> u64 {
+    // SAFETY: supported targets provide aligned single-copy 64-bit reads. The acquire fence
+    // orders mapping state initialized before the CAS that published this length.
+    let value = unsafe { std::ptr::read_volatile(atomic.as_ptr()) };
+    std::sync::atomic::fence(Ordering::Acquire);
+    value
 }
 
 fn validate_mapping_length(length: u64) -> Result<()> {
