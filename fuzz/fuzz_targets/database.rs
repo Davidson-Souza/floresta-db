@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use floresta_db::{Config, Database, Mode};
 use libfuzzer_sys::fuzz_target;
 
-const RECORD_BYTES: usize = 17;
+const KEY_BYTES: usize = 16;
+const VALUE_BYTES: usize = 8;
+const RECORD_BYTES: usize = 1 + KEY_BYTES + VALUE_BYTES;
 const MAX_OPERATIONS: usize = 1_024;
 const FUZZ_CAPACITY: u64 = 1 << 20;
 const BLOCK_SIZE: u64 = 65_536;
@@ -45,24 +47,24 @@ fuzz_target!(|input: &[u8]| {
 });
 
 fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
-    let mut config = Config::new(Mode::Map, 64, 8);
+    let mut config = Config::new(Mode::Map, 64);
     config.body_capacity = FUZZ_CAPACITY;
     config.blob_capacity = FUZZ_CAPACITY;
     config.block_size = BLOCK_SIZE;
 
     let mut database = Database::create(path, config)?;
-    let mut model = BTreeMap::<[u8; 8], Vec<[u8; 8]>>::new();
+    let mut model = BTreeMap::<[u8; KEY_BYTES], Vec<[u8; VALUE_BYTES]>>::new();
 
     for (step, record) in input
         .chunks_exact(RECORD_BYTES)
         .take(MAX_OPERATIONS)
         .enumerate()
     {
-        let mut key = [0_u8; 8];
-        key.copy_from_slice(&record[1..9]);
+        let mut key = [0_u8; KEY_BYTES];
+        key.copy_from_slice(&record[1..1 + KEY_BYTES]);
 
-        let mut value = [0_u8; 8];
-        value.copy_from_slice(&record[9..17]);
+        let mut value = [0_u8; VALUE_BYTES];
+        value.copy_from_slice(&record[1 + KEY_BYTES..RECORD_BYTES]);
 
         match record[0] % 9 {
             0 => {
@@ -115,17 +117,20 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
             }
 
             6 => {
+                let second_key = key_from_value(&value);
+                let reverse_value = key[..VALUE_BYTES].try_into()?;
                 let entries = [
                     (key.as_slice(), value.as_slice()),
-                    (value.as_slice(), key.as_slice()),
+                    (second_key.as_slice(), reverse_value.as_slice()),
                 ];
                 database.write_only()?.put_batch(entries)?;
                 model.entry(key).or_default().push(value);
-                model.entry(value).or_default().push(key);
+                model.entry(second_key).or_default().push(reverse_value);
             }
 
             7 => {
-                let keys = [key.as_slice(), value.as_slice()];
+                let second_key = key_from_value(&value);
+                let keys = [key.as_slice(), second_key.as_slice()];
                 let actual = database.batch_fetch(keys)?;
                 compare_value(
                     step,
@@ -135,12 +140,12 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
                 compare_value(
                     step,
                     actual[1].as_deref(),
-                    model.get(&value).and_then(|values| values.last()),
+                    model.get(&second_key).and_then(|values| values.last()),
                 )?;
             }
 
             8 => {
-                let mut second_key = value;
+                let mut second_key = key_from_value(&value);
                 if second_key == key {
                     second_key[0] ^= 1;
                 }
@@ -163,7 +168,7 @@ fn exercise(input: &[u8], path: &Path) -> Result<(), Box<dyn StdError>> {
 fn verify_model(
     step: usize,
     database: &Database,
-    model: &BTreeMap<[u8; 8], Vec<[u8; 8]>>,
+    model: &BTreeMap<[u8; KEY_BYTES], Vec<[u8; VALUE_BYTES]>>,
 ) -> Result<(), Box<dyn StdError>> {
     for (key, values) in model {
         let expected = values
@@ -175,7 +180,10 @@ fn verify_model(
     Ok(())
 }
 
-fn delete_model(model: &mut BTreeMap<[u8; 8], Vec<[u8; 8]>>, key: &[u8; 8]) -> bool {
+fn delete_model(
+    model: &mut BTreeMap<[u8; KEY_BYTES], Vec<[u8; VALUE_BYTES]>>,
+    key: &[u8; KEY_BYTES],
+) -> bool {
     let Some(values) = model.get_mut(key) else {
         return false;
     };
@@ -189,7 +197,7 @@ fn delete_model(model: &mut BTreeMap<[u8; 8], Vec<[u8; 8]>>, key: &[u8; 8]) -> b
 fn compare_value(
     step: usize,
     actual: Option<&[u8]>,
-    expected: Option<&[u8; 8]>,
+    expected: Option<&[u8; VALUE_BYTES]>,
 ) -> Result<(), io::Error> {
     let matches = match (actual, expected) {
         (None, None) => true,
@@ -202,6 +210,15 @@ fn compare_value(
     } else {
         Err(mismatch(step, "lookup result"))
     }
+}
+
+fn key_from_value(value: &[u8; VALUE_BYTES]) -> [u8; KEY_BYTES] {
+    let mut key = [0_u8; KEY_BYTES];
+    key[..VALUE_BYTES].copy_from_slice(value);
+    for (destination, source) in key[VALUE_BYTES..].iter_mut().zip(value.iter().rev()) {
+        *destination = !*source;
+    }
+    key
 }
 
 fn ensure_equal(

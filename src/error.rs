@@ -22,7 +22,7 @@ use std::io;
 ///     config.validate()
 /// }
 ///
-/// validate(&Config::new(Mode::Set, 64, 32))?;
+/// validate(&Config::new(Mode::Set, 64))?;
 /// # Ok::<(), floresta_db::Error>(())
 /// ```
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -36,10 +36,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// use floresta_db::Error;
 ///
 /// let error = Error::InvalidKeyLength {
-///     expected: 36,
+///     expected: 16,
 ///     actual: 32,
 /// };
-/// assert_eq!(error.to_string(), "invalid key length: expected 36, got 32");
+/// assert_eq!(error.to_string(), "invalid key length: expected 16, got 32");
 /// ```
 pub enum Error {
     /// An operating-system or filesystem operation failed.
@@ -54,9 +54,9 @@ pub enum Error {
         &'static str,
     ),
 
-    /// A key does not match the width fixed at database creation.
+    /// A key does not match the fixed database key width.
     InvalidKeyLength {
-        /// The configured key width.
+        /// The required key width.
         expected: usize,
 
         /// The supplied key width.

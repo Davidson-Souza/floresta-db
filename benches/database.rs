@@ -194,10 +194,7 @@ fn entries(data: &BenchData) -> impl ExactSizeIterator<Item = (&[u8], &[u8])> + 
 }
 
 fn inline_map_config(items: usize) -> AnyResult<Config> {
-    let mut config = base_config(Mode::Map, items)?;
-    config.inline_value_size = VALUE_SIZE;
-    config.blob_capacity = 0;
-    Ok(config)
+    base_config(Mode::Map, items)
 }
 
 fn blob_map_config(items: usize) -> AnyResult<Config> {
@@ -218,7 +215,7 @@ fn base_config(mode: Mode, items: usize) -> AnyResult<Config> {
         .max(1_024)
         .checked_next_power_of_two()
         .ok_or_else(|| io::Error::other("benchmark bucket count overflow"))?;
-    let mut config = Config::new(mode, u64::try_from(buckets)?, KEY_SIZE);
+    let mut config = Config::new(mode, u64::try_from(buckets)?);
     config.block_size = BLOCK_SIZE;
     config.body_capacity = storage_capacity(items, 128)?;
     Ok(config)
