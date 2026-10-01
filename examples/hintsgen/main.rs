@@ -38,9 +38,9 @@ const UNPROCESSED_COUNT: u32 = u32::MAX;
 const BIP30_UNSPENDABLE_HEIGHTS: [u64; 2] = [91_722, 91_812];
 const COMPACTION_MIN_PAGE_LOAD: u16 = 8_192;
 #[cfg(not(test))]
-const SORT_RUN_VALUE_CAPACITY: usize = 1 << 20;
+const POSITION_RUN_VALUE_CAPACITY: usize = 1 << 20;
 #[cfg(test)]
-const SORT_RUN_VALUE_CAPACITY: usize = 4;
+const POSITION_RUN_VALUE_CAPACITY: usize = 4;
 const SORT_PROGRESS_INTERVAL: u64 = 10_000_000;
 
 // Kernel and hintsfile errors are both Send + Sync, so worker failures can cross scoped threads.
@@ -211,6 +211,7 @@ fn run() -> AnyResult<()> {
         compaction.remaining_candidate_pages
     ));
     database.close()?;
+    log_progress(format_args!("stage=index event=close_complete"));
 
     let hints_path = arguments.work_dir.join("swiftsync.hints");
     let hints_started = Instant::now();
@@ -424,7 +425,7 @@ fn remove_worker(
     let mut stats = WorkerStats::default();
     let mut keys = Vec::new();
     let mut input_ranges = Vec::new();
-    let mut spent_positions = SortRunCollector::new(run_directory, worker)?;
+    let mut spent_positions = PositionRunCollector::new(run_directory, worker)?;
     loop {
         progress.check_abort()?;
         let safe_height = progress.minimum_adder();
@@ -496,7 +497,7 @@ fn pop_spent_positions(
     database: &Database,
     keys: &[[u8; OUTPOINT_KEY_SIZE]],
     input_ranges: &[(u64, usize, usize)],
-    spent_positions: &mut SortRunCollector<'_>,
+    spent_positions: &mut PositionRunCollector<'_>,
 ) -> AnyResult<u64> {
     let popped = database.batch_pop(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
     for (input, value) in popped.into_iter().enumerate() {
@@ -710,7 +711,7 @@ fn fold_output_counts(counts: &[u32]) -> AnyResult<Vec<u64>> {
 
 fn write_hintsfile(
     directory: &Path,
-    spent_runs: &[SortRun],
+    spent_runs: &[PositionRun],
     tip_height: u64,
     counts: &[u32],
     offsets: &[u64],
@@ -734,6 +735,7 @@ fn write_hintsfile(
         "stage=hints event=sort_start runs={} spent_outputs={spent_outputs}",
         spent_runs.len()
     ));
+    sort_position_runs(spent_runs)?;
     merge_sort_runs(&sorted_spent_path, spent_runs, spent_outputs)?;
     log_progress(format_args!(
         "stage=hints event=sort_complete spent_outputs={spent_outputs}"
@@ -769,14 +771,13 @@ fn write_hintsfile(
     })
 }
 
-fn write_sort_run(
+fn write_position_run(
     directory: &Path,
     worker: usize,
     run_index: usize,
     values: &mut Vec<u64>,
-) -> AnyResult<SortRun> {
-    values.sort_unstable();
-    let path = directory.join(format!(".hints-sort-{worker:04}-{run_index:06}.run"));
+) -> AnyResult<PositionRun> {
+    let path = directory.join(format!(".hints-positions-{worker:04}-{run_index:06}.run"));
     let result = (|| -> AnyResult<()> {
         let file = OpenOptions::new()
             .write(true)
@@ -795,18 +796,56 @@ fn write_sort_run(
         return Err(error);
     }
     let count = u64::try_from(values.len())
-        .map_err(|_| invalid_input("sort run value count does not fit u64"))?;
+        .map_err(|_| invalid_input("position run value count does not fit u64"))?;
     values.clear();
     log_progress(format_args!(
-        "stage=hints event=sort_run worker={worker} run={run_index} values={count}"
+        "stage=index event=position_run_written worker={worker} run={run_index} values={count}"
     ));
-    Ok(SortRun {
+    Ok(PositionRun {
         path,
         values: count,
     })
 }
 
-fn merge_sort_runs(output_path: &Path, runs: &[SortRun], expected_values: u64) -> AnyResult<()> {
+fn sort_position_runs(runs: &[PositionRun]) -> AnyResult<()> {
+    for (index, run) in runs.iter().enumerate() {
+        let value_count = usize::try_from(run.values)
+            .map_err(|_| invalid_input("position run length does not fit memory"))?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(value_count)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut reader = ValueReader::open_run(run)?;
+        while let Some(value) = reader.next_value()? {
+            values.push(value);
+        }
+        values.sort_unstable();
+
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&run.path)?;
+        let mut writer = BufWriter::new(file);
+        for value in values {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        log_progress(format_args!(
+            "stage=hints event=sort_run run={} runs={} values={}",
+            index.saturating_add(1),
+            runs.len(),
+            run.values
+        ));
+    }
+    Ok(())
+}
+
+fn merge_sort_runs(
+    output_path: &Path,
+    runs: &[PositionRun],
+    expected_values: u64,
+) -> AnyResult<()> {
     let temporary_path = output_path.with_extension("sorted");
     let mut output = TemporarySortOutput::create(temporary_path)?;
     let mut readers = Vec::new();
@@ -938,19 +977,19 @@ fn encode_unspent_hintsfile(
     Ok(encoded_outputs)
 }
 
-struct SortRunCollector<'directory> {
+struct PositionRunCollector<'directory> {
     directory: &'directory Path,
     worker: usize,
     next_index: usize,
     values: Vec<u64>,
-    runs: Vec<SortRun>,
+    runs: Vec<PositionRun>,
 }
 
-impl<'directory> SortRunCollector<'directory> {
+impl<'directory> PositionRunCollector<'directory> {
     fn new(directory: &'directory Path, worker: usize) -> AnyResult<Self> {
         let mut values = Vec::new();
         values
-            .try_reserve_exact(SORT_RUN_VALUE_CAPACITY)
+            .try_reserve_exact(POSITION_RUN_VALUE_CAPACITY)
             .map_err(|_| Error::OutOfMemory)?;
         Ok(Self {
             directory,
@@ -963,13 +1002,13 @@ impl<'directory> SortRunCollector<'directory> {
 
     fn push(&mut self, position: u64) -> AnyResult<()> {
         self.values.push(position);
-        if self.values.len() == SORT_RUN_VALUE_CAPACITY {
+        if self.values.len() == POSITION_RUN_VALUE_CAPACITY {
             self.flush()?;
         }
         Ok(())
     }
 
-    fn finish(mut self) -> AnyResult<Vec<SortRun>> {
+    fn finish(mut self) -> AnyResult<Vec<PositionRun>> {
         self.flush()?;
         Ok(self.runs)
     }
@@ -981,9 +1020,9 @@ impl<'directory> SortRunCollector<'directory> {
         let following_index = self
             .next_index
             .checked_add(1)
-            .ok_or_else(|| invalid_input("sort run index overflow"))?;
+            .ok_or_else(|| invalid_input("position run index overflow"))?;
         self.runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        self.runs.push(write_sort_run(
+        self.runs.push(write_position_run(
             self.directory,
             self.worker,
             self.next_index,
@@ -994,12 +1033,12 @@ impl<'directory> SortRunCollector<'directory> {
     }
 }
 
-struct SortRun {
+struct PositionRun {
     path: PathBuf,
     values: u64,
 }
 
-impl Drop for SortRun {
+impl Drop for PositionRun {
     fn drop(&mut self) {
         let _removed = std::fs::remove_file(&self.path);
     }
@@ -1011,14 +1050,14 @@ struct ValueReader {
 }
 
 impl ValueReader {
-    fn open_run(run: &SortRun) -> AnyResult<Self> {
+    fn open_run(run: &PositionRun) -> AnyResult<Self> {
         let expected_length = run
             .values
             .checked_mul(size_of::<u64>() as u64)
-            .ok_or_else(|| io::Error::other("sort run length overflow"))?;
+            .ok_or_else(|| io::Error::other("position run length overflow"))?;
         let file = File::open(&run.path)?;
         if file.metadata()?.len() != expected_length {
-            return Err(io::Error::other("sort run has an unexpected length").into());
+            return Err(io::Error::other("position run has an unexpected length").into());
         }
         Ok(Self::new(file, run.values))
     }
@@ -1339,7 +1378,7 @@ impl WorkerStats {
 
 struct RemoveWorkerResult {
     stats: WorkerStats,
-    runs: Vec<SortRun>,
+    runs: Vec<PositionRun>,
 }
 
 #[derive(Clone, Copy)]
@@ -1758,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn merges_sorted_spend_runs() -> AnyResult<()> {
+    fn defers_spend_run_sorting_until_requested() -> AnyResult<()> {
         let directory =
             std::env::temp_dir().join(format!("floresta-db-hints-sort-{}", std::process::id()));
         let _ignored = std::fs::remove_dir_all(&directory);
@@ -1766,9 +1805,16 @@ mod tests {
         let mut first = vec![9, 1, 5];
         let mut second = vec![8, 2];
         let runs = [
-            write_sort_run(&directory, 0, 0, &mut first)?,
-            write_sort_run(&directory, 1, 0, &mut second)?,
+            write_position_run(&directory, 0, 0, &mut first)?,
+            write_position_run(&directory, 1, 0, &mut second)?,
         ];
+        let mut unsorted = ValueReader::open_run(&runs[0])?;
+        assert_eq!(unsorted.next_value()?, Some(9));
+        assert_eq!(unsorted.next_value()?, Some(1));
+        assert_eq!(unsorted.next_value()?, Some(5));
+        assert_eq!(unsorted.next_value()?, None);
+        drop(unsorted);
+        sort_position_runs(&runs)?;
         let sorted_path = directory.join("spent");
         merge_sort_runs(&sorted_path, &runs, 5)?;
 
