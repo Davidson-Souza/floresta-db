@@ -4,25 +4,29 @@
 //!
 //! Buckets are separate chains headed by in-memory atomics. Batch APIs SIMD-hash
 //! keys and visit heads in ascending bucket order. Append-only collisions are
-//! privately linked before one head CAS; fetches and unique deletions traverse
-//! each requested bucket once. Empty blocks return to a CAS-managed free list.
+//! privately linked before one head CAS; batch value reads sort external blob
+//! offsets before restoring input order.
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::allocator::{Allocation, BlockAllocator};
-use crate::config::{Config, Mode};
+use crate::config::{Config, KEY_SIZE, Mode};
 use crate::error::{Error, Result};
 use crate::hash::{xxh64, xxh64_batch4};
-use crate::layout::{FORMAT_PAGE_SIZE, HEADS_START, align_up};
+use crate::layout::{
+    BLOB_HEADER_SIZE, FORMAT_PAGE_SIZE, HEADS_START, NODE_ALIGNMENT, NODE_SIZE, NODE_SIZE_U64,
+    VALUE_BLOB_TAG, VALUE_OFFSET_MASK, align_up,
+};
 use crate::mapped_file::MappedFile;
 use crate::node::{
-    Node, NodeView, allocate_node, blob_checksum, read_node, read_node_into, set_private_next,
-    tombstone_node, write_node,
+    Node, allocate_node, blob_checksum, blob_header, compare_exchange_next, decode_blob_header,
+    read_next, read_node, read_node_if_present, set_private_next, tombstone_node, write_node,
 };
 
 pub(crate) const HEADER_MAGIC: &[u8; 8] = b"CASDB001";
-pub(crate) const FORMAT_VERSION: u64 = 5;
+pub(crate) const FORMAT_VERSION: u64 = 7;
 pub(crate) const HEADER_CHECKSUM_OFFSET: usize = 96;
 pub(crate) const HEADER_CHECKSUM_SEED: u64 = 0x4341_5344_4248_4452;
 
@@ -42,6 +46,19 @@ pub enum PutResult {
 
     /// An existing node for the key was replaced.
     Replaced,
+}
+
+/// Work completed by one online body-page compaction pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompactionStats {
+    /// Sparse sealed pages selected at the start of the pass.
+    pub candidate_pages: u64,
+    /// Live body nodes relocated through successful link CAS operations.
+    pub moved_nodes: u64,
+    /// Candidate pages whose live count reached zero after quiescence.
+    pub reclaimed_pages: u64,
+    /// Candidate pages that still contained allocations after the pass.
+    pub remaining_candidate_pages: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,10 +98,16 @@ struct PrivateInsert {
     bucket: u64,
 }
 
+struct DetachedNode {
+    body: Allocation,
+
+    blob: Option<Allocation>,
+}
+
 struct PrivateGroup<'database> {
     head: &'database AtomicU64,
 
-    tail_next: &'database AtomicU64,
+    tail_node: u64,
 
     root: u64,
 }
@@ -95,7 +118,7 @@ struct BucketDeleteGuard<'database> {
 
 impl Drop for BucketDeleteGuard<'_> {
     fn drop(&mut self) {
-        let mut observed = self.lock.load(Ordering::Acquire);
+        let mut observed = read_shared(self.lock);
         while observed != 0 {
             match self
                 .lock
@@ -108,19 +131,28 @@ impl Drop for BucketDeleteGuard<'_> {
     }
 }
 
+struct CompactionGuard<'database> {
+    state: &'database AtomicU64,
+}
+
+impl Drop for CompactionGuard<'_> {
+    fn drop(&mut self) {
+        self.state.store(0, Ordering::Release);
+    }
+}
+
 /// A concurrent handle to one memory-mapped map or set.
 ///
 /// Cloned handles are intentionally not provided; share one `Database` by
-/// reference between scoped threads. All keys must match the fixed width in
-/// [`Config`].
+/// reference between scoped threads. Every key is exactly 16 bytes.
 ///
 /// # Removal contract
 ///
 /// Append-only writes may run concurrently. Operations that remove an existing
-/// node—[`Database::delete`] and replacing [`Database::put`] calls—require the
-/// caller to provide unique ownership of that logical key and quiescence from
-/// reads or checkpoints that could retain an offset in the affected bucket.
-/// Empty blocks can be reused immediately after the unlink CAS succeeds.
+/// node—[`Database::delete`], [`Database::batch_delete`], [`Database::batch_pop`],
+/// and replacing [`Database::put`] calls—require unique ownership of each logical
+/// key and quiescence from reads or checkpoints that could retain an affected
+/// bucket offset. Empty allocation pages can be reused immediately after unlink.
 ///
 /// # Examples
 ///
@@ -129,14 +161,13 @@ impl Drop for BucketDeleteGuard<'_> {
 ///
 /// let database = Database::create(
 ///     "floresta-db-example",
-///     Config::new(Mode::Set, 1_024, 32),
+///     Config::new(Mode::Set, 1_024),
 /// )?;
-/// assert!(!database.contains(&[0; 32])?);
+/// assert!(!database.contains(&[0; 16])?);
 /// # Ok::<(), floresta_db::Error>(())
 /// ```
 pub struct Database {
     pub(crate) config: Config,
-    pub(crate) node_size: u64,
     pub(crate) heads: MappedFile,
     pub(crate) runtime_heads: Box<[AtomicU64]>,
     pub(crate) delete_locks: Box<[AtomicU64]>,
@@ -144,6 +175,8 @@ pub struct Database {
     pub(crate) blobs: Option<BlockAllocator>,
     pub(crate) checkpoint_state: AtomicU64,
     pub(crate) checkpoint_generation: AtomicU64,
+    pub(crate) quiescence: RwLock<()>,
+    pub(crate) compaction_state: AtomicU64,
     pub(crate) path: PathBuf,
 }
 
@@ -162,11 +195,11 @@ pub struct Database {
 ///
 /// let database = Database::create(
 ///     "floresta-db-writer-example",
-///     Config::new(Mode::Map, 1_024, 8),
+///     Config::new(Mode::Map, 1_024),
 /// )?;
 /// let entries = [
-///     (b"key-0001".as_slice(), b"value-01".as_slice()),
-///     (b"key-0002".as_slice(), b"value-02".as_slice()),
+///     (b"key-0001-0000000".as_slice(), b"value-01".as_slice()),
+///     (b"key-0002-0000000".as_slice(), b"value-02".as_slice()),
 /// ];
 /// database.write_only()?.put_batch(entries)?;
 /// # Ok::<(), floresta_db::Error>(())
@@ -190,19 +223,18 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-create-example",
-    ///     Config::new(Mode::Set, 1_024, 32),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// assert!(!database.contains(&[0; 32])?);
+    /// assert!(!database.contains(&[0; 16])?);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn create(path: impl AsRef<Path>, config: Config) -> Result<Self> {
         config.validate()?;
-        let node_size = config.node_size()?;
         let path = path.as_ref();
         std::fs::create_dir(path)?;
         let heads_length = heads_length(config.bucket_count)?;
         let heads = MappedFile::create(&path.join("heads"), heads_length, false, false)?;
-        initialize_header(&heads, &config, node_size)?;
+        initialize_header(&heads, &config)?;
         heads.advise_heads()?;
         let runtime_heads = create_runtime_heads(config.bucket_count, &heads, false)?;
         let delete_locks = create_delete_locks(config.bucket_count)?;
@@ -212,7 +244,7 @@ impl Database {
             config.body_capacity,
             config.block_size,
         )?;
-        let blobs = if config.mode == Mode::Map && config.inline_value_size == 0 {
+        let blobs = if config.mode == Mode::Map {
             Some(BlockAllocator::create(
                 &path.join("blobs"),
                 &path.join("blobs.counts"),
@@ -224,7 +256,6 @@ impl Database {
         };
         Ok(Self {
             config,
-            node_size,
             heads,
             runtime_heads,
             delete_locks,
@@ -232,6 +263,8 @@ impl Database {
             blobs,
             checkpoint_state: AtomicU64::new(0),
             checkpoint_generation: AtomicU64::new(0),
+            quiescence: RwLock::new(()),
+            compaction_state: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
     }
@@ -243,8 +276,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error when called on a map, when the key width differs from
-    /// the configured width, or when allocation fails.
+    /// Returns an error when called on a map, when the key is not 16 bytes,
+    /// or when allocation fails.
     ///
     /// # Examples
     ///
@@ -253,10 +286,10 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-add-example",
-    ///     Config::new(Mode::Set, 1_024, 32),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// assert_eq!(database.add(&[1; 32])?, PutResult::Inserted);
-    /// assert_eq!(database.add(&[1; 32])?, PutResult::Inserted);
+    /// assert_eq!(database.add(&[1; 16])?, PutResult::Inserted);
+    /// assert_eq!(database.add(&[1; 16])?, PutResult::Inserted);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn add(&self, key: &[u8]) -> Result<PutResult> {
@@ -290,9 +323,9 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-add-batch-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// let keys = [b"key-0001".as_slice(), b"key-0002".as_slice()];
+    /// let keys = [b"key-0001-0000000".as_slice(), b"key-0002-0000000".as_slice()];
     /// assert_eq!(database.add_batch(keys)?, 2);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
@@ -313,8 +346,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error when called on a set, when the key length differs from
-    /// the configured width, or when allocation fails.
+    /// Returns an error when called on a set, when the key is not 16 bytes,
+    /// or when allocation fails.
     ///
     /// # Examples
     ///
@@ -323,9 +356,12 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-put-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
-    /// assert_eq!(database.put(b"key-0001", b"value")?, PutResult::Inserted);
+    /// assert_eq!(
+    ///     database.put(b"key-0001-0000000", b"value")?,
+    ///     PutResult::Inserted
+    /// );
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<PutResult> {
@@ -346,8 +382,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns an error when called on a set, when the key length differs from the configured
-    /// width, or when allocation fails.
+    /// Returns an error when called on a set, when the key is not 16 bytes,
+    /// or when allocation fails.
     ///
     /// # Examples
     ///
@@ -356,10 +392,10 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-put-new-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
-    /// assert!(database.put_new(b"key-0001", b"value")?);
-    /// assert!(!database.put_new(b"key-0001", b"other")?);
+    /// assert!(database.put_new(b"key-0001-0000000", b"value")?);
+    /// assert!(!database.put_new(b"key-0001-0000000", b"other")?);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn put_new(&self, key: &[u8], value: &[u8]) -> Result<bool> {
@@ -389,9 +425,9 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-write-only-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
-    /// let entries = [(b"key-0001".as_slice(), b"value-01".as_slice())];
+    /// let entries = [(b"key-0001-0000000".as_slice(), b"value-01".as_slice())];
     /// database.write_only()?.put_batch(entries)?;
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
@@ -415,17 +451,21 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-get-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
-    /// database.put(b"key-0001", b"value")?;
-    /// assert_eq!(database.get(b"key-0001")?.as_deref(), Some(b"value".as_slice()));
+    /// database.put(b"key-0001-0000000", b"value")?;
+    /// assert_eq!(
+    ///     database.get(b"key-0001-0000000")?.as_deref(),
+    ///     Some(b"value".as_slice())
+    /// );
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _operation_guard = self.operation_guard()?;
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("get is available only for maps"));
         }
-        self.validate_key(key)?;
+        Self::validate_key(key)?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
         let found = self.find(bucket, hash, key)?;
@@ -454,10 +494,13 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-batch-fetch-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
-    /// database.put_new(b"key-0001", b"value-01")?;
-    /// let keys = [b"key-0001".as_slice(), b"missing!".as_slice()];
+    /// database.put_new(b"key-0001-0000000", b"value-01")?;
+    /// let keys = [
+    ///     b"key-0001-0000000".as_slice(),
+    ///     b"missing!-0000000".as_slice(),
+    /// ];
     /// let values = database.batch_fetch(keys)?;
     /// assert_eq!(values[0].as_deref(), Some(b"value-01".as_slice()));
     /// assert_eq!(values[1], None);
@@ -467,15 +510,16 @@ impl Database {
     where
         I: IntoIterator<Item = &'key [u8]>,
     {
+        let _operation_guard = self.operation_guard()?;
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("batch_fetch is available only for maps"));
         }
         let prepared = self.prepare_keys(keys)?;
-        let mut results = Vec::new();
-        results
+        let mut encoded = Vec::new();
+        encoded
             .try_reserve_exact(prepared.len())
             .map_err(|_| Error::OutOfMemory)?;
-        results.resize_with(prepared.len(), || None);
+        encoded.resize(prepared.len(), None);
 
         let mut start = 0;
         while start < prepared.len() {
@@ -484,10 +528,10 @@ impl Database {
             while end < prepared.len() && prepared[end].bucket == bucket {
                 end += 1;
             }
-            self.fetch_bucket_batch(bucket, &prepared[start..end], &mut results)?;
+            self.fetch_bucket_batch(bucket, &prepared[start..end], &mut encoded)?;
             start = end;
         }
-        Ok(results)
+        self.materialize_values(&encoded)
     }
 
     /// Tests membership in either a set or map.
@@ -503,23 +547,24 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-contains-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// database.add(b"key-0001")?;
-    /// assert!(database.contains(b"key-0001")?);
+    /// database.add(b"key-0001-0000000")?;
+    /// assert!(database.contains(b"key-0001-0000000")?);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn contains(&self, key: &[u8]) -> Result<bool> {
-        self.validate_key(key)?;
+        let _operation_guard = self.operation_guard()?;
+        Self::validate_key(key)?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
         Ok(self.find(bucket, hash, key)?.node.is_some())
     }
 
-    /// Unlinks one uniquely owned key and immediately recycles empty blocks.
+    /// Unlinks one uniquely owned key and immediately recycles empty pages.
     ///
     /// The caller must guarantee that no other thread can delete the same live
-    /// key. Since reclaimed blocks may be reused immediately, deletion also
+    /// key. Since reclaimed pages may be reused immediately, deletion also
     /// requires external quiescence from reads or checkpoints that could still
     /// retain an offset in the affected bucket.
     ///
@@ -535,14 +580,15 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-delete-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// database.add(b"key-0001")?;
-    /// assert!(database.delete(b"key-0001")?);
+    /// database.add(b"key-0001-0000000")?;
+    /// assert!(database.delete(b"key-0001-0000000")?);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        self.validate_key(key)?;
+        let _operation_guard = self.operation_guard()?;
+        Self::validate_key(key)?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
         let _delete_guard = self.lock_delete_bucket(bucket)?;
@@ -581,10 +627,13 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-batch-delete-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
-    /// database.add(b"key-0001")?;
-    /// let keys = [b"key-0001".as_slice(), b"missing!".as_slice()];
+    /// database.add(b"key-0001-0000000")?;
+    /// let keys = [
+    ///     b"key-0001-0000000".as_slice(),
+    ///     b"missing!-0000000".as_slice(),
+    /// ];
     /// assert_eq!(database.batch_delete(keys)?, vec![true, false]);
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
@@ -592,6 +641,7 @@ impl Database {
     where
         I: IntoIterator<Item = &'key [u8]>,
     {
+        let _operation_guard = self.operation_guard()?;
         let prepared = self.prepare_keys(keys)?;
         Self::validate_unique_batch_keys(&prepared)?;
         let mut deleted = Vec::new();
@@ -614,6 +664,78 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Deletes map entries and returns their values in input order.
+    ///
+    /// Keys are SIMD-hashed and visited in bucket order. Removed body nodes stay
+    /// reserved until every matching value is known; blob offsets are then sorted
+    /// and read in ascending order before either body or blob storage is reused.
+    /// Duplicate keys are rejected.
+    ///
+    /// This method has the same unique-ownership and read-quiescence requirements
+    /// as [`Database::delete`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for set mode, duplicate inputs, wrong key widths, corrupt
+    /// storage, allocation failure, or a unique-deletion violation.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-batch-pop-example",
+    ///     Config::new(Mode::Map, 1_024),
+    /// )?;
+    /// let key = b"key-0001-0000000";
+    /// database.put(key, b"value")?;
+    /// assert_eq!(database.batch_pop([key.as_slice()])?, vec![Some(b"value".to_vec())]);
+    /// assert_eq!(database.get(key)?, None);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    pub fn batch_pop<'key, I>(&self, keys: I) -> Result<Vec<Option<Vec<u8>>>>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        let _operation_guard = self.operation_guard()?;
+        if self.config.mode != Mode::Map {
+            return Err(Error::Unsupported("batch_pop is available only for maps"));
+        }
+        let prepared = self.prepare_keys(keys)?;
+        Self::validate_unique_batch_keys(&prepared)?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        encoded.resize(prepared.len(), None);
+        let mut detached = Vec::new();
+        detached
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::OutOfMemory)?;
+
+        let operation = (|| -> Result<Vec<Option<Vec<u8>>>> {
+            let mut start = 0;
+            while start < prepared.len() {
+                let bucket = prepared[start].bucket;
+                let mut end = start + 1;
+                while end < prepared.len() && prepared[end].bucket == bucket {
+                    end += 1;
+                }
+                let _delete_guard = self.lock_delete_bucket(bucket)?;
+                self.pop_bucket_batch(bucket, &prepared[start..end], &mut encoded, &mut detached)?;
+                start = end;
+            }
+            self.materialize_values(&encoded)
+        })();
+
+        let release = self.release_detached_batch(&detached);
+        match (operation, release) {
+            (Ok(values), Ok(())) => Ok(values),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Flushes mapped contents without defining a checkpoint generation.
     ///
     /// # Errors
@@ -627,18 +749,161 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-sync-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
     /// database.sync()?;
     /// # Ok::<(), floresta_db::Error>(())
     /// ```
     pub fn sync(&self) -> Result<()> {
+        let _operation_guard = self.operation_guard()?;
         self.body.sync_all()?;
+
         if let Some(blobs) = &self.blobs {
             blobs.sync_all()?;
         }
         self.persist_runtime_heads()?;
         self.heads.sync_all()
+    }
+
+    /// Relocates live body nodes from sealed pages containing fewer than
+    /// `minimum_page_load` nodes, then reclaims their old allocations after a
+    /// reader grace period.
+    ///
+    /// Blob allocations are not moved. Readers and writers continue during node
+    /// relocation; only final reclamation waits for operations that could retain
+    /// an old node offset. Compaction and checkpoints are mutually exclusive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid threshold, an active checkpoint or
+    /// compaction, corrupt storage, allocation failure, or a poisoned quiescence
+    /// lock.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-compact-example",
+    ///     Config::new(Mode::Map, 1_024),
+    /// )?;
+    /// let stats = database.compact(1)?;
+    /// assert_eq!(stats.remaining_candidate_pages, 0);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    pub fn compact(&self, minimum_page_load: u16) -> Result<CompactionStats> {
+        let page_capacity = self.body.block_size() / NODE_SIZE_U64;
+        if minimum_page_load == 0 || u64::from(minimum_page_load) > page_capacity {
+            return Err(Error::InvalidConfig(
+                "compaction page load must be within the body-page capacity",
+            ));
+        }
+        self.compaction_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Busy("another compaction is active"))?;
+        let _compaction_guard = CompactionGuard {
+            state: &self.compaction_state,
+        };
+        if self.checkpoint_active() {
+            return Err(Error::Busy("checkpoint is active"));
+        }
+        let operation_guard = self.operation_guard()?;
+        let candidates = self
+            .body
+            .blocks_below_load(minimum_page_load.saturating_sub(1))?;
+        let candidate_pages = u64::try_from(candidates.len())
+            .map_err(|_| Error::CapacityExhausted("compaction statistics"))?;
+        let reserve = candidates
+            .len()
+            .checked_mul(usize::from(minimum_page_load))
+            .ok_or(Error::OutOfMemory)?;
+        let mut retired = Vec::new();
+        retired
+            .try_reserve(reserve)
+            .map_err(|_| Error::OutOfMemory)?;
+        let slots = self.body.block_size() / NODE_SIZE_U64;
+        let node_length = u32::try_from(NODE_SIZE)
+            .map_err(|_| Error::Corrupt("body node size does not fit u32"))?;
+        let mut moved_nodes = 0_u64;
+        let relocation = (|| -> Result<()> {
+            for block in &candidates {
+                let base = self.body.block_offset(*block)?;
+                for slot in 0..slots {
+                    let offset = base
+                        .checked_add(
+                            slot.checked_mul(NODE_SIZE_U64)
+                                .ok_or(Error::CapacityExhausted("compaction node offset"))?,
+                        )
+                        .ok_or(Error::CapacityExhausted("compaction node offset"))?;
+                    let Some(scanned) = read_node_if_present(&self.body, offset)? else {
+                        continue;
+                    };
+                    let hash = xxh64(&scanned.key, self.config.hash_seed);
+                    let bucket = hash % self.config.bucket_count;
+                    let _delete_guard = self.lock_delete_bucket(bucket)?;
+                    while let Some((node, link)) = self.find_offset(bucket, offset)? {
+                        let replacement = allocate_node(&self.body, &node.key, node.value)?;
+                        if let Err(error) =
+                            set_private_next(&self.body, replacement.offset, 0, node.next)
+                        {
+                            tombstone_node(&self.body, replacement.offset)?;
+                            self.body.release(replacement)?;
+                            return Err(error);
+                        }
+                        if self.compare_exchange_link(link, node.offset, replacement.offset)? {
+                            retired.push(self.body.allocation_for(node.offset, node_length)?);
+                            moved_nodes = moved_nodes.saturating_add(1);
+                            break;
+                        }
+                        tombstone_node(&self.body, replacement.offset)?;
+                        self.body.release(replacement)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        drop(operation_guard);
+        let reclamation = self.reclaim_compaction_nodes(retired);
+        match (relocation, reclamation) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
+        }
+
+        let mut reclaimed_pages = 0_u64;
+        for block in &candidates {
+            if self.body.block_live_count(*block)? == 0 {
+                reclaimed_pages += 1;
+            }
+        }
+        Ok(CompactionStats {
+            candidate_pages,
+            moved_nodes,
+            reclaimed_pages,
+            remaining_candidate_pages: candidate_pages.saturating_sub(reclaimed_pages),
+        })
+    }
+
+    fn reclaim_compaction_nodes(&self, retired: Vec<Allocation>) -> Result<()> {
+        let _quiescence = self
+            .quiescence
+            .write()
+            .map_err(|_| Error::Corrupt("database quiescence lock is poisoned"))?;
+        let mut first_error = None;
+        for allocation in retired {
+            let release = tombstone_node(&self.body, allocation.offset)
+                .and_then(|()| self.body.release(allocation));
+            if let Err(error) = release
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Flushes the database and consumes the handle.
@@ -654,7 +919,7 @@ impl Database {
     ///
     /// let database = Database::create(
     ///     "floresta-db-close-example",
-    ///     Config::new(Mode::Set, 1_024, 8),
+    ///     Config::new(Mode::Set, 1_024),
     /// )?;
     /// database.close()?;
     /// # Ok::<(), floresta_db::Error>(())
@@ -672,7 +937,7 @@ impl Database {
         for (batch, heads) in self.runtime_heads.chunks(HEAD_BATCH).enumerate() {
             bytes.clear();
             for head in heads {
-                bytes.extend_from_slice(&head.load(Ordering::Acquire).to_le_bytes());
+                bytes.extend_from_slice(&read_shared(head).to_le_bytes());
             }
             let first = batch
                 .checked_mul(HEAD_BATCH)
@@ -691,34 +956,25 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) fn operation_guard(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>> {
+        self.quiescence
+            .read()
+            .map_err(|_| Error::Corrupt("database quiescence lock is poisoned"))
+    }
+
     fn put_inner(
         &self,
         key: &[u8],
         value: Option<&[u8]>,
         replace_existing: bool,
     ) -> Result<PutOutcome> {
-        self.validate_key(key)?;
+        let _operation_guard = self.operation_guard()?;
+        Self::validate_key(key)?;
         self.validate_value(value)?;
         let blob = self.allocate_blob(value)?;
-        let blob_offset = if self.config.inline_value_size == 0 {
-            blob.map_or(0, |allocation| allocation.offset)
-        } else {
-            inline_value_word(value.ok_or(Error::Corrupt("inline map value is missing"))?)?
-        };
-        let blob_length = value.map_or(0, <[u8]>::len);
-        let blob_length_u64 =
-            u64::try_from(blob_length).map_err(|_| Error::CapacityExhausted("blob length"))?;
-        let value_checksum = value.map_or(0, blob_checksum);
+        let encoded_value = self.encoded_value(value, blob)?;
         let hash = xxh64(key, self.config.hash_seed);
-        let node = match allocate_node(
-            &self.body,
-            self.node_size,
-            key,
-            hash,
-            blob_offset,
-            blob_length_u64,
-            value_checksum,
-        ) {
+        let node = match allocate_node(&self.body, key, encoded_value) {
             Ok(allocation) => allocation,
             Err(error) => {
                 if let Some(blob) = blob {
@@ -783,11 +1039,12 @@ impl Database {
     }
 
     fn insert_one_inner(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        self.validate_key(key)?;
+        let _operation_guard = self.operation_guard()?;
+        Self::validate_key(key)?;
         self.validate_value(value)?;
         let hash = xxh64(key, self.config.hash_seed);
         let bucket = hash % self.config.bucket_count;
-        let private = self.allocate_private_insert(key, value, hash, bucket)?;
+        let private = self.allocate_private_insert(key, value, bucket)?;
         let head = match self.head(private.bucket) {
             Ok(head) => head,
             Err(error) => {
@@ -795,19 +1052,12 @@ impl Database {
                 return Err(error);
             }
         };
-        let tail_next = match self.body.atomic_u64(private.node.offset) {
-            Ok(tail_next) => tail_next,
-            Err(error) => {
-                self.release_private(private.node, private.blob)?;
-                return Err(error);
-            }
-        };
         let group = PrivateGroup {
             head,
-            tail_next,
+            tail_node: private.node.offset,
             root: private.node.offset,
         };
-        Self::commit_private_group(&group);
+        self.commit_private_group(&group)?;
         Ok(())
     }
 
@@ -815,6 +1065,7 @@ impl Database {
     where
         I: IntoIterator<Item = (&'entry [u8], Option<&'entry [u8]>)>,
     {
+        let _operation_guard = self.operation_guard()?;
         let prepared = self.prepare_batch(entries)?;
         let count = prepared.len();
         if count == 0 {
@@ -845,7 +1096,7 @@ impl Database {
         }
 
         for group in &groups {
-            Self::commit_private_group(group);
+            self.commit_private_group(group)?;
         }
         Ok(count)
     }
@@ -861,7 +1112,7 @@ impl Database {
             .map_err(|_| Error::OutOfMemory)?;
 
         for (order, (key, value)) in entries.enumerate() {
-            self.validate_key(key)?;
+            Self::validate_key(key)?;
             self.validate_value(value)?;
             prepared.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
             prepared.push(PreparedInsert {
@@ -909,7 +1160,7 @@ impl Database {
             .try_reserve(keys.size_hint().0)
             .map_err(|_| Error::OutOfMemory)?;
         for (order, key) in keys.enumerate() {
-            self.validate_key(key)?;
+            Self::validate_key(key)?;
             prepared.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
             prepared.push(PreparedKey {
                 key,
@@ -961,7 +1212,7 @@ impl Database {
                     .any(|other| entry.key == other.key)
                 {
                     return Err(Error::InvalidConfig(
-                        "batch_delete keys must be globally unique",
+                        "destructive batch keys must be globally unique",
                     ));
                 }
             }
@@ -974,9 +1225,8 @@ impl Database {
         &self,
         bucket: u64,
         prepared: &[PreparedKey<'_>],
-        results: &mut [Option<Vec<u8>>],
+        results: &mut [Option<u64>],
     ) -> Result<()> {
-        let mut node_bytes = Vec::new();
         'restart: loop {
             for entry in prepared {
                 let result = results
@@ -986,44 +1236,35 @@ impl Database {
             }
             let mut remaining = prepared.len();
             let mut link = Link::Head(bucket);
-            let root = self.link_atomic(link)?.load(Ordering::Acquire);
+            let root = self.link_value(link)?;
             let mut current = root;
             while current != 0 {
-                let node = read_node_into(
-                    &self.body,
-                    current,
-                    self.node_size,
-                    self.config.key_size,
-                    &mut node_bytes,
-                )?;
+                let node = read_node(&self.body, current)?;
                 let observed_next = node.next;
-                if self.link_atomic(link)?.load(Ordering::Acquire) != current
-                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                if self.link_value(link)? != current
+                    || read_next(&self.body, current)? != observed_next
                 {
                     continue 'restart;
                 }
 
-                let first = prepared.partition_point(|entry| entry.hash < node.hash);
+                let node_hash = xxh64(&node.key, self.config.hash_seed);
+                let first = prepared.partition_point(|entry| entry.hash < node_hash);
                 for entry in &prepared[first..] {
-                    if entry.hash != node.hash {
+                    if entry.hash != node_hash {
                         break;
                     }
                     let result = results
                         .get_mut(entry.order)
                         .ok_or(Error::Corrupt("batch-fetch result index is out of range"))?;
                     if result.is_none() && entry.key == node.key {
-                        *result = Some(self.read_node_value_fields(
-                            node.blob_offset,
-                            node.blob_length,
-                            node.blob_checksum,
-                        )?);
+                        *result = Some(node.value);
                         remaining = remaining
                             .checked_sub(1)
                             .ok_or(Error::Corrupt("batch-fetch match count underflow"))?;
                     }
                 }
                 if remaining == 0 {
-                    if self.head(bucket)?.load(Ordering::Acquire) == root {
+                    if read_shared(self.head(bucket)?) == root {
                         return Ok(());
                     }
                     continue 'restart;
@@ -1031,7 +1272,7 @@ impl Database {
                 link = Link::Node(current);
                 current = observed_next;
             }
-            if self.head(bucket)?.load(Ordering::Acquire) == root {
+            if read_shared(self.head(bucket)?) == root {
                 return Ok(());
             }
         }
@@ -1043,7 +1284,6 @@ impl Database {
         prepared: &[PreparedKey<'_>],
         deleted: &mut [bool],
     ) -> Result<()> {
-        let mut node_bytes = Vec::new();
         'restart: loop {
             let mut remaining = prepared
                 .iter()
@@ -1054,32 +1294,27 @@ impl Database {
             }
             let mut link = Link::Head(bucket);
             let head = self.head(bucket)?;
-            let mut expected_head = head.load(Ordering::Acquire);
+            let mut expected_head = read_shared(head);
             let mut current = expected_head;
             while current != 0 {
-                let node = read_node_into(
-                    &self.body,
-                    current,
-                    self.node_size,
-                    self.config.key_size,
-                    &mut node_bytes,
-                )?;
+                let node = read_node(&self.body, current)?;
                 let observed_next = node.next;
-                if self.link_atomic(link)?.load(Ordering::Acquire) != current
-                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                if self.link_value(link)? != current
+                    || read_next(&self.body, current)? != observed_next
                 {
                     continue 'restart;
                 }
 
-                let first = prepared.partition_point(|entry| entry.hash < node.hash);
+                let node_hash = xxh64(&node.key, self.config.hash_seed);
+                let first = prepared.partition_point(|entry| entry.hash < node_hash);
                 let matching = prepared[first..].iter().find(|entry| {
-                    entry.hash == node.hash
+                    entry.hash == node_hash
                         && !deleted.get(entry.order).copied().unwrap_or(false)
                         && entry.key == node.key
                 });
                 if let Some(entry) = matching {
                     let removes_head = matches!(link, Link::Head(_));
-                    match self.unlink_view(link, &node) {
+                    match self.unlink_link(link, &node) {
                         Ok(()) => {
                             let result = deleted.get_mut(entry.order).ok_or(Error::Corrupt(
                                 "batch-delete result index is out of range",
@@ -1104,49 +1339,135 @@ impl Database {
                 link = Link::Node(current);
                 current = observed_next;
             }
-            if head.load(Ordering::Acquire) == expected_head {
+            if read_shared(head) == expected_head {
+                return Ok(());
+            }
+        }
+    }
+
+    fn pop_bucket_batch(
+        &self,
+        bucket: u64,
+        prepared: &[PreparedKey<'_>],
+        encoded: &mut [Option<u64>],
+        detached: &mut Vec<DetachedNode>,
+    ) -> Result<()> {
+        'restart: loop {
+            let mut remaining = prepared
+                .iter()
+                .filter(|entry| encoded.get(entry.order).copied().flatten().is_none())
+                .count();
+            if remaining == 0 {
+                return Ok(());
+            }
+            let mut link = Link::Head(bucket);
+            let head = self.head(bucket)?;
+            let mut expected_head = read_shared(head);
+            let mut current = expected_head;
+            while current != 0 {
+                let node = read_node(&self.body, current)?;
+                let observed_next = node.next;
+                if self.link_value(link)? != current
+                    || read_next(&self.body, current)? != observed_next
+                {
+                    continue 'restart;
+                }
+
+                let node_hash = xxh64(&node.key, self.config.hash_seed);
+                let first = prepared.partition_point(|entry| entry.hash < node_hash);
+                let matching = prepared[first..].iter().find(|entry| {
+                    entry.hash == node_hash
+                        && encoded.get(entry.order).copied().flatten().is_none()
+                        && entry.key == node.key
+                });
+                if let Some(entry) = matching {
+                    let removes_head = matches!(link, Link::Head(_));
+                    match self.detach_link(link, &node) {
+                        Ok(allocation) => {
+                            let result = encoded
+                                .get_mut(entry.order)
+                                .ok_or(Error::Corrupt("batch-pop result index is out of range"))?;
+                            *result = Some(node.value);
+                            detached.push(allocation);
+                            remaining = remaining
+                                .checked_sub(1)
+                                .ok_or(Error::Corrupt("batch-pop match count underflow"))?;
+                            if remaining == 0 {
+                                return Ok(());
+                            }
+                            if removes_head {
+                                expected_head = observed_next;
+                            }
+                            current = observed_next;
+                            continue;
+                        }
+                        Err(Error::Busy(_)) => continue 'restart,
+                        Err(error) => return Err(error),
+                    }
+                }
+                link = Link::Node(current);
+                current = observed_next;
+            }
+            if read_shared(head) == expected_head {
                 return Ok(());
             }
         }
     }
 
     fn read_node_value(&self, node: &Node) -> Result<Vec<u8>> {
-        self.read_node_value_fields(node.blob_offset, node.blob_length, node.blob_checksum)
+        self.read_value(node.value)
     }
 
-    fn read_node_value_fields(
-        &self,
-        blob_offset: u64,
-        blob_length: u64,
-        expected_checksum: u64,
-    ) -> Result<Vec<u8>> {
-        if self.config.inline_value_size != 0 {
-            if blob_length != self.config.inline_value_size as u64 {
-                return Err(Error::Corrupt("inline map value length does not match"));
-            }
-            let value = inline_value_bytes(blob_offset, self.config.inline_value_size)?;
-            if expected_checksum != blob_checksum(&value) {
-                return Err(Error::Corrupt("inline map value checksum does not match"));
-            }
-            return Ok(value);
+    fn read_value(&self, encoded: u64) -> Result<Vec<u8>> {
+        if encoded & VALUE_BLOB_TAG == 0 {
+            return Ok(inline_value_bytes(encoded));
         }
-        if blob_length == 0 {
-            if expected_checksum != blob_checksum(&[]) {
-                return Err(Error::Corrupt("empty map value checksum does not match"));
-            }
-            return Ok(Vec::new());
-        }
-        let length = usize::try_from(blob_length)
-            .map_err(|_| Error::Corrupt("blob length does not fit memory"))?;
+        self.read_blob(encoded & VALUE_OFFSET_MASK)
+    }
+
+    fn read_blob(&self, offset: u64) -> Result<Vec<u8>> {
         let blobs = self
             .blobs
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        let value = blobs.read(blob_offset, length)?;
-        if expected_checksum != blob_checksum(&value) {
+        let mut header = [0_u8; BLOB_HEADER_SIZE];
+        blobs.read_into(offset, &mut header)?;
+        let (length, expected_checksum) = decode_blob_header(header);
+        let value_offset = offset
+            .checked_add(BLOB_HEADER_SIZE as u64)
+            .ok_or(Error::Corrupt("blob value offset overflow"))?;
+        let value = blobs.read(value_offset, length as usize)?;
+        if blob_checksum(&value) != expected_checksum {
             return Err(Error::Corrupt("map value checksum does not match"));
         }
         Ok(value)
+    }
+
+    fn materialize_values(&self, encoded: &[Option<u64>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(encoded.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        results.resize_with(encoded.len(), || None);
+        let mut blobs = Vec::new();
+        blobs
+            .try_reserve_exact(encoded.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for (order, value) in encoded.iter().copied().enumerate() {
+            let Some(value) = value else {
+                continue;
+            };
+            if value & VALUE_BLOB_TAG == 0 {
+                results[order] = Some(self.read_value(value)?);
+            } else {
+                blobs.push((value & VALUE_OFFSET_MASK, order));
+            }
+        }
+        blobs.sort_unstable_by_key(|(offset, _order)| *offset);
+        for (offset, order) in blobs {
+            results[order] = Some(self.read_blob(offset)?);
+        }
+        Ok(results)
     }
 
     fn allocate_private_inserts(
@@ -1154,25 +1475,19 @@ impl Database {
         prepared: &[PreparedInsert<'_>],
         private: &mut Vec<PrivateInsert>,
     ) -> Result<()> {
-        let node_size = usize::try_from(self.node_size)
-            .map_err(|_| Error::InvalidConfig("node size does not fit memory"))?;
-        let mut node_bytes = Vec::new();
-        node_bytes
-            .try_reserve_exact(node_size)
-            .map_err(|_| Error::OutOfMemory)?;
+        let node_size = NODE_SIZE;
         let mut start = 0;
         while start < prepared.len() {
-            let reserved = self
-                .body
-                .allocate_batch(node_size, 8, prepared.len() - start)?;
+            let reserved =
+                self.body
+                    .allocate_batch(node_size, NODE_ALIGNMENT, prepared.len() - start)?;
             let reserved_count = reserved.len();
             let mut allocations = reserved.allocations();
             for entry in &prepared[start..start + reserved_count] {
                 let allocation = allocations
                     .next()
                     .ok_or(Error::Corrupt("batch allocation ended early"))?;
-                match self.initialize_reserved_insert(entry, allocation, &mut node_bytes, node_size)
-                {
+                match self.initialize_reserved_insert(entry, allocation) {
                     Ok(insert) => private.push(insert),
                     Err(error) => {
                         self.body.release(allocation)?;
@@ -1194,33 +1509,10 @@ impl Database {
         &self,
         entry: &PreparedInsert<'_>,
         node: Allocation,
-        node_bytes: &mut Vec<u8>,
-        node_size: usize,
     ) -> Result<PrivateInsert> {
         let blob = self.allocate_blob(entry.value)?;
-        let blob_offset = if self.config.inline_value_size == 0 {
-            blob.map_or(0, |allocation| allocation.offset)
-        } else {
-            inline_value_word(
-                entry
-                    .value
-                    .ok_or(Error::Corrupt("inline map value is missing"))?,
-            )?
-        };
-        let blob_length = u64::try_from(entry.value.map_or(0, <[u8]>::len))
-            .map_err(|_| Error::CapacityExhausted("blob length"))?;
-        let value_checksum = entry.value.map_or(0, blob_checksum);
-        if let Err(error) = write_node(
-            &self.body,
-            node,
-            node_bytes,
-            node_size,
-            entry.key,
-            entry.hash,
-            blob_offset,
-            blob_length,
-            value_checksum,
-        ) {
+        let encoded_value = self.encoded_value(entry.value, blob)?;
+        if let Err(error) = write_node(&self.body, node, entry.key, encoded_value) {
             if let Some(blob) = blob {
                 self.release_blob(blob)?;
             }
@@ -1237,27 +1529,11 @@ impl Database {
         &self,
         key: &[u8],
         value: Option<&[u8]>,
-        hash: u64,
         bucket: u64,
     ) -> Result<PrivateInsert> {
         let blob = self.allocate_blob(value)?;
-        let blob_offset = if self.config.inline_value_size == 0 {
-            blob.map_or(0, |allocation| allocation.offset)
-        } else {
-            inline_value_word(value.ok_or(Error::Corrupt("inline map value is missing"))?)?
-        };
-        let blob_length = u64::try_from(value.map_or(0, <[u8]>::len))
-            .map_err(|_| Error::CapacityExhausted("blob length"))?;
-        let value_checksum = value.map_or(0, blob_checksum);
-        let node = match allocate_node(
-            &self.body,
-            self.node_size,
-            key,
-            hash,
-            blob_offset,
-            blob_length,
-            value_checksum,
-        ) {
+        let encoded_value = self.encoded_value(value, blob)?;
+        let node = match allocate_node(&self.body, key, encoded_value) {
             Ok(allocation) => allocation,
             Err(error) => {
                 if let Some(blob) = blob {
@@ -1294,7 +1570,7 @@ impl Database {
             }
             groups.push(PrivateGroup {
                 head: self.head(bucket)?,
-                tail_next: self.body.atomic_u64(private[start].node.offset)?,
+                tail_node: private[start].node.offset,
                 root: private[end - 1].node.offset,
             });
             start = end;
@@ -1319,25 +1595,19 @@ impl Database {
             std::hint::spin_loop();
         }
     }
-    fn commit_private_group(group: &PrivateGroup<'_>) {
-        let mut previous_next = group.tail_next.load(Ordering::Acquire);
+    fn commit_private_group(&self, group: &PrivateGroup<'_>) -> Result<()> {
         loop {
-            let observed = group.head.load(Ordering::Acquire);
-            while let Err(actual) = group.tail_next.compare_exchange(
-                previous_next,
-                observed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                previous_next = actual;
+            let observed = read_shared(group.head);
+            let previous_next = read_next(&self.body, group.tail_node)?;
+            if !compare_exchange_next(&self.body, group.tail_node, previous_next, observed)? {
+                continue;
             }
-            previous_next = observed;
             if group
                 .head
                 .compare_exchange(observed, group.root, Ordering::Release, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return Ok(());
             }
         }
     }
@@ -1358,25 +1628,47 @@ impl Database {
     }
 
     fn allocate_blob(&self, value: Option<&[u8]>) -> Result<Option<Allocation>> {
-        if self.config.inline_value_size != 0 {
+        if self.config.mode == Mode::Set {
             return Ok(None);
         }
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        if value.is_empty() {
+        let value = value.ok_or(Error::Corrupt("map value is missing"))?;
+        if inline_value_word(value).is_some() {
             return Ok(None);
         }
+        let length = BLOB_HEADER_SIZE
+            .checked_add(value.len())
+            .ok_or(Error::Corrupt("blob length overflow"))?;
         let blobs = self
             .blobs
             .as_ref()
             .ok_or(Error::Corrupt("map has no blob allocator"))?;
-        let allocation = blobs.allocate(value.len(), 8)?;
-        if let Err(error) = blobs.write(allocation, value) {
+        let allocation = blobs.allocate(length, 8)?;
+        let header = blob_header(value)?;
+        if let Err(error) = blobs
+            .write_at(allocation, 0, &header)
+            .and_then(|()| blobs.write_at(allocation, BLOB_HEADER_SIZE, value))
+        {
             let _released = blobs.release(allocation);
             return Err(error);
         }
         Ok(Some(allocation))
+    }
+
+    fn encoded_value(&self, value: Option<&[u8]>, blob: Option<Allocation>) -> Result<u64> {
+        if self.config.mode == Mode::Set {
+            return Ok(0);
+        }
+        let value = value.ok_or(Error::Corrupt("map value is missing"))?;
+        if let Some(inline) = inline_value_word(value) {
+            return Ok(inline);
+        }
+        let offset = blob
+            .ok_or(Error::Corrupt("blob map value has no allocation"))?
+            .offset;
+        if offset & !VALUE_OFFSET_MASK != 0 {
+            return Err(Error::CapacityExhausted("tagged blob offset"));
+        }
+        Ok(VALUE_BLOB_TAG | offset)
     }
 
     fn release_private(&self, node: Allocation, blob: Option<Allocation>) -> Result<()> {
@@ -1400,17 +1692,17 @@ impl Database {
     fn find(&self, bucket: u64, hash: u64, key: &[u8]) -> Result<Found> {
         'restart: loop {
             let mut link = Link::Head(bucket);
-            let root = self.link_atomic(link)?.load(Ordering::Acquire);
+            let root = self.link_value(link)?;
             let mut current = root;
             while current != 0 {
-                let node = read_node(&self.body, current, self.node_size, self.config.key_size)?;
+                let node = read_node(&self.body, current)?;
                 let observed_next = node.next;
-                if self.link_atomic(link)?.load(Ordering::Acquire) != current
-                    || self.body.atomic_u64(current)?.load(Ordering::Acquire) != observed_next
+                if self.link_value(link)? != current
+                    || read_next(&self.body, current)? != observed_next
                 {
                     continue 'restart;
                 }
-                if node.hash == hash && node.key == key {
+                if xxh64(&node.key, self.config.hash_seed) == hash && node.key == key {
                     return Ok(Found {
                         node: Some(node),
                         root,
@@ -1420,7 +1712,7 @@ impl Database {
                 link = Link::Node(current);
                 current = observed_next;
             }
-            if self.head(bucket)?.load(Ordering::Acquire) != root {
+            if read_shared(self.head(bucket)?) != root {
                 continue;
             }
             return Ok(Found {
@@ -1431,66 +1723,84 @@ impl Database {
         }
     }
 
+    fn find_offset(&self, bucket: u64, target: u64) -> Result<Option<(Node, Link)>> {
+        'restart: loop {
+            let mut link = Link::Head(bucket);
+            let root = self.link_value(link)?;
+            let mut current = root;
+            while current != 0 {
+                let node = read_node(&self.body, current)?;
+                let observed_next = node.next;
+                if self.link_value(link)? != current
+                    || read_next(&self.body, current)? != observed_next
+                {
+                    continue 'restart;
+                }
+                if current == target {
+                    return Ok(Some((node, link)));
+                }
+                link = Link::Node(current);
+                current = observed_next;
+            }
+            if read_shared(self.head(bucket)?) == root {
+                return Ok(None);
+            }
+        }
+    }
+
     fn unlink_link(&self, link: Link, target: &Node) -> Result<()> {
-        self.unlink_node_fields(
-            link,
-            target.offset,
-            target.next,
-            target.blob_offset,
-            target.blob_length,
-        )
-    }
-
-    fn unlink_view(&self, link: Link, target: &NodeView<'_>) -> Result<()> {
-        self.unlink_node_fields(
-            link,
-            target.offset,
-            target.next,
-            target.blob_offset,
-            target.blob_length,
-        )
-    }
-
-    fn unlink_node_fields(
-        &self,
-        link: Link,
-        offset: u64,
-        next: u64,
-        blob_offset: u64,
-        blob_length: u64,
-    ) -> Result<()> {
         let (body_allocation, blob_allocation) =
-            self.node_allocations(offset, blob_offset, blob_length)?;
-        self.link_atomic(link)?
-            .compare_exchange(offset, next, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::Busy("unique deletion link changed before unlink"))?;
-        tombstone_node(&self.body, offset)?;
+            self.node_allocations(target.offset, target.value)?;
+        if !self.compare_exchange_link(link, target.offset, target.next)? {
+            return Err(Error::Busy("unique deletion link changed before unlink"));
+        }
+        tombstone_node(&self.body, target.offset)?;
         if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
             blobs.release_count(allocation)?;
         }
         self.body.release_count(body_allocation)
     }
 
+    fn detach_link(&self, link: Link, target: &Node) -> Result<DetachedNode> {
+        let (body, blob) = self.node_allocations(target.offset, target.value)?;
+        if !self.compare_exchange_link(link, target.offset, target.next)? {
+            return Err(Error::Busy("unique deletion link changed before unlink"));
+        }
+        Ok(DetachedNode { body, blob })
+    }
+
+    fn release_detached_batch(&self, detached: &[DetachedNode]) -> Result<()> {
+        let mut first_error = None;
+        for node in detached.iter().rev() {
+            if let Err(error) = self.release_detached(node)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn release_detached(&self, node: &DetachedNode) -> Result<()> {
+        tombstone_node(&self.body, node.body.offset)?;
+        if let (Some(blobs), Some(blob)) = (&self.blobs, node.blob) {
+            blobs.release_count(blob)?;
+        }
+        self.body.release_count(node.body)
+    }
+
     fn node_allocations(
         &self,
         offset: u64,
-        blob_offset: u64,
-        blob_length: u64,
+        encoded_value: u64,
     ) -> Result<(Allocation, Option<Allocation>)> {
-        let blob_allocation = if self.config.inline_value_size != 0 || blob_length == 0 {
-            None
-        } else {
-            let length = u32::try_from(blob_length)
-                .map_err(|_| Error::Corrupt("deleted blob length exceeds one block"))?;
-            let blob = self
-                .blobs
-                .as_ref()
-                .ok_or(Error::Corrupt("deleted map node has no blob allocator"))?;
-            Some(blob.allocation_for(blob_offset, length)?)
-        };
-        let node_length = u32::try_from(self.node_size)
-            .map_err(|_| Error::Corrupt("deleted body node length overflow"))?;
-        let body_allocation = self.body.allocation_for(offset, node_length)?;
+        let blob_allocation = self.blob_allocation(encoded_value)?;
+        let node_size = u32::try_from(NODE_SIZE)
+            .map_err(|_| Error::Corrupt("body node size does not fit u32"))?;
+        let body_allocation = self.body.allocation_for(offset, node_size)?;
 
         self.body.validate_release(body_allocation)?;
         if let (Some(blobs), Some(allocation)) = (&self.blobs, blob_allocation) {
@@ -1499,10 +1809,35 @@ impl Database {
         Ok((body_allocation, blob_allocation))
     }
 
-    fn validate_key(&self, key: &[u8]) -> Result<()> {
-        if key.len() != self.config.key_size {
+    fn blob_allocation(&self, encoded_value: u64) -> Result<Option<Allocation>> {
+        if encoded_value & VALUE_BLOB_TAG == 0 {
+            if self.config.mode == Mode::Set && encoded_value != 0 {
+                return Err(Error::Corrupt("set node stores a value"));
+            }
+            return Ok(None);
+        }
+        if self.config.mode != Mode::Map {
+            return Err(Error::Corrupt("set node has a blob tag"));
+        }
+        let offset = encoded_value & VALUE_OFFSET_MASK;
+        let blobs = self
+            .blobs
+            .as_ref()
+            .ok_or(Error::Corrupt("map has no blob allocator"))?;
+        let mut header = [0_u8; BLOB_HEADER_SIZE];
+        blobs.read_into(offset, &mut header)?;
+        let (length, _checksum) = decode_blob_header(header);
+        let total = u32::try_from(BLOB_HEADER_SIZE)
+            .ok()
+            .and_then(|header| header.checked_add(length))
+            .ok_or(Error::Corrupt("blob allocation length overflow"))?;
+        Ok(Some(blobs.allocation_for(offset, total)?))
+    }
+
+    fn validate_key(key: &[u8]) -> Result<()> {
+        if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeyLength {
-                expected: self.config.key_size,
+                expected: KEY_SIZE,
                 actual: key.len(),
             });
         }
@@ -1516,12 +1851,7 @@ impl Database {
             }
             return Ok(());
         }
-        let value = value.ok_or(Error::Corrupt("map value is missing"))?;
-        if self.config.inline_value_size != 0 && value.len() != self.config.inline_value_size {
-            return Err(Error::InvalidConfig(
-                "map value length does not match inline value size",
-            ));
-        }
+        value.ok_or(Error::Corrupt("map value is missing"))?;
         Ok(())
     }
 
@@ -1533,10 +1863,20 @@ impl Database {
             .ok_or(Error::Corrupt("bucket index is out of range"))
     }
 
-    fn link_atomic(&self, link: Link) -> Result<&AtomicU64> {
+    fn link_value(&self, link: Link) -> Result<u64> {
         match link {
-            Link::Head(bucket) => self.head(bucket),
-            Link::Node(offset) => self.body.atomic_u64(offset),
+            Link::Head(bucket) => Ok(read_shared(self.head(bucket)?)),
+            Link::Node(offset) => read_next(&self.body, offset),
+        }
+    }
+
+    fn compare_exchange_link(&self, link: Link, expected: u64, replacement: u64) -> Result<bool> {
+        match link {
+            Link::Head(bucket) => Ok(self
+                .head(bucket)?
+                .compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()),
+            Link::Node(offset) => compare_exchange_next(&self.body, offset, expected, replacement),
         }
     }
 }
@@ -1553,8 +1893,8 @@ impl WriteOnlyWriter<'_> {
     ///
     /// # Errors
     ///
-    /// Returns an error when any key or inline value has the wrong width, or
-    /// when validation, metadata allocation, or mapped allocation fails.
+    /// Returns an error when any key has the wrong width, or when validation,
+    /// metadata allocation, or mapped allocation fails.
     ///
     /// # Examples
     ///
@@ -1563,11 +1903,11 @@ impl WriteOnlyWriter<'_> {
     ///
     /// let database = Database::create(
     ///     "floresta-db-put-batch-example",
-    ///     Config::new(Mode::Map, 1_024, 8),
+    ///     Config::new(Mode::Map, 1_024),
     /// )?;
     /// let entries = [
-    ///     (b"key-0001".as_slice(), b"value-01".as_slice()),
-    ///     (b"key-0002".as_slice(), b"value-02".as_slice()),
+    ///     (b"key-0001-0000000".as_slice(), b"value-01".as_slice()),
+    ///     (b"key-0002-0000000".as_slice(), b"value-02".as_slice()),
     /// ];
     /// assert_eq!(database.write_only()?.put_batch(entries)?, 2);
     /// # Ok::<(), floresta_db::Error>(())
@@ -1601,7 +1941,13 @@ pub(crate) fn create_runtime_heads(
                         .ok_or(Error::Corrupt("head offset overflow"))?,
                 )
                 .ok_or(Error::Corrupt("head offset overflow"))?;
-            heads.atomic_u64(offset)?.load(Ordering::Acquire)
+            let bytes = heads.copy_out(offset, size_of::<u64>())?;
+            u64::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("persisted head is truncated"))?,
+            )
         } else {
             0
         };
@@ -1623,21 +1969,20 @@ pub(crate) fn create_delete_locks(bucket_count: u64) -> Result<Box<[AtomicU64]>>
     Ok(locks.into_boxed_slice())
 }
 
-fn inline_value_word(value: &[u8]) -> Result<u64> {
-    if value.len() > size_of::<u64>() {
-        return Err(Error::InvalidConfig("inline value exceeds eight bytes"));
-    }
-    let mut bytes = [0u8; 8];
-    bytes[..value.len()].copy_from_slice(value);
-    Ok(u64::from_le_bytes(bytes))
+fn inline_value_word(value: &[u8]) -> Option<u64> {
+    let bytes = <[u8; 8]>::try_from(value).ok()?;
+    let word = u64::from_le_bytes(bytes);
+    (word & VALUE_BLOB_TAG == 0).then_some(word)
 }
 
-fn inline_value_bytes(word: u64, length: usize) -> Result<Vec<u8>> {
-    let bytes = word.to_le_bytes();
-    bytes
-        .get(..length)
-        .map(<[u8]>::to_vec)
-        .ok_or(Error::Corrupt("inline value length exceeds eight bytes"))
+fn inline_value_bytes(word: u64) -> Vec<u8> {
+    word.to_le_bytes().to_vec()
+}
+
+fn read_shared(atomic: &AtomicU64) -> u64 {
+    // SAFETY: the target platforms provide aligned single-copy 64-bit reads. Writers use CAS,
+    // and every decision based on this possibly stale observation is revalidated by CAS.
+    unsafe { std::ptr::read_volatile(atomic.as_ptr()) }
 }
 
 #[derive(Clone, Copy)]
@@ -1680,7 +2025,7 @@ pub(crate) fn heads_length(bucket_count: u64) -> Result<u64> {
         .ok_or(Error::InvalidConfig("heads file size overflow"))
 }
 
-pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: u64) -> Result<()> {
+pub(crate) fn initialize_header(heads: &MappedFile, config: &Config) -> Result<()> {
     let page_size = usize::try_from(FORMAT_PAGE_SIZE)
         .map_err(|_| Error::InvalidConfig("page size does not fit memory"))?;
     let mut header = Vec::new();
@@ -1699,19 +2044,14 @@ pub(crate) fn initialize_header(heads: &MappedFile, config: &Config, node_size: 
     write_header_u64(
         &mut header,
         32,
-        u64::try_from(config.key_size).map_err(|_| Error::InvalidConfig("key size overflow"))?,
+        u64::try_from(KEY_SIZE).map_err(|_| Error::InvalidConfig("key size overflow"))?,
     )?;
     write_header_u64(&mut header, 40, config.body_capacity)?;
     write_header_u64(&mut header, 48, config.blob_capacity)?;
     write_header_u64(&mut header, 56, config.block_size)?;
     write_header_u64(&mut header, 72, config.hash_seed)?;
-    write_header_u64(&mut header, 80, node_size)?;
-    write_header_u64(
-        &mut header,
-        88,
-        u64::try_from(config.inline_value_size)
-            .map_err(|_| Error::InvalidConfig("inline value size overflow"))?,
-    )?;
+    write_header_u64(&mut header, 80, NODE_SIZE_U64)?;
+    write_header_u64(&mut header, 88, 0)?;
     let checksum = header_checksum(&header)?;
     write_header_u64(&mut header, HEADER_CHECKSUM_OFFSET, checksum)?;
     // SAFETY: database creation is single-threaded and heads are not published yet.
@@ -1744,8 +2084,15 @@ mod tests {
         std::env::temp_dir().join(format!("floresta-db-{}-{name}", std::process::id()))
     }
 
-    fn config(mode: Mode, buckets: u64, key_size: usize) -> Config {
-        let mut config = Config::new(mode, buckets, key_size);
+    fn fixed_key(input: &[u8]) -> [u8; KEY_SIZE] {
+        let mut key = [0_u8; KEY_SIZE];
+        let length = input.len().min(KEY_SIZE);
+        key[..length].copy_from_slice(&input[..length]);
+        key
+    }
+
+    fn config(mode: Mode, buckets: u64) -> Config {
+        let mut config = Config::new(mode, buckets);
         config.block_size = 64 * 1_024;
         config.body_capacity = config.block_size * 8;
         config.blob_capacity = if mode == Mode::Map {
@@ -1760,16 +2107,19 @@ mod tests {
     fn inserts_replaces_and_deletes_colliding_map_keys() -> Result<()> {
         let path = test_directory("map");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Map, 1, 4))?;
-        assert_eq!(database.put(b"key1", b"first")?, PutResult::Inserted);
-        assert_eq!(database.put(b"key2", b"second")?, PutResult::Inserted);
-        assert_eq!(database.put(b"key1", b"new")?, PutResult::Replaced);
-        assert_eq!(database.get(b"key1")?, Some(b"new".to_vec()));
-        assert_eq!(database.get(b"key2")?, Some(b"second".to_vec()));
-        assert!(database.delete(b"key1")?);
-        assert_eq!(database.get(b"key1")?, None);
-        assert_eq!(database.get(b"key2")?, Some(b"second".to_vec()));
-        assert!(!database.delete(b"none")?);
+        let database = Database::create(&path, config(Mode::Map, 1))?;
+        let first = fixed_key(b"key1");
+        let second = fixed_key(b"key2");
+        let missing = fixed_key(b"none");
+        assert_eq!(database.put(&first, b"first")?, PutResult::Inserted);
+        assert_eq!(database.put(&second, b"second")?, PutResult::Inserted);
+        assert_eq!(database.put(&first, b"new")?, PutResult::Replaced);
+        assert_eq!(database.get(&first)?, Some(b"new".to_vec()));
+        assert_eq!(database.get(&second)?, Some(b"second".to_vec()));
+        assert!(database.delete(&first)?);
+        assert_eq!(database.get(&first)?, None);
+        assert_eq!(database.get(&second)?, Some(b"second".to_vec()));
+        assert!(!database.delete(&missing)?);
         drop(database);
         std::fs::remove_dir_all(path)?;
         Ok(())
@@ -1779,20 +2129,20 @@ mod tests {
     fn supports_concurrent_set_writers() -> Result<()> {
         let path = test_directory("set-concurrent");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Set, 16, 8))?;
+        let database = Database::create(&path, config(Mode::Set, 16))?;
         std::thread::scope(|scope| {
             for thread in 0_u64..8 {
                 let database_ref = &database;
                 scope.spawn(move || {
                     for item in 0_u64..64 {
-                        let key = (thread * 64 + item).to_le_bytes();
+                        let key = fixed_key(&(thread * 64 + item).to_le_bytes());
                         assert!(database_ref.add(&key).is_ok());
                     }
                 });
             }
         });
-        for key in 0_u64..512 {
-            assert!(database.contains(&key.to_le_bytes())?);
+        for value in 0_u64..512 {
+            assert!(database.contains(&fixed_key(&value.to_le_bytes()))?);
         }
         drop(database);
         std::fs::remove_dir_all(path)?;
@@ -1803,10 +2153,12 @@ mod tests {
     fn serializes_concurrent_deleters_per_bucket() -> Result<()> {
         let path = test_directory("delete-concurrent-bucket");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
-        let keys: Vec<[u8; 8]> = (0_u64..512).map(u64::to_le_bytes).collect();
+        let database = Database::create(&path, config(Mode::Set, 1))?;
+        let keys: Vec<[u8; KEY_SIZE]> = (0_u64..512)
+            .map(|value| fixed_key(&value.to_le_bytes()))
+            .collect();
         assert_eq!(
-            database.add_batch(keys.iter().map(<[u8; 8]>::as_slice))?,
+            database.add_batch(keys.iter().map(<[u8; KEY_SIZE]>::as_slice))?,
             keys.len()
         );
 
@@ -1814,7 +2166,8 @@ mod tests {
             for chunk in keys.chunks(64) {
                 let database_ref = &database;
                 scope.spawn(move || {
-                    let result = database_ref.batch_delete(chunk.iter().map(<[u8; 8]>::as_slice));
+                    let result =
+                        database_ref.batch_delete(chunk.iter().map(<[u8; KEY_SIZE]>::as_slice));
                     assert!(matches!(result, Ok(deleted) if deleted.iter().all(|value| *value)));
                 });
             }
@@ -1832,21 +2185,23 @@ mod tests {
     fn set_adds_retain_duplicates() -> Result<()> {
         let path = test_directory("set-duplicates");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
+        let database = Database::create(&path, config(Mode::Set, 1))?;
 
-        assert_eq!(database.add(b"same-key")?, PutResult::Inserted);
-        assert_eq!(database.add(b"same-key")?, PutResult::Inserted);
-        let batch = [b"batchkey".as_slice(), b"batchkey".as_slice()];
+        let same = fixed_key(b"same-key");
+        let batch_key = fixed_key(b"batchkey");
+        assert_eq!(database.add(&same)?, PutResult::Inserted);
+        assert_eq!(database.add(&same)?, PutResult::Inserted);
+        let batch = [batch_key.as_slice(), batch_key.as_slice()];
         assert_eq!(database.add_batch(batch)?, 2);
 
-        assert!(database.delete(b"same-key")?);
-        assert!(database.contains(b"same-key")?);
-        assert!(database.delete(b"same-key")?);
-        assert!(!database.contains(b"same-key")?);
-        assert!(database.delete(b"batchkey")?);
-        assert!(database.contains(b"batchkey")?);
-        assert!(database.delete(b"batchkey")?);
-        assert!(!database.contains(b"batchkey")?);
+        assert!(database.delete(&same)?);
+        assert!(database.contains(&same)?);
+        assert!(database.delete(&same)?);
+        assert!(!database.contains(&same)?);
+        assert!(database.delete(&batch_key)?);
+        assert!(database.contains(&batch_key)?);
+        assert!(database.delete(&batch_key)?);
+        assert!(!database.contains(&batch_key)?);
 
         drop(database);
         std::fs::remove_dir_all(path)?;
@@ -1857,8 +2212,11 @@ mod tests {
     fn prepares_batches_by_ascending_bucket_and_input_order() -> Result<()> {
         let path = test_directory("batch-order");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Set, 8, 8))?;
-        let keys: Vec<[u8; 8]> = (0_u64..64).map(u64::to_le_bytes).rev().collect();
+        let database = Database::create(&path, config(Mode::Set, 8))?;
+        let keys: Vec<[u8; KEY_SIZE]> = (0_u64..64)
+            .map(|value| fixed_key(&value.to_le_bytes()))
+            .rev()
+            .collect();
         let prepared =
             database.prepare_batch(keys.iter().map(|key| (key.as_slice(), None::<&[u8]>)))?;
 
@@ -1869,7 +2227,7 @@ mod tests {
             }
         }
 
-        let prepared_keys = database.prepare_keys(keys.iter().map(<[u8; 8]>::as_slice))?;
+        let prepared_keys = database.prepare_keys(keys.iter().map(<[u8; KEY_SIZE]>::as_slice))?;
         for pair in prepared_keys.windows(2) {
             assert!(pair[0].bucket <= pair[1].bucket);
             if pair[0].bucket == pair[1].bucket {
@@ -1886,31 +2244,31 @@ mod tests {
     fn batch_prelinks_collisions_and_retains_duplicate_values() -> Result<()> {
         let path = test_directory("batch-collisions");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Map, 1, 8))?;
-        database.put(b"key-000A", b"value-a")?;
+        let database = Database::create(&path, config(Mode::Map, 1))?;
+        database.put(&fixed_key(b"key-000A-0000000"), b"value-a")?;
 
         let entries = [
-            (b"key-000B".as_slice(), b"value-b".as_slice()),
-            (b"key-000C".as_slice(), b"value-c".as_slice()),
+            (b"key-000B-0000000".as_slice(), b"value-b".as_slice()),
+            (b"key-000C-0000000".as_slice(), b"value-c".as_slice()),
         ];
         assert_eq!(database.write_only()?.put_batch(entries)?, 2);
 
-        let root = database.head(0)?.load(Ordering::Acquire);
-        let node_c = read_node(&database.body, root, database.node_size, 8)?;
-        let node_b = read_node(&database.body, node_c.next, database.node_size, 8)?;
-        let node_a = read_node(&database.body, node_b.next, database.node_size, 8)?;
-        assert_eq!(node_c.key, b"key-000C");
-        assert_eq!(node_b.key, b"key-000B");
-        assert_eq!(node_a.key, b"key-000A");
+        let root = read_shared(database.head(0)?);
+        let node_c = read_node(&database.body, root)?;
+        let node_b = read_node(&database.body, node_c.next)?;
+        let node_a = read_node(&database.body, node_b.next)?;
+        assert_eq!(node_c.key, *b"key-000C-0000000");
+        assert_eq!(node_b.key, *b"key-000B-0000000");
+        assert_eq!(node_a.key, *b"key-000A-0000000");
 
         let duplicates = [
-            (b"same-key".as_slice(), b"first".as_slice()),
-            (b"same-key".as_slice(), b"second".as_slice()),
+            (b"same-key-0000000".as_slice(), b"first".as_slice()),
+            (b"same-key-0000000".as_slice(), b"second".as_slice()),
         ];
         assert_eq!(database.write_only()?.put_batch(duplicates)?, 2);
-        assert_eq!(database.get(b"same-key")?, Some(b"second".to_vec()));
-        assert!(database.delete(b"same-key")?);
-        assert_eq!(database.get(b"same-key")?, Some(b"first".to_vec()));
+        assert_eq!(database.get(b"same-key-0000000")?, Some(b"second".to_vec()));
+        assert!(database.delete(b"same-key-0000000")?);
+        assert_eq!(database.get(b"same-key-0000000")?, Some(b"first".to_vec()));
 
         drop(database);
         std::fs::remove_dir_all(path)?;
@@ -1921,9 +2279,9 @@ mod tests {
     fn batch_fetch_restores_input_order_across_buckets() -> Result<()> {
         let path = test_directory("batch-fetch");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Map, 8, 8))?;
-        let entries: Vec<([u8; 8], [u8; 8])> = (0_u64..8)
-            .map(|key| (key.to_le_bytes(), (key + 100).to_le_bytes()))
+        let database = Database::create(&path, config(Mode::Map, 8))?;
+        let entries: Vec<([u8; KEY_SIZE], [u8; 8])> = (0_u64..8)
+            .map(|value| (fixed_key(&value.to_le_bytes()), (value + 100).to_le_bytes()))
             .collect();
         assert_eq!(
             database.write_only()?.put_batch(
@@ -1934,7 +2292,7 @@ mod tests {
             entries.len()
         );
 
-        let missing = [255_u8; 8];
+        let missing = [255_u8; KEY_SIZE];
         let queries = [
             entries[5].0.as_slice(),
             missing.as_slice(),
@@ -1958,7 +2316,7 @@ mod tests {
     fn concurrent_insert_only_puts_publish_once_without_replacement() -> Result<()> {
         let path = test_directory("insert-only-concurrent");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Map, 1, 8))?;
+        let database = Database::create(&path, config(Mode::Map, 1))?;
         let inserted = AtomicU64::new(0);
         std::thread::scope(|scope| {
             for value in 0_u64..8 {
@@ -1966,7 +2324,7 @@ mod tests {
                 let inserted_ref = &inserted;
                 scope.spawn(move || {
                     if database_ref
-                        .put_new(b"same-key", &value.to_le_bytes())
+                        .put_new(&fixed_key(b"same-key"), &value.to_le_bytes())
                         .unwrap_or(false)
                     {
                         inserted_ref.fetch_add(1, Ordering::Relaxed);
@@ -1976,29 +2334,26 @@ mod tests {
         });
         assert_eq!(inserted.load(Ordering::Relaxed), 1);
         let expected = database
-            .get(b"same-key")?
+            .get(&fixed_key(b"same-key"))?
             .ok_or(Error::Corrupt("insert-only key is missing"))?;
-        assert!(!database.put_new(b"same-key", b"ignored")?);
+        assert!(!database.put_new(&fixed_key(b"same-key"), b"ignored")?);
         assert_eq!(inserted.load(Ordering::Relaxed), 1);
         database.close()?;
         let reopened = Database::open_runtime(&path)?;
-        assert_eq!(reopened.get(b"same-key")?, Some(expected));
+        assert_eq!(reopened.get(&fixed_key(b"same-key"))?, Some(expected));
         drop(reopened);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
 
     #[test]
-    fn write_only_inline_values_survive_clean_reopen() -> Result<()> {
+    fn write_only_automatically_inlines_values_across_reopen() -> Result<()> {
         let path = test_directory("write-only-inline");
         let _ignored = std::fs::remove_dir_all(&path);
-        let mut inline_config = config(Mode::Map, 16, 8);
-        inline_config.inline_value_size = 8;
-        inline_config.blob_capacity = 0;
-        let database = Database::create(&path, inline_config)?;
+        let database = Database::create(&path, config(Mode::Map, 16))?;
         {
-            let entries: Vec<([u8; 8], [u8; 8])> = (0_u64..128)
-                .map(|value| (value.to_le_bytes(), (value * 2).to_le_bytes()))
+            let entries: Vec<([u8; KEY_SIZE], [u8; 8])> = (0_u64..128)
+                .map(|value| (fixed_key(&value.to_le_bytes()), (value * 2).to_le_bytes()))
                 .collect();
             let writer = database.write_only()?;
             assert_eq!(
@@ -2010,12 +2365,15 @@ mod tests {
                 entries.len()
             );
         }
-        assert!(!path.join("blobs").exists());
+        assert_eq!(
+            std::fs::metadata(path.join("blobs"))?.len(),
+            FORMAT_PAGE_SIZE
+        );
         database.close()?;
         let reopened = Database::open_runtime(&path)?;
         for value in 0_u64..128 {
             assert_eq!(
-                reopened.get(&value.to_le_bytes())?,
+                reopened.get(&fixed_key(&value.to_le_bytes()))?,
                 Some((value * 2).to_le_bytes().to_vec())
             );
         }
@@ -2025,34 +2383,235 @@ mod tests {
     }
 
     #[test]
-    fn deletion_reuses_freed_block_before_growing_body() -> Result<()> {
-        let path = test_directory("delete-free-list");
+    fn tagged_or_non_eight_byte_values_fall_back_to_blobs() -> Result<()> {
+        let path = test_directory("automatic-blob-fallback");
         let _ignored = std::fs::remove_dir_all(&path);
-        let mut test_config = config(Mode::Set, 1, 4_000);
+        let database = Database::create(&path, config(Mode::Map, 8))?;
+        let tagged_key = fixed_key(b"tagged");
+        let short_key = fixed_key(b"short");
+        let tagged = [0, 0, 0, 0, 0, 0, 0, 0x80];
+        database.put(&tagged_key, &tagged)?;
+        database.put(&short_key, b"short")?;
+
+        for key in [tagged_key, short_key] {
+            let hash = xxh64(&key, database.config.hash_seed);
+            let node = database
+                .find(hash % database.config.bucket_count, hash, &key)?
+                .node
+                .ok_or(Error::Corrupt("automatic blob test node is missing"))?;
+            assert_ne!(node.value & VALUE_BLOB_TAG, 0);
+        }
+        assert_eq!(database.get(&tagged_key)?, Some(tagged.to_vec()));
+        assert_eq!(database.get(&short_key)?, Some(b"short".to_vec()));
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deletion_reuses_zero_count_page_before_growing_body() -> Result<()> {
+        let path = test_directory("delete-zero-page");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut test_config = config(Mode::Set, 1);
         test_config.block_size = FORMAT_PAGE_SIZE;
-        test_config.body_capacity = FORMAT_PAGE_SIZE * 2;
+        test_config.body_capacity = test_config.block_size * 2;
+        let nodes_per_page = test_config.block_size / NODE_SIZE_U64;
+        let key_count = nodes_per_page * 2;
         let database = Database::create(&path, test_config)?;
-        let first = vec![1; 4_000];
-        let second = vec![2; 4_000];
-        let third = vec![3; 4_000];
-        database.add(&first)?;
-        database.add(&second)?;
+        let keys: Vec<[u8; KEY_SIZE]> = (0..key_count)
+            .map(|value| fixed_key(&value.to_le_bytes()))
+            .collect();
+        assert_eq!(
+            database.add_batch(keys.iter().map(<[u8; KEY_SIZE]>::as_slice))?,
+            keys.len()
+        );
         let grown_length = std::fs::metadata(path.join("body"))?.len();
 
-        assert!(database.delete(&first)?);
-        database.add(&third)?;
-        let hash = xxh64(&third, database.config.hash_seed);
+        let first_page_end = usize::try_from(nodes_per_page)
+            .map_err(|_| Error::Corrupt("nodes per page does not fit usize"))?;
+        let deleted = database.batch_delete(
+            keys[..first_page_end]
+                .iter()
+                .map(<[u8; KEY_SIZE]>::as_slice),
+        )?;
+        assert!(deleted.iter().all(|value| *value));
+        let replacement = fixed_key(&key_count.to_le_bytes());
+        database.add(&replacement)?;
+        let hash = xxh64(&replacement, database.config.hash_seed);
         let node = database
-            .find(0, hash, &third)?
+            .find(0, hash, &replacement)?
             .node
             .ok_or(Error::Corrupt("reused key is missing"))?;
-        let allocation = database.body.allocation_for(
-            node.offset,
-            u32::try_from(database.node_size)
-                .map_err(|_| Error::Corrupt("node size does not fit test allocation"))?,
-        )?;
+        let node_size = u32::try_from(NODE_SIZE)
+            .map_err(|_| Error::Corrupt("body node size does not fit u32"))?;
+        let allocation = database.body.allocation_for(node.offset, node_size)?;
         assert_eq!(allocation.block, 0);
         assert_eq!(std::fs::metadata(path.join("body"))?.len(), grown_length);
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_pop_reuses_multi_page_zero_runs_before_growing() -> Result<()> {
+        let path = test_directory("batch-pop-zero-runs");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut test_config = config(Mode::Map, 4_096);
+        test_config.body_capacity = test_config.block_size * 16;
+        test_config.blob_capacity = test_config.block_size * 16;
+        let database = Database::create(&path, test_config)?;
+        let value = [0x42_u8; 64];
+        let keys = |generation: u64| {
+            (0_u64..6_000)
+                .map(|index| {
+                    let mut key = [0_u8; KEY_SIZE];
+                    key[..8].copy_from_slice(&generation.to_le_bytes());
+                    key[8..].copy_from_slice(&index.to_le_bytes());
+                    key
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = keys(1);
+        database
+            .write_only()?
+            .put_batch(first.iter().map(|key| (key.as_slice(), value.as_slice())))?;
+        database.sync()?;
+        let body_high_water = crate::allocator::read_high_water(&path.join("body.counts"))?;
+        let blob_high_water = crate::allocator::read_high_water(&path.join("blobs.counts"))?;
+        let body_length = std::fs::metadata(path.join("body"))?.len();
+        let blob_length = std::fs::metadata(path.join("blobs"))?.len();
+        assert!(body_high_water > 1);
+        assert!(blob_high_water > 1);
+
+        let popped = database.batch_pop(first.iter().map(<[u8; KEY_SIZE]>::as_slice))?;
+        assert!(popped.iter().all(Option::is_some));
+        database.sync()?;
+
+        let second = keys(2);
+        database
+            .write_only()?
+            .put_batch(second.iter().map(|key| (key.as_slice(), value.as_slice())))?;
+        database.sync()?;
+        assert_eq!(
+            crate::allocator::read_high_water(&path.join("body.counts"))?,
+            body_high_water
+        );
+        assert_eq!(
+            crate::allocator::read_high_water(&path.join("blobs.counts"))?,
+            blob_high_water
+        );
+        assert_eq!(std::fs::metadata(path.join("body"))?.len(), body_length);
+        assert_eq!(std::fs::metadata(path.join("blobs"))?.len(), blob_length);
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+    #[test]
+    fn online_compaction_preserves_concurrent_reads_and_reclaims_sparse_page() -> Result<()> {
+        let path = test_directory("online-compaction");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let mut test_config = config(Mode::Set, 4_096);
+        test_config.body_capacity = test_config.block_size * 4;
+        let database = std::sync::Arc::new(Database::create(&path, test_config)?);
+        let keys: Vec<[u8; KEY_SIZE]> = (0_u64..4_096)
+            .map(|value| fixed_key(&value.to_le_bytes()))
+            .collect();
+        database.add_batch(keys.iter().map(<[u8; KEY_SIZE]>::as_slice))?;
+        database.sync()?;
+
+        let mut first_page = Vec::new();
+        for key in &keys {
+            let hash = xxh64(key, database.config.hash_seed);
+            let node = database
+                .find(hash % database.config.bucket_count, hash, key)?
+                .node
+                .ok_or(Error::Corrupt("compaction test key is missing"))?;
+            let allocation = database.body.allocation_for(
+                node.offset,
+                u32::try_from(NODE_SIZE)
+                    .map_err(|_| Error::Corrupt("body node size does not fit u32"))?,
+            )?;
+            if allocation.block == 0 {
+                first_page.push(*key);
+            }
+        }
+        assert_eq!(first_page.len(), 2_048);
+        let retained = first_page[..16].to_vec();
+        for key in &first_page[16..] {
+            assert!(database.delete(key)?);
+        }
+        assert_eq!(database.body.block_live_count(0)?, 16);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| -> Result<()> {
+            let mut readers = Vec::new();
+            for _reader in 0..4 {
+                let database = std::sync::Arc::clone(&database);
+                let retained = &retained;
+                let stop = std::sync::Arc::clone(&stop);
+                readers.push(scope.spawn(move || -> Result<()> {
+                    while !stop.load(Ordering::Acquire) {
+                        for key in retained {
+                            if !database.contains(key)? {
+                                return Err(Error::Corrupt(
+                                    "compaction hid a concurrently-read key",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+
+            let compaction = database.compact(64);
+            stop.store(true, Ordering::Release);
+            for reader in readers {
+                reader
+                    .join()
+                    .map_err(|_| Error::Corrupt("compaction reader thread panicked"))??;
+            }
+            let stats = compaction?;
+            assert_eq!(stats.candidate_pages, 1);
+            assert_eq!(stats.moved_nodes, 16);
+            assert_eq!(stats.reclaimed_pages, 1);
+            assert_eq!(stats.remaining_candidate_pages, 0);
+            Ok(())
+        })?;
+
+        for key in &retained {
+            assert!(database.contains(key)?);
+        }
+        assert_eq!(database.body.block_live_count(0)?, 0);
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_and_checkpoints_are_mutually_exclusive() -> Result<()> {
+        let path = test_directory("compaction-checkpoint-exclusion");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Set, 8))?;
+
+        database.compaction_state.store(1, Ordering::Release);
+        assert!(matches!(
+            database.checkpoint(),
+            Err(Error::Busy("compaction is active"))
+        ));
+        assert_eq!(database.checkpoint_state.load(Ordering::Acquire), 0);
+        database.compaction_state.store(0, Ordering::Release);
+
+        database.checkpoint_state.store(1, Ordering::Release);
+        assert!(matches!(
+            database.compact(1),
+            Err(Error::Busy("checkpoint is active"))
+        ));
+        assert_eq!(database.compaction_state.load(Ordering::Acquire), 0);
+        database.checkpoint_state.store(0, Ordering::Release);
 
         drop(database);
         std::fs::remove_dir_all(path)?;
@@ -2063,9 +2622,9 @@ mod tests {
     fn batch_delete_stops_after_last_match() -> Result<()> {
         let path = test_directory("batch-delete-early-exit");
         let _ignored = std::fs::remove_dir_all(&path);
-        let database = Database::create(&path, config(Mode::Set, 1, 8))?;
-        let older = 1_u64.to_le_bytes();
-        let newest = 2_u64.to_le_bytes();
+        let database = Database::create(&path, config(Mode::Set, 1))?;
+        let older = fixed_key(&1_u64.to_le_bytes());
+        let newest = fixed_key(&2_u64.to_le_bytes());
         database.add(&older)?;
         database.add(&newest)?;
 
@@ -2081,14 +2640,14 @@ mod tests {
             .ok_or(Error::Corrupt("newest test node is missing"))?;
         database
             .body
-            .atomic_u64(older_node.offset)?
+            .atomic_u64(older_node.offset + crate::layout::NODE_POINTER_OFFSET as u64)?
             .store(1, Ordering::Release);
 
         assert_eq!(database.batch_delete([newest.as_slice()])?, vec![true]);
         assert_eq!(
             database
                 .body
-                .atomic_u64(newest_node.offset + crate::layout::NODE_MAGIC_OFFSET as u64)?
+                .atomic_u64(newest_node.offset + crate::layout::NODE_POINTER_OFFSET as u64)?
                 .load(Ordering::Acquire),
             0
         );
@@ -2099,49 +2658,65 @@ mod tests {
     }
 
     #[test]
-    fn batch_delete_reuses_colliding_blocks_and_preserves_result_order() -> Result<()> {
-        let path = test_directory("batch-delete-free-list");
+    fn batch_delete_preserves_result_order() -> Result<()> {
+        let path = test_directory("batch-delete-order");
         let _ignored = std::fs::remove_dir_all(&path);
-        let mut test_config = config(Mode::Set, 1, 4_000);
-        test_config.block_size = FORMAT_PAGE_SIZE;
-        test_config.body_capacity = FORMAT_PAGE_SIZE * 3;
-        let database = Database::create(&path, test_config)?;
-        let first = vec![1; 4_000];
-        let second = vec![2; 4_000];
-        let third = vec![3; 4_000];
-        let fourth = vec![4; 4_000];
-        let missing = vec![9; 4_000];
-        assert_eq!(
-            database.add_batch([first.as_slice(), second.as_slice(), third.as_slice()])?,
-            3
-        );
-        let grown_length = std::fs::metadata(path.join("body"))?.len();
+        let database = Database::create(&path, config(Mode::Set, 1))?;
+        let first = fixed_key(b"first");
+        let second = fixed_key(b"second");
+        let third = fixed_key(b"third");
+        let missing = fixed_key(b"missing");
+        database.add_batch([first.as_slice(), second.as_slice(), third.as_slice()])?;
 
         assert!(matches!(
             database.batch_delete([first.as_slice(), first.as_slice()]),
             Err(Error::InvalidConfig(_))
         ));
         assert_eq!(
-            database.batch_delete([first.as_slice(), missing.as_slice(), second.as_slice()])?,
+            database.batch_delete([second.as_slice(), missing.as_slice(), first.as_slice()])?,
             vec![true, false, true]
         );
         assert!(!database.contains(&first)?);
         assert!(!database.contains(&second)?);
         assert!(database.contains(&third)?);
 
-        database.add(&fourth)?;
-        let hash = xxh64(&fourth, database.config.hash_seed);
-        let node = database
-            .find(0, hash, &fourth)?
-            .node
-            .ok_or(Error::Corrupt("batch-delete replacement key is missing"))?;
-        let allocation = database.body.allocation_for(
-            node.offset,
-            u32::try_from(database.node_size)
-                .map_err(|_| Error::Corrupt("node size does not fit test allocation"))?,
-        )?;
-        assert_eq!(allocation.block, 0);
-        assert_eq!(std::fs::metadata(path.join("body"))?.len(), grown_length);
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn batch_pop_returns_blob_values_in_input_order() -> Result<()> {
+        let path = test_directory("batch-pop");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Map, 8))?;
+        let first = fixed_key(b"first");
+        let second = fixed_key(b"second");
+        let third = fixed_key(b"third");
+        let missing = fixed_key(b"missing");
+        database.put(&first, b"first-value")?;
+        database.put(&second, b"second-value")?;
+        database.put(&third, b"third-value")?;
+
+        let popped = database.batch_pop([
+            third.as_slice(),
+            missing.as_slice(),
+            first.as_slice(),
+            second.as_slice(),
+        ])?;
+        assert_eq!(
+            popped,
+            vec![
+                Some(b"third-value".to_vec()),
+                None,
+                Some(b"first-value".to_vec()),
+                Some(b"second-value".to_vec()),
+            ]
+        );
+        assert_eq!(
+            database.batch_fetch([first.as_slice(), second.as_slice(), third.as_slice()])?,
+            vec![None, None, None]
+        );
 
         drop(database);
         std::fs::remove_dir_all(path)?;
