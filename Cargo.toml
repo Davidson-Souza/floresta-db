@@ -12,16 +12,15 @@ license = "MIT OR Apache-2.0"
 bitcoin = { version = "0.32.7", optional = true }
 bitcoinkernel = { version = "0.3.0", optional = true }
 hintsfile = { version = "0.1.1", optional = true }
-memmap2 = { version = "0.9.5", optional = true }
 
 [features]
 default = []
-bitcoin-load = ["dep:bitcoin", "dep:bitcoinkernel", "dep:hintsfile", "dep:memmap2"]
+hintsgen = ["dep:bitcoin", "dep:bitcoinkernel", "dep:hintsfile"]
 
 [[example]]
-name = "bitcoin-load"
-path = "examples/bitcoin_load/main.rs"
-required-features = ["bitcoin-load"]
+name = "hintsgen"
+path = "examples/hintsgen/main.rs"
+required-features = ["hintsgen"]
 
 [[bench]]
 name = "database"
