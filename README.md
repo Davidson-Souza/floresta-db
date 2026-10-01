@@ -186,6 +186,8 @@ cargo run --release --features hintsgen --example hintsgen -- \
 
 The work directory must not exist. Building this feature requires CMake, a C++ compiler, and Boost. Stop any process that exclusively locks the selected Bitcoin Core data directory before running it.
 
+`DATA_DIR` is the network-specific Bitcoin Core directory, not the base `.bitcoin` directory. In particular, testnet3 uses `~/.bitcoin/testnet3` and `~/.bitcoin/testnet3/blocks`; the network argument accepts either `testnet` or `testnet3`.
+
 Eligible outputs are inserted with `WriteOnlyWriter::put_batch`; spent outpoints are removed with `batch_pop`, whose returned output positions are sorted into the hintsfile complement. A final `compact` pass reclaims sparse body pages before the database closes. `WORK_DIR/index` remains a clean runtime database that can be reopened with `Database::open_runtime`. Tuning variables are `HINTSGEN_BUCKETS`, `HINTSGEN_BODY_GIB`, and `HINTSGEN_BLOCK_MIB`.
 
 ## Validation

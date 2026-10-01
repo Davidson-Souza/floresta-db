@@ -15,13 +15,13 @@ use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint, TxOut};
-use bitcoinkernel::{ChainType, ChainstateManager, ContextBuilder};
+use bitcoinkernel::{ChainType, ChainstateManager, Context, ContextBuilder, Log, Logger};
 use floresta_db::{Config, Database, Error, Mode};
 use hintsfile::{EliasFano, HintsfileBuilder};
 
@@ -68,11 +68,7 @@ fn run() -> AnyResult<()> {
     let context = ContextBuilder::new()
         .chain_type(arguments.network)
         .build()?;
-    let data_dir = path_text(&arguments.data_dir, "data directory")?;
-    let blocks_dir = path_text(&arguments.blocks_dir, "blocks directory")?;
-    let chainman = ChainstateManager::builder(&context, data_dir, blocks_dir)?
-        .worker_threads(0)
-        .build()?;
+    let chainman = open_chainstate(&arguments, &context)?;
     log_progress(format_args!("stage=kernel event=manager_ready"));
     chainman.import_blocks()?;
 
@@ -247,6 +243,87 @@ fn run() -> AnyResult<()> {
         storage,
     );
     Ok(())
+}
+
+#[derive(Clone, Default)]
+struct KernelDiagnostics {
+    latest: Arc<Mutex<String>>,
+}
+
+impl Log for KernelDiagnostics {
+    fn log(&self, message: &str) {
+        let message = message.trim();
+        if !message.is_empty()
+            && let Ok(mut latest) = self.latest.lock()
+        {
+            message.clone_into(&mut latest);
+        }
+    }
+}
+
+impl KernelDiagnostics {
+    fn latest(&self) -> Option<String> {
+        let message = self.latest.lock().ok()?;
+        if message.is_empty() {
+            None
+        } else {
+            Some(message.clone())
+        }
+    }
+}
+
+fn open_chainstate(arguments: &Arguments, context: &Context) -> AnyResult<ChainstateManager> {
+    let data_dir = path_text(&arguments.data_dir, "data directory")?;
+    let blocks_dir = path_text(&arguments.blocks_dir, "blocks directory")?;
+    let diagnostics = KernelDiagnostics::default();
+    let logger = Logger::new(diagnostics.clone())?;
+    let result = ChainstateManager::builder(context, data_dir, blocks_dir)?
+        .worker_threads(0)
+        .build();
+    drop(logger);
+
+    result.map_err(|error| {
+        io::Error::other(chainstate_failure_message(
+            &error.to_string(),
+            diagnostics.latest().as_deref(),
+            arguments.network,
+            &arguments.data_dir,
+            &arguments.blocks_dir,
+        ))
+        .into()
+    })
+}
+
+fn chainstate_failure_message(
+    error: &str,
+    kernel_detail: Option<&str>,
+    network: ChainType,
+    data_dir: &Path,
+    blocks_dir: &Path,
+) -> String {
+    let mut message = error.to_owned();
+    if let Some(detail) = kernel_detail
+        && !message.contains(detail)
+    {
+        message = format!("{message} Kernel detail: {detail}");
+    }
+    if network == ChainType::Testnet
+        && data_dir.file_name().and_then(|name| name.to_str()) == Some("testnet")
+    {
+        let corrected_data = data_dir.with_file_name("testnet3");
+        let corrected_blocks = if blocks_dir == data_dir.join("blocks") {
+            corrected_data.join("blocks")
+        } else {
+            blocks_dir.to_path_buf()
+        };
+        message = format!(
+            "{message} Bitcoin Core stores testnet3 in `testnet3`, not `testnet`; retry with \
+             DATA_DIR={} BLOCKS_DIR={} and network `testnet3`.",
+            corrected_data.display(),
+            corrected_blocks.display()
+        );
+    }
+    message
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1541,6 +1618,30 @@ mod tests {
             .chain_type(ChainType::Regtest)
             .build()?;
         Ok(())
+    }
+
+    #[test]
+    fn explains_the_testnet3_data_directory_name() {
+        let message = chainstate_failure_message(
+            "Failed to create chainstate manager.",
+            Some("Failed to load chain state from your data directory"),
+            ChainType::Testnet,
+            Path::new("/home/alice/.bitcoin/testnet"),
+            Path::new("/home/alice/.bitcoin/testnet/blocks"),
+        );
+        assert!(message.contains("Failed to load chain state"));
+        assert!(message.contains("DATA_DIR=/home/alice/.bitcoin/testnet3"));
+        assert!(message.contains("BLOCKS_DIR=/home/alice/.bitcoin/testnet3/blocks"));
+        assert!(message.contains("network `testnet3`"));
+
+        let canonical = chainstate_failure_message(
+            "Failed to create chainstate manager.",
+            None,
+            ChainType::Testnet,
+            Path::new("/home/alice/.bitcoin/testnet3"),
+            Path::new("/home/alice/.bitcoin/testnet3/blocks"),
+        );
+        assert!(!canonical.contains("retry with"));
     }
 
     #[test]
