@@ -24,9 +24,8 @@ use bitcoin::{Block, OutPoint, TxOut};
 use bitcoinkernel::{ChainType, ChainstateManager, ContextBuilder};
 use floresta_db::{Config, Database, Error, Mode};
 use hintsfile::{EliasFano, HintsfileBuilder};
-use memmap2::MmapOptions;
 
-const OUTPOINT_KEY_SIZE: usize = 12;
+const OUTPOINT_KEY_SIZE: usize = 16;
 const OUTPUT_INDEX_SIZE: usize = size_of::<u64>();
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const DEFAULT_BUCKETS: u64 = 1 << 20;
@@ -37,14 +36,7 @@ const HINTS_PROGRESS_INTERVAL: u64 = 10_000;
 const MAX_ADDER_LEAD_BLOCKS: u64 = 4096;
 const UNPROCESSED_COUNT: u32 = u32::MAX;
 const BIP30_UNSPENDABLE_HEIGHTS: [u64; 2] = [91_722, 91_812];
-const BODY_DATA_START: usize = 65_536;
-const BODY_NODE_FIXED_SIZE: usize = 56;
-const BODY_NODE_ALIGNMENT: usize = 8;
-const BODY_BLOB_OFFSET: usize = 16;
-const BODY_BLOB_LENGTH_OFFSET: usize = 24;
-const BODY_MAGIC_OFFSET: usize = 32;
-const BODY_BLOB_CHECKSUM_OFFSET: usize = 48;
-const BODY_NODE_MAGIC: u64 = 0x4341_534e_4f44_4531;
+const COMPACTION_MIN_PAGE_LOAD: u16 = 8_192;
 #[cfg(not(test))]
 const SORT_RUN_VALUE_CAPACITY: usize = 1 << 20;
 #[cfg(test)]
@@ -57,7 +49,7 @@ type AnyResult<T> = std::result::Result<T, AnyError>;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("bitcoin load test failed: {error}");
+        eprintln!("hints generation failed: {error}");
         std::process::exit(1);
     }
 }
@@ -100,8 +92,7 @@ fn run() -> AnyResult<()> {
     let block_slots = block_count_slots(end_height)?;
 
     let index_path = arguments.work_dir.join("index");
-    let index_config = database_config(&arguments, tip_height)?;
-    let database = Database::create(&index_path, index_config.clone())?;
+    let database = Database::create(&index_path, database_config(&arguments, tip_height)?)?;
     let live_outputs = AtomicU64::new(0);
     let add_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
     let remove_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
@@ -119,7 +110,7 @@ fn run() -> AnyResult<()> {
     ));
 
     let started = Instant::now();
-    let (adder_stats, remover_stats) = std::thread::scope(|scope| -> AnyResult<_> {
+    let (adder_stats, remover_stats, spent_runs) = std::thread::scope(|scope| -> AnyResult<_> {
         let mut adders = Vec::new();
         adders
             .try_reserve_exact(arguments.add_threads)
@@ -161,6 +152,7 @@ fn run() -> AnyResult<()> {
             let ranges_ref = &remove_ranges;
             let progress_ref = &progress;
             let live_ref = &live_outputs;
+            let run_directory = &arguments.work_dir;
             removers.push(scope.spawn(move || {
                 let result = remove_worker(
                     worker,
@@ -169,6 +161,7 @@ fn run() -> AnyResult<()> {
                     ranges_ref,
                     progress_ref,
                     live_ref,
+                    run_directory,
                 );
                 if let Err(error) = &result {
                     eprintln!("remover worker {worker} failed: {error}");
@@ -186,13 +179,18 @@ fn run() -> AnyResult<()> {
             adder_stats.merge(stats);
         }
         let mut remover_stats = WorkerStats::default();
+        let mut spent_runs = Vec::new();
         for handle in removers {
-            let stats = handle
+            let result = handle
                 .join()
                 .map_err(|_| io::Error::other("remover thread panicked"))??;
-            remover_stats.merge(stats);
+            remover_stats.merge(result.stats);
+            spent_runs
+                .try_reserve(result.runs.len())
+                .map_err(|_| Error::OutOfMemory)?;
+            spent_runs.extend(result.runs);
         }
-        Ok((adder_stats, remover_stats))
+        Ok((adder_stats, remover_stats, spent_runs))
     })?;
     log_progress(format_args!(
         "stage=index event=complete blocks_added={} blocks_removed={} eligible_outputs={} inputs_removed={} live_outputs={}",
@@ -206,18 +204,23 @@ fn run() -> AnyResult<()> {
     let counts = collect_output_counts(&block_slots)?;
     let offsets = fold_output_counts(&counts)?;
     let live = live_outputs.load(Ordering::Acquire);
+    let minimum_page_load = COMPACTION_MIN_PAGE_LOAD;
+    let compaction = database.compact(minimum_page_load)?;
+    log_progress(format_args!(
+        "stage=index event=compact_complete threshold={} candidates={} moved={} reclaimed={} remaining={}",
+        minimum_page_load,
+        compaction.candidate_pages,
+        compaction.moved_nodes,
+        compaction.reclaimed_pages,
+        compaction.remaining_candidate_pages
+    ));
     database.close()?;
 
-    let sort_workers = arguments
-        .add_threads
-        .checked_add(arguments.remove_threads)
-        .ok_or_else(|| invalid_input("offline sort worker count overflow"))?;
     let hints_path = arguments.work_dir.join("swiftsync.hints");
     let hints_started = Instant::now();
     let hints = write_hintsfile(
-        &index_path,
-        &index_config,
-        sort_workers,
+        &arguments.work_dir,
+        &spent_runs,
         tip_height,
         &counts,
         &offsets,
@@ -231,6 +234,7 @@ fn run() -> AnyResult<()> {
         ))
         .into());
     }
+    drop(spent_runs);
 
     let elapsed = started.elapsed();
     let storage = storage_stats(&arguments.work_dir)?;
@@ -338,10 +342,12 @@ fn remove_worker(
     ranges: &RangeAllocator,
     progress: &WorkerProgress,
     live_outputs: &AtomicU64,
-) -> AnyResult<WorkerStats> {
+    run_directory: &Path,
+) -> AnyResult<RemoveWorkerResult> {
     let mut stats = WorkerStats::default();
     let mut keys = Vec::new();
     let mut input_ranges = Vec::new();
+    let mut spent_positions = SortRunCollector::new(run_directory, worker)?;
     loop {
         progress.check_abort()?;
         let safe_height = progress.minimum_adder();
@@ -370,27 +376,10 @@ fn remove_worker(
                 stats.blocks = stats.blocks.saturating_add(1);
             }
 
-            let delete_started = Instant::now();
-            let deleted =
-                database.batch_delete(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
-            if let Some(missing) = deleted.iter().position(|deleted| !deleted) {
-                let Some((height, input_start, _input_end)) =
-                    input_ranges.iter().find(|(_, input_start, input_end)| {
-                        (*input_start..*input_end).contains(&missing)
-                    })
-                else {
-                    return Err(Error::Corrupt("missing input index is outside its range").into());
-                };
-                return Err(io::Error::other(format!(
-                    "missing spent outpoint at height {height}, input {}",
-                    missing - input_start
-                ))
-                .into());
-            }
-            let count = u64::try_from(deleted.len())
-                .map_err(|_| invalid_input("deleted input count does not fit u64"))?;
+            let pop_started = Instant::now();
+            let count = pop_spent_positions(database, &keys, &input_ranges, &mut spent_positions)?;
             cas_sub(live_outputs, count)?;
-            stats.database += delete_started.elapsed();
+            stats.database += pop_started.elapsed();
             stats.inputs = stats.inputs.saturating_add(count);
             progress.publish_remover(worker, range_end)?;
             log_progress(format_args!(
@@ -417,12 +406,43 @@ fn remove_worker(
             std::hint::spin_loop();
         }
     }
+    let runs = spent_positions.finish()?;
     progress.finish_remover(worker)?;
     log_progress(format_args!(
         "stage=remove event=tip worker={worker} completed_blocks={}",
         stats.blocks
     ));
-    Ok(stats)
+    Ok(RemoveWorkerResult { stats, runs })
+}
+
+fn pop_spent_positions(
+    database: &Database,
+    keys: &[[u8; OUTPOINT_KEY_SIZE]],
+    input_ranges: &[(u64, usize, usize)],
+    spent_positions: &mut SortRunCollector<'_>,
+) -> AnyResult<u64> {
+    let popped = database.batch_pop(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
+    for (input, value) in popped.into_iter().enumerate() {
+        let Some(value) = value else {
+            let Some((height, input_start, _input_end)) = input_ranges
+                .iter()
+                .find(|(_, input_start, input_end)| (*input_start..*input_end).contains(&input))
+            else {
+                return Err(Error::Corrupt("missing input index is outside its range").into());
+            };
+            return Err(io::Error::other(format!(
+                "missing spent outpoint at height {height}, input {}",
+                input - input_start
+            ))
+            .into());
+        };
+        let position = <[u8; OUTPUT_INDEX_SIZE]>::try_from(value.as_slice())
+            .map(u64::from_le_bytes)
+            .map_err(|_| Error::Corrupt("stored output position has the wrong width"))?;
+        spent_positions.push(position)?;
+    }
+    u64::try_from(keys.len())
+        .map_err(|_| invalid_input("popped input count does not fit u64").into())
 }
 
 fn read_block(chainman: &ChainstateManager, height: u64) -> AnyResult<(Block, u64)> {
@@ -547,8 +567,8 @@ fn should_index_output(
 fn outpoint_key(outpoint: OutPoint) -> [u8; OUTPOINT_KEY_SIZE] {
     let txid = outpoint.txid.to_byte_array();
     let mut key = [0_u8; OUTPOINT_KEY_SIZE];
-    key[..8].copy_from_slice(&txid[..8]);
-    key[8..].copy_from_slice(&outpoint.vout.to_le_bytes());
+    key[..12].copy_from_slice(&txid[..12]);
+    key[12..].copy_from_slice(&outpoint.vout.to_le_bytes());
     key
 }
 
@@ -612,38 +632,50 @@ fn fold_output_counts(counts: &[u32]) -> AnyResult<Vec<u64>> {
 }
 
 fn write_hintsfile(
-    index_path: &Path,
-    config: &Config,
-    sort_workers: usize,
+    directory: &Path,
+    spent_runs: &[SortRun],
     tip_height: u64,
     counts: &[u32],
     offsets: &[u64],
     path: &Path,
 ) -> AnyResult<HintsStats> {
-    let total = offsets
+    let eligible_outputs = offsets
         .last()
         .copied()
         .ok_or_else(|| invalid_input("block offsets are empty"))?;
-    let body_path = index_path.join("body");
+    let mut spent_outputs = 0_u64;
+    for run in spent_runs {
+        spent_outputs = spent_outputs
+            .checked_add(run.values)
+            .ok_or_else(|| invalid_input("spent output count overflow"))?;
+    }
+    let unspent_outputs = eligible_outputs
+        .checked_sub(spent_outputs)
+        .ok_or_else(|| invalid_input("spent outputs exceed eligible outputs"))?;
+    let sorted_spent_path = directory.join("spent-outputs.data");
     log_progress(format_args!(
-        "stage=hints event=sort_start workers={sort_workers} eligible_outputs={total} body={}",
-        body_path.display()
+        "stage=hints event=sort_start runs={} spent_outputs={spent_outputs}",
+        spent_runs.len()
     ));
-    let unspent_outputs =
-        destructive_sort_body_values(&body_path, config.block_size, sort_workers)?;
+    merge_sort_runs(&sorted_spent_path, spent_runs, spent_outputs)?;
     log_progress(format_args!(
-        "stage=hints event=sort_complete unspent_outputs={unspent_outputs} body_bytes={}",
-        std::fs::metadata(&body_path)?.len()
+        "stage=hints event=sort_complete spent_outputs={spent_outputs}"
     ));
 
     log_progress(format_args!(
         "stage=hints event=encode_start path={}",
         path.display()
     ));
-    let encoded_outputs = encode_sorted_hintsfile(path, &body_path, tip_height, counts, offsets)?;
+    let encoded = encode_unspent_hintsfile(path, &sorted_spent_path, tip_height, counts);
+    let cleanup = std::fs::remove_file(&sorted_spent_path);
+    let encoded_outputs = match (encoded, cleanup) {
+        (Ok(outputs), Ok(())) => outputs,
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error.into()),
+    };
     if encoded_outputs != unspent_outputs {
         return Err(io::Error::other(format!(
-            "sorted output count mismatch: sort={unspent_outputs}, encoded={encoded_outputs}"
+            "encoded output count mismatch: expected={unspent_outputs}, actual={encoded_outputs}"
         ))
         .into());
     }
@@ -654,190 +686,10 @@ fn write_hintsfile(
     ));
 
     Ok(HintsStats {
-        eligible_outputs: total,
+        eligible_outputs,
         unspent_outputs,
         file_bytes: std::fs::metadata(path)?.len(),
     })
-}
-
-fn destructive_sort_body_values(
-    body_path: &Path,
-    block_size: u64,
-    workers: usize,
-) -> AnyResult<u64> {
-    if workers == 0 {
-        return Err(invalid_input("offline sort requires at least one worker").into());
-    }
-    let block_size = usize::try_from(block_size)
-        .map_err(|_| invalid_input("database block size does not fit memory"))?;
-    let node_size = align_usize(
-        BODY_NODE_FIXED_SIZE
-            .checked_add(OUTPOINT_KEY_SIZE)
-            .ok_or_else(|| invalid_input("body node size overflow"))?,
-        BODY_NODE_ALIGNMENT,
-    )
-    .ok_or_else(|| invalid_input("body node alignment overflow"))?;
-    let body_file = File::open(body_path)?;
-    // SAFETY: indexing is complete, Database::close has unmapped the file, and this mapping is
-    // read-only. Scoped scan workers cannot outlive `mapping`.
-    let mapping = unsafe { MmapOptions::new().map(&body_file)? };
-    let data_length = mapping
-        .len()
-        .checked_sub(BODY_DATA_START)
-        .ok_or_else(|| io::Error::other("body file is shorter than its header"))?;
-    if data_length % block_size != 0 {
-        return Err(io::Error::other("body file has a partial allocation block").into());
-    }
-    let block_count = data_length / block_size;
-    let active_workers = workers.min(block_count.max(1));
-    let blocks_per_worker = block_count.div_ceil(active_workers);
-    let run_directory = body_path
-        .parent()
-        .ok_or_else(|| invalid_input("body file has no parent directory"))?;
-
-    let runs = std::thread::scope(|scope| -> AnyResult<Vec<SortRun>> {
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(active_workers)
-            .map_err(|_| Error::OutOfMemory)?;
-        for worker in 0..active_workers {
-            let start_block = worker.saturating_mul(blocks_per_worker);
-            let end_block = start_block
-                .saturating_add(blocks_per_worker)
-                .min(block_count);
-            let mapping_ref = &mapping;
-            handles.push(scope.spawn(move || {
-                scan_body_runs(
-                    mapping_ref,
-                    run_directory,
-                    block_size,
-                    node_size,
-                    worker,
-                    start_block,
-                    end_block,
-                )
-            }));
-        }
-
-        let mut runs = Vec::new();
-        for handle in handles {
-            let worker_runs = handle
-                .join()
-                .map_err(|_| io::Error::other("offline sort worker panicked"))??;
-            runs.try_reserve(worker_runs.len())
-                .map_err(|_| Error::OutOfMemory)?;
-            runs.extend(worker_runs);
-        }
-        Ok(runs)
-    })?;
-    drop(mapping);
-    drop(body_file);
-
-    let mut live_values = 0_u64;
-    for run in &runs {
-        live_values = live_values
-            .checked_add(run.values)
-            .ok_or_else(|| invalid_input("live output count overflow"))?;
-    }
-    merge_sort_runs(body_path, &runs, live_values)?;
-    Ok(live_values)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_body_runs(
-    mapping: &[u8],
-    run_directory: &Path,
-    block_size: usize,
-    node_size: usize,
-    worker: usize,
-    start_block: usize,
-    end_block: usize,
-) -> AnyResult<Vec<SortRun>> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(SORT_RUN_VALUE_CAPACITY)
-        .map_err(|_| Error::OutOfMemory)?;
-    let mut runs = Vec::new();
-    let mut run_index = 0_usize;
-
-    for block in start_block..end_block {
-        let block_start = BODY_DATA_START
-            .checked_add(
-                block
-                    .checked_mul(block_size)
-                    .ok_or_else(|| io::Error::other("body block offset overflow"))?,
-            )
-            .ok_or_else(|| io::Error::other("body block offset overflow"))?;
-        let mut relative = 0_usize;
-        while relative
-            .checked_add(node_size)
-            .is_some_and(|end| end <= block_size)
-        {
-            let offset = block_start
-                .checked_add(relative)
-                .ok_or_else(|| io::Error::other("body node offset overflow"))?;
-            let end = offset
-                .checked_add(node_size)
-                .ok_or_else(|| io::Error::other("body node range overflow"))?;
-            let slot = mapping
-                .get(offset..end)
-                .ok_or_else(|| io::Error::other("body node is outside its mapping"))?;
-            let magic = read_body_u64(slot, BODY_MAGIC_OFFSET)?;
-            if magic == 0 {
-                relative = relative
-                    .checked_add(node_size)
-                    .ok_or_else(|| io::Error::other("body node stride overflow"))?;
-                continue;
-            }
-            if magic != BODY_NODE_MAGIC {
-                return Err(io::Error::other(format!(
-                    "invalid body node magic at offset {offset}"
-                ))
-                .into());
-            }
-            let value_length = read_body_u64(slot, BODY_BLOB_LENGTH_OFFSET)?;
-            if value_length != OUTPUT_INDEX_SIZE as u64 {
-                return Err(io::Error::other(format!(
-                    "invalid inline value length at body offset {offset}"
-                ))
-                .into());
-            }
-            let value = read_body_u64(slot, BODY_BLOB_OFFSET)?;
-            let expected_checksum = read_body_u64(slot, BODY_BLOB_CHECKSUM_OFFSET)?;
-            if floresta_db::xxh64(&value.to_le_bytes(), BODY_NODE_MAGIC) != expected_checksum {
-                return Err(io::Error::other(format!(
-                    "inline value checksum mismatch at body offset {offset}"
-                ))
-                .into());
-            }
-            values.push(value);
-            if values.len() == SORT_RUN_VALUE_CAPACITY {
-                runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                runs.push(write_sort_run(
-                    run_directory,
-                    worker,
-                    run_index,
-                    &mut values,
-                )?);
-                run_index = run_index
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_input("sort run index overflow"))?;
-            }
-            relative = relative
-                .checked_add(node_size)
-                .ok_or_else(|| io::Error::other("body node stride overflow"))?;
-        }
-    }
-    if !values.is_empty() {
-        runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        runs.push(write_sort_run(
-            run_directory,
-            worker,
-            run_index,
-            &mut values,
-        )?);
-    }
-    Ok(runs)
 }
 
 fn write_sort_run(
@@ -877,9 +729,9 @@ fn write_sort_run(
     })
 }
 
-fn merge_sort_runs(body_path: &Path, runs: &[SortRun], expected_values: u64) -> AnyResult<()> {
-    let output_path = body_path.with_extension("sorted");
-    let mut output = TemporarySortOutput::create(output_path)?;
+fn merge_sort_runs(output_path: &Path, runs: &[SortRun], expected_values: u64) -> AnyResult<()> {
+    let temporary_path = output_path.with_extension("sorted");
+    let mut output = TemporarySortOutput::create(temporary_path)?;
     let mut readers = Vec::new();
     readers
         .try_reserve_exact(runs.len())
@@ -900,7 +752,7 @@ fn merge_sort_runs(body_path: &Path, runs: &[SortRun], expected_values: u64) -> 
     let file = output
         .file
         .take()
-        .ok_or_else(|| io::Error::other("sorted body output file is unavailable"))?;
+        .ok_or_else(|| io::Error::other("temporary sort output file is unavailable"))?;
     let mut writer = BufWriter::new(file);
     let mut written = 0_u64;
     let mut next_progress = SORT_PROGRESS_INTERVAL;
@@ -932,22 +784,21 @@ fn merge_sort_runs(body_path: &Path, runs: &[SortRun], expected_values: u64) -> 
     writer.flush()?;
     writer.get_ref().sync_data()?;
     drop(writer);
-    std::fs::rename(&output.path, body_path)?;
+    std::fs::rename(&output.path, output_path)?;
     output.committed = true;
     Ok(())
 }
 
-fn encode_sorted_hintsfile(
+fn encode_unspent_hintsfile(
     path: &Path,
-    sorted_body_path: &Path,
+    sorted_spent_path: &Path,
     tip_height: u64,
     counts: &[u32],
-    offsets: &[u64],
 ) -> AnyResult<u64> {
     let stop_height =
         u32::try_from(tip_height).map_err(|_| invalid_input("hintsfile height exceeds u32"))?;
-    let mut values = ValueReader::open_flat(sorted_body_path)?;
-    let mut next = values.next_value()?;
+    let mut spent_positions = ValueReader::open_flat(sorted_spent_path)?;
+    let mut next_spent = spent_positions.next_value()?;
     let writer = BufWriter::new(File::create(path)?);
     let builder = HintsfileBuilder::new(writer);
     let mut builder = builder.initialize(stop_height)?;
@@ -969,75 +820,101 @@ fn encode_sorted_hintsfile(
             .get(height_index)
             .copied()
             .ok_or_else(|| invalid_input("eligible output count is unavailable"))?;
-        let block_offset = offsets
-            .get(height_index)
-            .copied()
-            .ok_or_else(|| invalid_input("block offset is unavailable"))?;
-        let block_end = offsets
-            .get(height_index + 1)
-            .copied()
-            .ok_or_else(|| invalid_input("next block offset is unavailable"))?;
+        let count_usize = usize::try_from(count)
+            .map_err(|_| invalid_input("eligible output count does not fit memory"))?;
+        if count_usize > indices.capacity() {
+            indices
+                .try_reserve_exact(count_usize - indices.capacity())
+                .map_err(|_| Error::OutOfMemory)?;
+        }
 
-        while let Some(position) = next {
-            let (position_height, block_index) = unpack_output_position(position);
-            if position_height < height {
-                return Err(io::Error::other("sorted output positions moved backwards").into());
+        for output_index in 0..count {
+            if let Some(position) = next_spent {
+                let (position_height, spent_index) = unpack_output_position(position);
+                if position_height < height
+                    || (position_height == height && spent_index < output_index)
+                {
+                    return Err(io::Error::other(
+                        "sorted spent output positions contain a duplicate or moved backwards",
+                    )
+                    .into());
+                }
+                if position_height == height && spent_index == output_index {
+                    next_spent = spent_positions.next_value()?;
+                    continue;
+                }
             }
-            if position_height != height {
-                break;
-            }
-            if block_index >= count {
-                return Err(io::Error::other(format!(
-                    "output index {block_index} exceeds block {height} count {count}"
-                ))
-                .into());
-            }
-            if indices
-                .last()
-                .is_some_and(|previous| *previous >= block_index)
-            {
-                return Err(io::Error::other("duplicate sorted output position").into());
-            }
-            let global = block_offset
-                .checked_add(u64::from(block_index))
-                .ok_or_else(|| invalid_input("global output index overflow"))?;
-            if global >= block_end {
-                return Err(io::Error::other("output index exceeds its block range").into());
-            }
-            indices.push(block_index);
+            indices.push(output_index);
             encoded_outputs = encoded_outputs
                 .checked_add(1)
                 .ok_or_else(|| invalid_input("encoded output count overflow"))?;
-            next = values.next_value()?;
         }
         builder.append(EliasFano::compress(&indices))?;
     }
-    if next.is_some() {
-        return Err(io::Error::other("sorted body contains output above the requested tip").into());
+    if next_spent.is_some() {
+        return Err(io::Error::other(
+            "sorted spent outputs contain a position above the requested tip",
+        )
+        .into());
     }
     builder.finish()?;
     Ok(encoded_outputs)
 }
 
-fn read_body_u64(slot: &[u8], offset: usize) -> AnyResult<u64> {
-    let end = offset
-        .checked_add(size_of::<u64>())
-        .ok_or_else(|| io::Error::other("body field range overflow"))?;
-    let bytes: [u8; size_of::<u64>()] = slot
-        .get(offset..end)
-        .ok_or_else(|| io::Error::other("body field is outside its node"))?
-        .try_into()
-        .map_err(|_| io::Error::other("body field has the wrong width"))?;
-    Ok(u64::from_le_bytes(bytes))
+struct SortRunCollector<'directory> {
+    directory: &'directory Path,
+    worker: usize,
+    next_index: usize,
+    values: Vec<u64>,
+    runs: Vec<SortRun>,
 }
 
-fn align_usize(value: usize, alignment: usize) -> Option<usize> {
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return None;
+impl<'directory> SortRunCollector<'directory> {
+    fn new(directory: &'directory Path, worker: usize) -> AnyResult<Self> {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(SORT_RUN_VALUE_CAPACITY)
+            .map_err(|_| Error::OutOfMemory)?;
+        Ok(Self {
+            directory,
+            worker,
+            next_index: 0,
+            values,
+            runs: Vec::new(),
+        })
     }
-    value
-        .checked_add(alignment - 1)
-        .map(|sum| sum & !(alignment - 1))
+
+    fn push(&mut self, position: u64) -> AnyResult<()> {
+        self.values.push(position);
+        if self.values.len() == SORT_RUN_VALUE_CAPACITY {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> AnyResult<Vec<SortRun>> {
+        self.flush()?;
+        Ok(self.runs)
+    }
+
+    fn flush(&mut self) -> AnyResult<()> {
+        if self.values.is_empty() {
+            return Ok(());
+        }
+        let following_index = self
+            .next_index
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("sort run index overflow"))?;
+        self.runs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        self.runs.push(write_sort_run(
+            self.directory,
+            self.worker,
+            self.next_index,
+            &mut self.values,
+        )?);
+        self.next_index = following_index;
+        Ok(())
+    }
 }
 
 struct SortRun {
@@ -1073,7 +950,7 @@ impl ValueReader {
         let file = File::open(path)?;
         let length = file.metadata()?.len();
         if length % size_of::<u64>() as u64 != 0 {
-            return Err(io::Error::other("sorted body has a partial value").into());
+            return Err(io::Error::other("sorted values contain a partial record").into());
         }
         Ok(Self::new(file, length / size_of::<u64>() as u64))
     }
@@ -1138,11 +1015,9 @@ fn block_count_slots(end_height: u64) -> AnyResult<Box<[AtomicU32]>> {
 }
 
 fn database_config(arguments: &Arguments, tip_height: u64) -> AnyResult<Config> {
-    let mut config = Config::new(Mode::Map, arguments.buckets, OUTPOINT_KEY_SIZE);
-    config.inline_value_size = OUTPUT_INDEX_SIZE;
+    let mut config = Config::new(Mode::Map, arguments.buckets);
     config.block_size = arguments.database_block_bytes;
     config.body_capacity = arguments.body_capacity;
-    config.blob_capacity = 0;
     let minimum_body = tip_height
         .checked_add(1)
         .and_then(|blocks| blocks.checked_mul(96))
@@ -1385,6 +1260,11 @@ impl WorkerStats {
     }
 }
 
+struct RemoveWorkerResult {
+    stats: WorkerStats,
+    runs: Vec<SortRun>,
+}
+
 #[derive(Clone, Copy)]
 struct HintsStats {
     eligible_outputs: u64,
@@ -1519,8 +1399,8 @@ impl Arguments {
         if range_size == 0 {
             return Err(invalid_input("range size must be nonzero").into());
         }
-        let body_gib = environment_u64("DB_LOAD_BODY_GIB", DEFAULT_CAPACITY_GIB)?;
-        let block_mib = environment_u64("DB_LOAD_BLOCK_MIB", DEFAULT_BLOCK_MIB)?;
+        let body_gib = environment_u64("HINTSGEN_BODY_GIB", DEFAULT_CAPACITY_GIB)?;
+        let block_mib = environment_u64("HINTSGEN_BLOCK_MIB", DEFAULT_BLOCK_MIB)?;
 
         Ok(Self {
             data_dir: PathBuf::from(&arguments[0]),
@@ -1539,10 +1419,10 @@ impl Arguments {
             remove_threads,
             range_size,
             work_dir: arguments.get(7).map_or_else(
-                || PathBuf::from(format!("bitcoin-load-{}", std::process::id())),
+                || PathBuf::from(format!("hintsgen-{}", std::process::id())),
                 PathBuf::from,
             ),
-            buckets: environment_u64("DB_LOAD_BUCKETS", DEFAULT_BUCKETS)?,
+            buckets: environment_u64("HINTSGEN_BUCKETS", DEFAULT_BUCKETS)?,
             body_capacity: gibibytes(body_gib)?,
             database_block_bytes: mebibytes(block_mib)?,
         })
@@ -1641,9 +1521,9 @@ fn invalid_input_owned(message: String) -> io::Error {
 
 fn print_usage() {
     println!(
-        "Usage: bitcoin-load DATA_DIR BLOCKS_DIR [mainnet|testnet|testnet4|signet|regtest] \
+        "Usage: hintsgen DATA_DIR BLOCKS_DIR [mainnet|testnet|testnet4|signet|regtest] \
          [TIP|tip] [ADD_THREADS] [REMOVE_THREADS] [RANGE_SIZE] [WORK_DIR]\n\
-         Environment: DB_LOAD_BUCKETS DB_LOAD_BODY_GIB DB_LOAD_BLOCK_MIB"
+         Environment: HINTSGEN_BUCKETS HINTSGEN_BODY_GIB HINTSGEN_BLOCK_MIB"
     );
 }
 
@@ -1673,8 +1553,8 @@ mod tests {
             txid: Txid::from_byte_array(txid),
             vout: 0x0102_0304,
         });
-        assert_eq!(&key[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(&key[8..], &[4, 3, 2, 1]);
+        assert_eq!(&key[..12], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(&key[12..], &[4, 3, 2, 1]);
     }
 
     #[test]
@@ -1747,34 +1627,29 @@ mod tests {
     }
 
     #[test]
-    fn encodes_sorted_body_positions_with_hintsfile_crate() -> AnyResult<()> {
+    fn encodes_complement_of_sorted_spent_positions() -> AnyResult<()> {
         let directory =
             std::env::temp_dir().join(format!("floresta-db-hints-encode-{}", std::process::id()));
         let _ignored = std::fs::remove_dir_all(&directory);
         std::fs::create_dir(&directory)?;
-        let body = directory.join("body");
+        let spent_path = directory.join("spent");
         let hints_path = directory.join("swiftsync.hints");
-        let mut sorted = BufWriter::new(File::create(&body)?);
-        for position in [
-            pack_output_position(1, 0),
-            pack_output_position(1, 3),
-            pack_output_position(2, 1),
-        ] {
+        let mut sorted = BufWriter::new(File::create(&spent_path)?);
+        for position in [pack_output_position(1, 1), pack_output_position(2, 0)] {
             sorted.write_all(&position.to_le_bytes())?;
         }
         sorted.flush()?;
         drop(sorted);
 
         let counts = [0, 4, 2];
-        let offsets = fold_output_counts(&counts)?;
         assert_eq!(
-            encode_sorted_hintsfile(&hints_path, &body, 2, &counts, &offsets)?,
-            3
+            encode_unspent_hintsfile(&hints_path, &spent_path, 2, &counts)?,
+            4
         );
         let encoded = std::fs::read(&hints_path)?;
         let hints = hintsfile::Hintsfile::from_reader(&mut encoded.as_slice())?;
         assert_eq!(hints.stop_height(), 2);
-        assert_eq!(hints.indices_at_height(1), Some(vec![0, 3]));
+        assert_eq!(hints.indices_at_height(1), Some(vec![0, 2, 3]));
         assert_eq!(hints.indices_at_height(2), Some(vec![1]));
 
         std::fs::remove_dir_all(directory)?;
@@ -1782,49 +1657,21 @@ mod tests {
     }
 
     #[test]
-    fn destructively_sorts_only_live_inline_values() -> AnyResult<()> {
+    fn merges_sorted_spend_runs() -> AnyResult<()> {
         let directory =
             std::env::temp_dir().join(format!("floresta-db-hints-sort-{}", std::process::id()));
         let _ignored = std::fs::remove_dir_all(&directory);
-        let mut config = Config::new(Mode::Map, 8, OUTPOINT_KEY_SIZE);
-        config.inline_value_size = OUTPUT_INDEX_SIZE;
-        config.block_size = 64 * 1_024;
-        config.body_capacity = config.block_size * 2;
-        config.blob_capacity = 0;
-        let database = Database::create(&directory, config.clone())?;
-        let mut keys = Vec::new();
-        let positions = [
-            pack_output_position(3, 4),
-            pack_output_position(1, 3),
-            pack_output_position(2, 8),
-            pack_output_position(1, 1),
-            pack_output_position(4, 0),
-            pack_output_position(2, 2),
-            pack_output_position(3, 1),
-            pack_output_position(1, 7),
-            pack_output_position(2, 5),
-            pack_output_position(3, 0),
+        std::fs::create_dir(&directory)?;
+        let mut first = vec![9, 1, 5];
+        let mut second = vec![8, 2];
+        let runs = [
+            write_sort_run(&directory, 0, 0, &mut first)?,
+            write_sort_run(&directory, 1, 0, &mut second)?,
         ];
-        for (number, position) in positions.iter().copied().enumerate() {
-            let mut key = [0_u8; OUTPOINT_KEY_SIZE];
-            key[..8].copy_from_slice(
-                &u64::try_from(number)
-                    .map_err(|_| invalid_input("test key index does not fit u64"))?
-                    .to_le_bytes(),
-            );
-            database.put(&key, &position.to_le_bytes())?;
-            keys.push(key);
-        }
-        assert!(database.delete(&keys[1])?);
-        assert!(database.delete(&keys[7])?);
-        database.close()?;
+        let sorted_path = directory.join("spent");
+        merge_sort_runs(&sorted_path, &runs, 5)?;
 
-        let body = directory.join("body");
-        assert_eq!(
-            destructive_sort_body_values(&body, config.block_size, 2)?,
-            8
-        );
-        let bytes = std::fs::read(&body)?;
+        let bytes = std::fs::read(&sorted_path)?;
         let mut actual = Vec::new();
         for value in bytes.chunks_exact(size_of::<u64>()) {
             let value: [u8; size_of::<u64>()] = value
@@ -1832,11 +1679,9 @@ mod tests {
                 .map_err(|_| io::Error::other("sorted test value has the wrong width"))?;
             actual.push(u64::from_le_bytes(value));
         }
-        let mut expected = positions.to_vec();
-        expected.retain(|position| *position != positions[1] && *position != positions[7]);
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
+        assert_eq!(actual, [1, 2, 5, 8, 9]);
 
+        drop(runs);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
