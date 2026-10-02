@@ -188,7 +188,7 @@ The work directory must not exist. Building this feature requires CMake, a C++ c
 
 `DATA_DIR` is the network-specific Bitcoin Core directory, not the base `.bitcoin` directory. In particular, testnet3 uses `~/.bitcoin/testnet3` and `~/.bitcoin/testnet3/blocks`; the network argument accepts either `testnet` or `testnet3`.
 
-Eligible outputs are inserted with `WriteOnlyWriter::put_batch`, and spent outpoints are removed with `batch_pop`. During database construction, returned output positions are only appended to bounded unsorted run files. After the final `compact` pass and `Database::close`, those runs are sorted and merged to produce the hintsfile complement. `WORK_DIR/index` remains a clean runtime database that can be reopened with `Database::open_runtime`. Tuning variables are `HINTSGEN_BUCKETS`, `HINTSGEN_BODY_GIB`, and `HINTSGEN_BLOCK_MIB`.
+Eligible outputs are inserted with `WriteOnlyWriter::put_batch`, and spent outpoints are removed with `batch_pop`. After the final `compact` pass and `Database::close`, hintsgen scans the remaining live positions directly from `WORK_DIR/index/body`, externally sorts them, and destructively replaces `body` with the sorted position stream used to encode the hintsfile. It does not retain spent-position run files while indexing. The finished `WORK_DIR/index` is therefore scratch output, not a reopenable runtime database. Tuning variables are `HINTSGEN_BUCKETS`, `HINTSGEN_BODY_GIB`, and `HINTSGEN_BLOCK_MIB`.
 
 Each run writes instrumentation under `WORK_DIR/instrumentation/`:
 
