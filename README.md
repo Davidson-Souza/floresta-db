@@ -190,6 +190,31 @@ The work directory must not exist. Building this feature requires CMake, a C++ c
 
 Eligible outputs are inserted with `WriteOnlyWriter::put_batch`, and spent outpoints are removed with `batch_pop`. During database construction, returned output positions are only appended to bounded unsorted run files. After the final `compact` pass and `Database::close`, those runs are sorted and merged to produce the hintsfile complement. `WORK_DIR/index` remains a clean runtime database that can be reopened with `Database::open_runtime`. Tuning variables are `HINTSGEN_BUCKETS`, `HINTSGEN_BODY_GIB`, and `HINTSGEN_BLOCK_MIB`.
 
+Each run writes instrumentation under `WORK_DIR/instrumentation/`:
+
+- `summary.csv`: logical and allocated database sizes, allocator-page counts, average non-empty body-page usage, and average chain nodes followed per pop;
+- `page-usage.csv`: live allocation count for every body and blob allocator page before and after compaction;
+- `page-usage.svg`: allocator occupancy heatmaps;
+- `mappings.csv`: Linux virtual-address ranges used to attribute kernel page-fault samples to database files and OS pages.
+
+`average_body_page_usage` is live body nodes divided by available node slots across non-empty body pages. It is separate from the per-page live-allocation counts because blob allocations have variable byte lengths.
+
+On Linux, record every minor and major page fault with its faulting address, then generate exact per-file and per-OS-page fault tables and an SVG heatmap:
+
+```text
+perf record -q -e minor-faults -e major-faults -c 1 -d \
+  -o /tmp/hintsgen-faults.data -- \
+  ./target/release/examples/hintsgen \
+  DATA_DIR BLOCKS_DIR NETWORK TIP ADD_THREADS REMOVE_THREADS RANGE_SIZE WORK_DIR
+
+python3 examples/hintsgen/perf_fault_heatmap.py \
+  /tmp/hintsgen-faults.data \
+  WORK_DIR/instrumentation/mappings.csv \
+  WORK_DIR/instrumentation
+```
+
+The processor writes `fault-files.csv`, `fault-pages.csv`, and `page-faults.svg`. Recording with `-c 1` is intentionally exact and adds overhead; use an untraced run for throughput measurements. `perf_event_paranoid` may require running the `perf record` command with elevated privileges.
+
 ## Validation
 
 ```text

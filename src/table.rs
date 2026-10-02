@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::allocator::{Allocation, BlockAllocator};
+use crate::allocator::{Allocation, AllocatorStats, BlockAllocator};
 use crate::config::{Config, KEY_SIZE, Mode};
 use crate::error::{Error, Result};
 use crate::hash::{xxh64, xxh64_batch4};
@@ -59,6 +59,92 @@ pub struct CompactionStats {
     pub reclaimed_pages: u64,
     /// Candidate pages that still contained allocations after the pass.
     pub remaining_candidate_pages: u64,
+}
+
+/// Allocation-page occupancy for one database data file.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageStats {
+    /// Size of one allocator page.
+    pub page_size_bytes: u64,
+    /// Current logical size of the data file, including its format page.
+    pub data_file_bytes: u64,
+    /// Current logical size of the allocator count file.
+    pub count_file_bytes: u64,
+    /// Pages below the allocator high-water mark.
+    pub high_water_pages: u64,
+    /// Pages containing at least one live allocation.
+    pub used_pages: u64,
+    /// Reusable pages containing no live allocations.
+    pub empty_pages: u64,
+    /// Pages reserved as the allocator's current unfinished page.
+    pub claimed_pages: u64,
+    /// Claimed pages that do not contain a live allocation.
+    pub claimed_but_unused_pages: u64,
+    /// Total live allocations across all pages.
+    pub live_allocations: u64,
+    /// Mean live-allocation count across non-empty pages.
+    pub average_page_load: f64,
+    /// Live-allocation count for every page below the high-water mark.
+    pub page_loads: Vec<u16>,
+}
+
+/// Current database file and allocation-page statistics.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DatabaseStats {
+    /// Logical size of the heads file.
+    pub heads_file_bytes: u64,
+    /// Fixed-size body-node page occupancy.
+    pub body: PageStats,
+    /// Variable-size value page occupancy, absent in set mode.
+    pub blobs: Option<PageStats>,
+    /// Maximum body nodes that fit in one allocation page.
+    pub body_page_capacity: u64,
+    /// Mean fraction of occupied node slots across non-empty body pages.
+    pub average_body_page_usage: f64,
+    /// Combined logical bytes in runtime database files.
+    pub total_file_bytes: u64,
+}
+
+/// Traversal work performed by one instrumented [`Database::batch_pop`] call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BatchPopStats {
+    /// Requested keys, including keys that were absent.
+    pub pops: u64,
+    /// Bucket-chain nodes followed across all requested keys.
+    pub nodes_followed: u64,
+}
+
+impl BatchPopStats {
+    /// Returns the mean chain nodes followed per requested key.
+    #[must_use]
+    pub fn average_nodes_followed_per_pop(self) -> f64 {
+        average(self.nodes_followed, self.pops)
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn average(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn page_stats(stats: AllocatorStats) -> PageStats {
+    PageStats {
+        page_size_bytes: stats.page_size_bytes,
+        data_file_bytes: stats.data_file_bytes,
+        count_file_bytes: stats.count_file_bytes,
+        high_water_pages: stats.high_water_pages,
+        used_pages: stats.used_pages,
+        empty_pages: stats.empty_pages,
+        claimed_pages: stats.claimed_pages,
+        claimed_but_unused_pages: stats.claimed_but_unused_pages,
+        live_allocations: stats.live_allocations,
+        average_page_load: average(stats.live_allocations, stats.used_pages),
+        page_loads: stats.page_loads,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,12 +784,52 @@ impl Database {
     where
         I: IntoIterator<Item = &'key [u8]>,
     {
+        Ok(self.batch_pop_with_stats(keys)?.0)
+    }
+
+    /// Deletes map entries and returns their values with bucket-chain traversal metrics.
+    ///
+    /// `nodes_followed` counts one unit for every still-unresolved pop carried
+    /// across a visited chain node, including work repeated after a concurrent
+    /// link change. This makes `average_nodes_followed_per_pop` a direct measure
+    /// of lookup amplification.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-instrumented-pop-example",
+    ///     Config::new(Mode::Map, 1_024),
+    /// )?;
+    /// let key = b"key-0001-0000000";
+    /// database.put(key, b"value")?;
+    /// let (values, stats) = database.batch_pop_with_stats([key.as_slice()])?;
+    /// assert_eq!(values, vec![Some(b"value".to_vec())]);
+    /// assert_eq!(stats.pops, 1);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Database::batch_pop`].
+    pub fn batch_pop_with_stats<'key, I>(
+        &self,
+        keys: I,
+    ) -> Result<(Vec<Option<Vec<u8>>>, BatchPopStats)>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
         let _operation_guard = self.operation_guard()?;
         if self.config.mode != Mode::Map {
             return Err(Error::Unsupported("batch_pop is available only for maps"));
         }
         let prepared = self.prepare_keys(keys)?;
         Self::validate_unique_batch_keys(&prepared)?;
+        let pops = u64::try_from(prepared.len())
+            .map_err(|_| Error::CapacityExhausted("batch-pop statistics"))?;
+        let mut nodes_followed = 0_u64;
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(prepared.len())
@@ -723,7 +849,13 @@ impl Database {
                     end += 1;
                 }
                 let _delete_guard = self.lock_delete_bucket(bucket)?;
-                self.pop_bucket_batch(bucket, &prepared[start..end], &mut encoded, &mut detached)?;
+                self.pop_bucket_batch(
+                    bucket,
+                    &prepared[start..end],
+                    &mut encoded,
+                    &mut detached,
+                    &mut nodes_followed,
+                )?;
                 start = end;
             }
             self.materialize_values(&encoded)
@@ -731,7 +863,13 @@ impl Database {
 
         let release = self.release_detached_batch(&detached);
         match (operation, release) {
-            (Ok(values), Ok(())) => Ok(values),
+            (Ok(values), Ok(())) => Ok((
+                values,
+                BatchPopStats {
+                    pops,
+                    nodes_followed,
+                },
+            )),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
@@ -763,6 +901,66 @@ impl Database {
         }
         self.persist_runtime_heads()?;
         self.heads.sync_all()
+    }
+
+    /// Captures current runtime file sizes and allocation-page occupancy.
+    ///
+    /// The snapshot includes one live-allocation count per allocator page so
+    /// callers can produce occupancy distributions and heatmaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when allocator metadata is corrupt, a concurrent page
+    /// transition cannot be observed consistently, or a size calculation overflows.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use floresta_db::{Config, Database, Mode};
+    ///
+    /// let database = Database::create(
+    ///     "floresta-db-stats-example",
+    ///     Config::new(Mode::Map, 1_024),
+    /// )?;
+    /// let stats = database.stats()?;
+    /// assert_eq!(stats.body.live_allocations, 0);
+    /// # Ok::<(), floresta_db::Error>(())
+    /// ```
+    pub fn stats(&self) -> Result<DatabaseStats> {
+        let _operation_guard = self.operation_guard()?;
+        let body = page_stats(self.body.stats()?);
+        let blobs = self
+            .blobs
+            .as_ref()
+            .map(BlockAllocator::stats)
+            .transpose()?
+            .map(page_stats);
+        let body_page_capacity = self.body.block_size() / NODE_SIZE_U64;
+        let occupied_body_slots = body
+            .used_pages
+            .checked_mul(body_page_capacity)
+            .ok_or(Error::CapacityExhausted("database statistics"))?;
+        let average_body_page_usage = average(body.live_allocations, occupied_body_slots);
+        let mut total_file_bytes = self
+            .heads
+            .file_length()
+            .checked_add(body.data_file_bytes)
+            .and_then(|total| total.checked_add(body.count_file_bytes))
+            .ok_or(Error::CapacityExhausted("database statistics"))?;
+        if let Some(blob_stats) = &blobs {
+            total_file_bytes = total_file_bytes
+                .checked_add(blob_stats.data_file_bytes)
+                .and_then(|total| total.checked_add(blob_stats.count_file_bytes))
+                .ok_or(Error::CapacityExhausted("database statistics"))?;
+        }
+        Ok(DatabaseStats {
+            heads_file_bytes: self.heads.file_length(),
+            body,
+            blobs,
+            body_page_capacity,
+            average_body_page_usage,
+            total_file_bytes,
+        })
     }
 
     /// Relocates live body nodes from sealed pages containing fewer than
@@ -1351,6 +1549,7 @@ impl Database {
         prepared: &[PreparedKey<'_>],
         encoded: &mut [Option<u64>],
         detached: &mut Vec<DetachedNode>,
+        nodes_followed: &mut u64,
     ) -> Result<()> {
         'restart: loop {
             let mut remaining = prepared
@@ -1365,6 +1564,12 @@ impl Database {
             let mut expected_head = read_shared(head);
             let mut current = expected_head;
             while current != 0 {
+                *nodes_followed = nodes_followed
+                    .checked_add(
+                        u64::try_from(remaining)
+                            .map_err(|_| Error::CapacityExhausted("batch-pop statistics"))?,
+                    )
+                    .ok_or(Error::CapacityExhausted("batch-pop statistics"))?;
                 let node = read_node(&self.body, current)?;
                 let observed_next = node.next;
                 if self.link_value(link)? != current
@@ -2717,6 +2922,45 @@ mod tests {
             database.batch_fetch([first.as_slice(), second.as_slice(), third.as_slice()])?,
             vec![None, None, None]
         );
+
+        drop(database);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reports_page_usage_and_pop_traversal() -> Result<()> {
+        let path = test_directory("instrumentation");
+        let _ignored = std::fs::remove_dir_all(&path);
+        let database = Database::create(&path, config(Mode::Map, 1))?;
+        let first = fixed_key(b"first");
+        let second = fixed_key(b"second");
+        let third = fixed_key(b"third");
+        database.put(&first, &1_u64.to_le_bytes())?;
+        database.put(&second, &2_u64.to_le_bytes())?;
+        database.put(&third, &3_u64.to_le_bytes())?;
+
+        let before = database.stats()?;
+        assert_eq!(before.body.high_water_pages, 1);
+        assert_eq!(before.body.used_pages, 1);
+        assert_eq!(before.body.live_allocations, 3);
+        assert_eq!(before.body.page_loads, [3]);
+        assert_eq!(before.body_page_capacity, 2_048);
+        assert!(f64::abs(before.average_body_page_usage - 3.0 / 2_048.0) < f64::EPSILON);
+        assert!(before.total_file_bytes >= before.body.data_file_bytes);
+
+        let (values, traversal) =
+            database.batch_pop_with_stats([first.as_slice(), third.as_slice()])?;
+        assert_eq!(
+            values,
+            vec![
+                Some(1_u64.to_le_bytes().to_vec()),
+                Some(3_u64.to_le_bytes().to_vec())
+            ]
+        );
+        assert_eq!(traversal.pops, 2);
+        assert_eq!(traversal.nodes_followed, 4);
+        assert!(f64::abs(traversal.average_nodes_followed_per_pop() - 2.0) < f64::EPSILON);
 
         drop(database);
         std::fs::remove_dir_all(path)?;

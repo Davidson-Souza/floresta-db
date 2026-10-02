@@ -45,7 +45,9 @@ mod table;
 pub use config::{Config, DEFAULT_HASH_SEED, KEY_SIZE, MAX_INLINE_VALUE_SIZE, Mode};
 pub use error::{Error, Result};
 pub use hash::xxh64;
-pub use table::{CompactionStats, Database, PutResult, WriteOnlyWriter};
+pub use table::{
+    BatchPopStats, CompactionStats, Database, DatabaseStats, PageStats, PutResult, WriteOnlyWriter,
+};
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("floresta-db requires a 64-bit target");

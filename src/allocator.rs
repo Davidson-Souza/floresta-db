@@ -67,6 +67,20 @@ impl AllocationBatch {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AllocatorStats {
+    pub(crate) high_water_pages: u64,
+    pub(crate) used_pages: u64,
+    pub(crate) empty_pages: u64,
+    pub(crate) claimed_pages: u64,
+    pub(crate) claimed_but_unused_pages: u64,
+    pub(crate) live_allocations: u64,
+    pub(crate) page_size_bytes: u64,
+    pub(crate) data_file_bytes: u64,
+    pub(crate) count_file_bytes: u64,
+    pub(crate) page_loads: Vec<u16>,
+}
+
 pub(crate) struct BlockAllocator {
     data: MappedFile,
     counts: MappedFile,
@@ -357,6 +371,70 @@ impl BlockAllocator {
 
     pub(crate) fn block_live_count(&self, block: u64) -> Result<u16> {
         self.read_count(block)
+    }
+
+    pub(crate) fn stats(&self) -> Result<AllocatorStats> {
+        let _current_guard = self
+            .current_guard
+            .read()
+            .map_err(|_| Error::Corrupt("allocator current-page lock is poisoned"))?;
+        let high_water = self.next_block_value()?;
+        let snapshot = self.count_snapshot(high_water)?;
+        let current = read_shared_u64(&self.current_block);
+        let current_block = if current == 0 || current == CURRENT_INSTALLING {
+            None
+        } else {
+            Some(decode_block(current)?)
+        };
+        let current_live = current_live(read_shared_u64(&self.current_word));
+        let entries = usize::try_from(high_water)
+            .map_err(|_| Error::Corrupt("page count does not fit memory"))?;
+        let mut page_loads = Vec::new();
+        page_loads
+            .try_reserve_exact(entries)
+            .map_err(|_| Error::OutOfMemory)?;
+        let mut stats = AllocatorStats {
+            high_water_pages: high_water,
+            page_size_bytes: self.block_size,
+            data_file_bytes: self.data.file_length(),
+            count_file_bytes: self.counts.file_length(),
+            page_loads,
+            ..AllocatorStats::default()
+        };
+
+        for (index, bytes) in snapshot.chunks_exact(size_of::<u16>()).enumerate() {
+            let count = u16::from_le_bytes([bytes[0], bytes[1]]);
+            match count {
+                0 => {
+                    stats.empty_pages += 1;
+                    stats.page_loads.push(0);
+                }
+                u16::MAX => {
+                    stats.claimed_pages += 1;
+                    let block = u64::try_from(index)
+                        .map_err(|_| Error::Corrupt("page index does not fit u64"))?;
+                    let live = if current_block == Some(block) {
+                        current_live
+                    } else {
+                        stats.claimed_but_unused_pages += 1;
+                        0
+                    };
+                    if live != 0 {
+                        stats.used_pages += 1;
+                        stats.live_allocations += u64::from(live);
+                    } else {
+                        stats.claimed_but_unused_pages += u64::from(current_block == Some(block));
+                    }
+                    stats.page_loads.push(live);
+                }
+                live => {
+                    stats.used_pages += 1;
+                    stats.live_allocations += u64::from(live);
+                    stats.page_loads.push(live);
+                }
+            }
+        }
+        Ok(stats)
     }
 
     pub(crate) fn seal_current(&self) -> Result<()> {

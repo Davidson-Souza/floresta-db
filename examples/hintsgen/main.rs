@@ -22,7 +22,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint, TxOut};
 use bitcoinkernel::{ChainType, ChainstateManager, Context, ContextBuilder, Log, Logger};
-use floresta_db::{Config, Database, Error, Mode};
+use floresta_db::{BatchPopStats, Config, Database, DatabaseStats, Error, Mode, PageStats};
 use hintsfile::{EliasFano, HintsfileBuilder};
 
 const OUTPOINT_KEY_SIZE: usize = 16;
@@ -89,6 +89,9 @@ fn run() -> AnyResult<()> {
 
     let index_path = arguments.work_dir.join("index");
     let database = Database::create(&index_path, database_config(&arguments, tip_height)?)?;
+    let instrumentation_dir = arguments.work_dir.join("instrumentation");
+    std::fs::create_dir(&instrumentation_dir)?;
+    write_mapping_manifest(&instrumentation_dir.join("mappings.csv"), &index_path)?;
     let live_outputs = AtomicU64::new(0);
     let add_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
     let remove_ranges = RangeAllocator::new(end_height, arguments.range_size)?;
@@ -200,6 +203,8 @@ fn run() -> AnyResult<()> {
     let counts = collect_output_counts(&block_slots)?;
     let offsets = fold_output_counts(&counts)?;
     let live = live_outputs.load(Ordering::Acquire);
+    let before_compaction = database.stats()?;
+    let storage_before_compaction = storage_stats(&index_path)?;
     let minimum_page_load = COMPACTION_MIN_PAGE_LOAD;
     let compaction = database.compact(minimum_page_load)?;
     log_progress(format_args!(
@@ -210,6 +215,16 @@ fn run() -> AnyResult<()> {
         compaction.reclaimed_pages,
         compaction.remaining_candidate_pages
     ));
+    let after_compaction = database.stats()?;
+    let storage_after_compaction = storage_stats(&index_path)?;
+    write_database_instrumentation(
+        &instrumentation_dir,
+        &before_compaction,
+        &after_compaction,
+        storage_before_compaction,
+        storage_after_compaction,
+        &remover_stats,
+    )?;
     database.close()?;
     log_progress(format_args!("stage=index event=close_complete"));
 
@@ -455,10 +470,14 @@ fn remove_worker(
             }
 
             let pop_started = Instant::now();
-            let count = pop_spent_positions(database, &keys, &input_ranges, &mut spent_positions)?;
-            cas_sub(live_outputs, count)?;
+            let pop_stats =
+                pop_spent_positions(database, &keys, &input_ranges, &mut spent_positions)?;
+            cas_sub(live_outputs, pop_stats.pops)?;
             stats.database += pop_started.elapsed();
-            stats.inputs = stats.inputs.saturating_add(count);
+            stats.inputs = stats.inputs.saturating_add(pop_stats.pops);
+            stats.nodes_followed = stats
+                .nodes_followed
+                .saturating_add(pop_stats.nodes_followed);
             progress.publish_remover(worker, range_end)?;
             log_progress(format_args!(
                 "stage=remove event=range_complete worker={worker} start={range_start} end={} completed_blocks={}",
@@ -498,8 +517,9 @@ fn pop_spent_positions(
     keys: &[[u8; OUTPOINT_KEY_SIZE]],
     input_ranges: &[(u64, usize, usize)],
     spent_positions: &mut PositionRunCollector<'_>,
-) -> AnyResult<u64> {
-    let popped = database.batch_pop(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
+) -> AnyResult<BatchPopStats> {
+    let (popped, stats) =
+        database.batch_pop_with_stats(keys.iter().map(<[u8; OUTPOINT_KEY_SIZE]>::as_slice))?;
     for (input, value) in popped.into_iter().enumerate() {
         let Some(value) = value else {
             let Some((height, input_start, _input_end)) = input_ranges
@@ -519,8 +539,7 @@ fn pop_spent_positions(
             .map_err(|_| Error::Corrupt("stored output position has the wrong width"))?;
         spent_positions.push(position)?;
     }
-    u64::try_from(keys.len())
-        .map_err(|_| invalid_input("popped input count does not fit u64").into())
+    Ok(stats)
 }
 
 fn read_block(chainman: &ChainstateManager, height: u64) -> AnyResult<(Block, u64)> {
@@ -1361,6 +1380,7 @@ struct WorkerStats {
     bytes: u64,
     outputs: u64,
     inputs: u64,
+    nodes_followed: u64,
     block_read: Duration,
     database: Duration,
 }
@@ -1371,6 +1391,7 @@ impl WorkerStats {
         self.bytes = self.bytes.saturating_add(other.bytes);
         self.outputs = self.outputs.saturating_add(other.outputs);
         self.inputs = self.inputs.saturating_add(other.inputs);
+        self.nodes_followed = self.nodes_followed.saturating_add(other.nodes_followed);
         self.block_read += other.block_read;
         self.database += other.database;
     }
@@ -1438,6 +1459,339 @@ fn print_report(
         gibibytes_f64(storage.logical_bytes),
         mebibytes_f64(storage.allocated_bytes),
     );
+}
+
+#[cfg(target_os = "linux")]
+fn write_mapping_manifest(path: &Path, database_path: &Path) -> AnyResult<()> {
+    let database_path = std::fs::canonicalize(database_path)?;
+    let database_text = path_text(&database_path, "database directory")?;
+    let maps = std::fs::read_to_string("/proc/self/maps")?;
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(output, "pid,start,end,file_offset,file")?;
+    for line in maps.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(mapped_path) = fields.get(5) else {
+            continue;
+        };
+        if !mapped_path.starts_with(database_text) {
+            continue;
+        }
+        let range = fields
+            .first()
+            .ok_or_else(|| io::Error::other("process mapping has no address range"))?;
+        let (start, end) = range
+            .split_once('-')
+            .ok_or_else(|| io::Error::other("process mapping range is invalid"))?;
+        let file_offset = fields
+            .get(2)
+            .ok_or_else(|| io::Error::other("process mapping has no file offset"))?;
+        writeln!(
+            output,
+            "{},0x{start},0x{end},0x{file_offset},{}",
+            std::process::id(),
+            csv_text(mapped_path)
+        )?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_mapping_manifest(path: &Path, _database_path: &Path) -> AnyResult<()> {
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(output, "pid,start,end,file_offset,file")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn write_database_instrumentation(
+    directory: &Path,
+    before: &DatabaseStats,
+    after: &DatabaseStats,
+    storage_before: StorageStats,
+    storage_after: StorageStats,
+    removers: &WorkerStats,
+) -> AnyResult<()> {
+    write_metrics_summary(
+        &directory.join("summary.csv"),
+        before,
+        after,
+        storage_before,
+        storage_after,
+        removers,
+    )?;
+    write_page_metrics(&directory.join("page-usage.csv"), before, after)?;
+    write_page_usage_svg(&directory.join("page-usage.svg"), before, after)?;
+    let traversal = BatchPopStats {
+        pops: removers.inputs,
+        nodes_followed: removers.nodes_followed,
+    };
+    log_progress(format_args!(
+        "stage=instrumentation event=database_metrics body_pages={} body_used_pages={} average_body_page_usage={:.4} database_logical_bytes={} database_allocated_bytes={} average_nodes_followed_per_pop={:.3}",
+        after.body.high_water_pages,
+        after.body.used_pages,
+        after.average_body_page_usage,
+        after.total_file_bytes,
+        storage_after.allocated_bytes,
+        traversal.average_nodes_followed_per_pop()
+    ));
+    Ok(())
+}
+
+fn write_metrics_summary(
+    path: &Path,
+    before: &DatabaseStats,
+    after: &DatabaseStats,
+    storage_before: StorageStats,
+    storage_after: StorageStats,
+    removers: &WorkerStats,
+) -> AnyResult<()> {
+    let traversal = BatchPopStats {
+        pops: removers.inputs,
+        nodes_followed: removers.nodes_followed,
+    };
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(output, "metric,before_compaction,after_compaction")?;
+    writeln!(
+        output,
+        "database_logical_bytes,{},{}",
+        before.total_file_bytes, after.total_file_bytes
+    )?;
+    writeln!(
+        output,
+        "database_allocated_bytes,{},{}",
+        storage_before.allocated_bytes, storage_after.allocated_bytes
+    )?;
+    writeln!(
+        output,
+        "heads_file_bytes,{},{}",
+        before.heads_file_bytes, after.heads_file_bytes
+    )?;
+    write_allocator_summary(&mut output, "body", &before.body, &after.body)?;
+    if let (Some(before_blobs), Some(after_blobs)) = (&before.blobs, &after.blobs) {
+        write_allocator_summary(&mut output, "blobs", before_blobs, after_blobs)?;
+    }
+    writeln!(
+        output,
+        "average_body_page_usage,{:.8},{:.8}",
+        before.average_body_page_usage, after.average_body_page_usage
+    )?;
+    writeln!(output, "pop_requests,{},{}", traversal.pops, traversal.pops)?;
+    writeln!(
+        output,
+        "nodes_followed,{},{}",
+        traversal.nodes_followed, traversal.nodes_followed
+    )?;
+    writeln!(
+        output,
+        "average_nodes_followed_per_pop,{0:.8},{0:.8}",
+        traversal.average_nodes_followed_per_pop()
+    )?;
+    output.flush()?;
+    Ok(())
+}
+fn write_allocator_summary(
+    output: &mut impl Write,
+    name: &str,
+    before: &PageStats,
+    after: &PageStats,
+) -> io::Result<()> {
+    writeln!(
+        output,
+        "{name}_page_size_bytes,{},{}",
+        before.page_size_bytes, after.page_size_bytes
+    )?;
+    writeln!(
+        output,
+        "{name}_data_file_bytes,{},{}",
+        before.data_file_bytes, after.data_file_bytes
+    )?;
+    writeln!(
+        output,
+        "{name}_count_file_bytes,{},{}",
+        before.count_file_bytes, after.count_file_bytes
+    )?;
+    writeln!(
+        output,
+        "{name}_high_water_pages,{},{}",
+        before.high_water_pages, after.high_water_pages
+    )?;
+    writeln!(
+        output,
+        "{name}_used_pages,{},{}",
+        before.used_pages, after.used_pages
+    )?;
+    writeln!(
+        output,
+        "{name}_empty_pages,{},{}",
+        before.empty_pages, after.empty_pages
+    )?;
+    writeln!(
+        output,
+        "{name}_claimed_pages,{},{}",
+        before.claimed_pages, after.claimed_pages
+    )?;
+    writeln!(
+        output,
+        "{name}_claimed_but_unused_pages,{},{}",
+        before.claimed_but_unused_pages, after.claimed_but_unused_pages
+    )?;
+    writeln!(
+        output,
+        "{name}_live_allocations,{},{}",
+        before.live_allocations, after.live_allocations
+    )?;
+    writeln!(
+        output,
+        "{name}_average_page_load,{:.8},{:.8}",
+        before.average_page_load, after.average_page_load
+    )
+}
+
+fn write_page_metrics(path: &Path, before: &DatabaseStats, after: &DatabaseStats) -> AnyResult<()> {
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(output, "phase,file,page,live_allocations")?;
+    write_page_metric_rows(&mut output, "before_compaction", "body", &before.body)?;
+    if let Some(blobs) = &before.blobs {
+        write_page_metric_rows(&mut output, "before_compaction", "blobs", blobs)?;
+    }
+    write_page_metric_rows(&mut output, "after_compaction", "body", &after.body)?;
+    if let Some(blobs) = &after.blobs {
+        write_page_metric_rows(&mut output, "after_compaction", "blobs", blobs)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn write_page_metric_rows(
+    output: &mut impl Write,
+    phase: &str,
+    file: &str,
+    stats: &PageStats,
+) -> io::Result<()> {
+    for (page, live) in stats.page_loads.iter().copied().enumerate() {
+        writeln!(output, "{phase},{file},{page},{live}")?;
+    }
+    Ok(())
+}
+
+fn write_page_usage_svg(
+    path: &Path,
+    before: &DatabaseStats,
+    after: &DatabaseStats,
+) -> AnyResult<()> {
+    let mut panels = Vec::new();
+    panels
+        .try_reserve_exact(4)
+        .map_err(|_| Error::OutOfMemory)?;
+    panels.push((
+        "body before compaction",
+        &before.body,
+        before.body_page_capacity,
+    ));
+    panels.push((
+        "body after compaction",
+        &after.body,
+        after.body_page_capacity,
+    ));
+    if let Some(blobs) = &before.blobs {
+        panels.push(("blobs before compaction", blobs, maximum_page_load(blobs)));
+    }
+    if let Some(blobs) = &after.blobs {
+        panels.push(("blobs after compaction", blobs, maximum_page_load(blobs)));
+    }
+
+    let columns = 256_usize;
+    let cell = 3_usize;
+    let panel_heights = panels
+        .iter()
+        .map(|(_, stats, _)| stats.page_loads.len().div_ceil(columns).max(1) * cell + 52)
+        .collect::<Vec<_>>();
+    let height = panel_heights
+        .iter()
+        .try_fold(72_usize, |total, panel| total.checked_add(*panel))
+        .ok_or_else(|| invalid_input("page heatmap height overflow"))?;
+    let mut output = BufWriter::new(File::create(path)?);
+    writeln!(
+        output,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="{height}" viewBox="0 0 1080 {height}">"#
+    )?;
+    writeln!(
+        output,
+        r##"<rect width="1080" height="{height}" fill="#0f172a"/>"##
+    )?;
+    writeln!(
+        output,
+        r##"<text x="28" y="38" fill="#f8fafc" font-family="monospace" font-size="22">floresta-db allocator page usage</text>"##
+    )?;
+    let mut y = 64_usize;
+    for ((label, stats, capacity), panel_height) in panels.iter().zip(panel_heights) {
+        write_heatmap_panel(&mut output, label, stats, *capacity, y, columns, cell)?;
+        y = y
+            .checked_add(panel_height)
+            .ok_or_else(|| invalid_input("page heatmap position overflow"))?;
+    }
+    writeln!(output, "</svg>")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn write_heatmap_panel(
+    output: &mut impl Write,
+    label: &str,
+    stats: &PageStats,
+    capacity: u64,
+    y: usize,
+    columns: usize,
+    cell: usize,
+) -> AnyResult<()> {
+    writeln!(
+        output,
+        r##"<text x="28" y="{}" fill="#cbd5e1" font-family="monospace" font-size="15">{label}: pages={} used={} average_load={:.2}</text>"##,
+        y + 16,
+        stats.high_water_pages,
+        stats.used_pages,
+        stats.average_page_load
+    )?;
+    let grid_y = y + 28;
+    for (page, live) in stats.page_loads.iter().copied().enumerate() {
+        let x = 28 + page % columns * cell;
+        let cell_y = grid_y + page / columns * cell;
+        let color = heat_color(u64::from(live), capacity);
+        writeln!(
+            output,
+            r#"<rect x="{x}" y="{cell_y}" width="{cell}" height="{cell}" fill="{color}"><title>{label} page {page}: {live} live allocations</title></rect>"#
+        )?;
+    }
+    Ok(())
+}
+
+fn maximum_page_load(stats: &PageStats) -> u64 {
+    stats
+        .page_loads
+        .iter()
+        .copied()
+        .map(u64::from)
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn heat_color(load: u64, capacity: u64) -> String {
+    if load == 0 || capacity == 0 {
+        return "#1e293b".to_owned();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let intensity = ((load as f64 / capacity as f64).clamp(0.0, 1.0).sqrt() * 255.0) as u8;
+    let red = 30_u8.saturating_add(intensity.saturating_mul(3) / 4);
+    let green = 64_u8.saturating_add(intensity / 3);
+    let blue = 175_u8.saturating_sub(intensity / 2);
+    format!("#{red:02x}{green:02x}{blue:02x}")
+}
+
+fn csv_text(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn storage_stats(path: &Path) -> io::Result<StorageStats> {
@@ -1681,6 +2035,76 @@ mod tests {
             Path::new("/home/alice/.bitcoin/testnet3/blocks"),
         );
         assert!(!canonical.contains("retry with"));
+    }
+
+    #[test]
+    fn writes_database_instrumentation_artifacts() -> AnyResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "floresta-db-hints-instrumentation-{}",
+            std::process::id()
+        ));
+        let _ignored = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory)?;
+        let page_stats = |loads: Vec<u16>| PageStats {
+            page_size_bytes: 64 * 1_024,
+            data_file_bytes: 64 * 1_024 * 4,
+            count_file_bytes: 64 * 1_024,
+            high_water_pages: 3,
+            used_pages: 2,
+            empty_pages: 1,
+            claimed_pages: 0,
+            claimed_but_unused_pages: 0,
+            live_allocations: 3,
+            average_page_load: 1.5,
+            page_loads: loads,
+        };
+        let before = DatabaseStats {
+            heads_file_bytes: 64 * 1_024,
+            body: page_stats(vec![2, 0, 1]),
+            blobs: None,
+            body_page_capacity: 2,
+            average_body_page_usage: 0.75,
+            total_file_bytes: 320 * 1_024,
+        };
+        let after = DatabaseStats {
+            heads_file_bytes: before.heads_file_bytes,
+            body: page_stats(vec![2, 1, 0]),
+            blobs: None,
+            body_page_capacity: 2,
+            average_body_page_usage: 0.75,
+            total_file_bytes: before.total_file_bytes,
+        };
+        let removers = WorkerStats {
+            inputs: 2,
+            nodes_followed: 5,
+            ..WorkerStats::default()
+        };
+        write_database_instrumentation(
+            &directory,
+            &before,
+            &after,
+            StorageStats {
+                files: 3,
+                logical_bytes: before.total_file_bytes,
+                allocated_bytes: 128 * 1_024,
+            },
+            StorageStats {
+                files: 3,
+                logical_bytes: after.total_file_bytes,
+                allocated_bytes: 128 * 1_024,
+            },
+            &removers,
+        )?;
+
+        let summary = std::fs::read_to_string(directory.join("summary.csv"))?;
+        assert!(summary.contains("average_nodes_followed_per_pop,2.50000000,2.50000000"));
+        let pages = std::fs::read_to_string(directory.join("page-usage.csv"))?;
+        assert!(pages.contains("before_compaction,body,1,0"));
+        let heatmap = std::fs::read_to_string(directory.join("page-usage.svg"))?;
+        assert!(heatmap.contains("body after compaction page 1: 1 live allocations"));
+
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
